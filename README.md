@@ -8,9 +8,19 @@ Sources imported from [`fp-sns-stbox1/Utilities/rust`](https://github.com/zdavat
 
 Grab the latest archive for your platform from the [Releases page](https://github.com/zdavatz/movement_logger_desktop/releases).
 
-- **Windows** — `MovementLogger-vX.Y.Z-x86_64-pc-windows-msvc.zip`. Unzip, run `MovementLogger.exe`.
-- **macOS (Apple Silicon)** — `MovementLogger-vX.Y.Z-macos-aarch64.dmg`. Drag the `.app` to `/Applications`. Unsigned builds need right-click → Open the first time.
+- **Windows** — `MovementLogger-vX.Y.Z-x86_64-pc-windows-msvc.zip`. Unzip, run `MovementLogger.exe`. (The `.exe` is unsigned; Windows SmartScreen may warn on first launch — click *More info → Run anyway*.)
+- **macOS (Apple Silicon)** — `MovementLogger-X.Y.Z-macos-aarch64.dmg`. Drag the `.app` to `/Applications`. From **v0.0.2 onwards** the `.app` is Developer ID-signed, notarized and stapled, so it launches without any Gatekeeper prompt — even offline.
 - **Linux x86_64** — `MovementLogger-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`. Extract, run `./install-linux.sh` for desktop integration or `./MovementLogger` directly. Needs `libxkbcommon`, `libfontconfig`, `libGL`, `libdbus-1` on the system; `ffmpeg` on `PATH` for video output.
+
+## In-app updates
+
+On launch the GUI polls this repo's Releases API and, if a newer `vX.Y.Z` tag is published, offers an **Update now** button. The platform-specific upgrade:
+
+- **macOS** — downloads the DMG, mounts it, verifies the embedded `.app` is properly codesigned, copies it next to the running one, and a tiny helper script swaps the `.app` once you quit and relaunches.
+- **Windows** — downloads the zip, extracts it, and a helper batch swaps `MovementLogger.exe`.
+- **Linux** — downloads the tarball, extracts, and a helper shell script swaps the binary.
+
+> **Note for v0.0.1 users:** the in-app updater in v0.0.1 points at the wrong repository (a leftover from when this code lived inside `fp-sns-stbox1`). It will *not* find v0.0.2 automatically. Download v0.0.2 manually once; from that point on every future update is automatic.
 
 ## Build from source
 
@@ -30,7 +40,7 @@ See [`CLAUDE.md`](CLAUDE.md) for the workspace layout, runtime topology, and rel
 git tag v0.0.2 && git push origin v0.0.2
 ```
 
-The `.github/workflows/release.yml` workflow builds + packages for all three platforms and publishes a GitHub Release with the artefacts. macOS code-signing + notarization activates automatically when the Developer ID + App Store Connect API key secrets are present.
+The `.github/workflows/release.yml` workflow builds + packages for all three platforms and publishes a GitHub Release with the artefacts. macOS code-signing + notarization runs automatically on every tag — the Developer ID Application certificate and App Store Connect API key are already configured as repo secrets.
 
 ## License
 
