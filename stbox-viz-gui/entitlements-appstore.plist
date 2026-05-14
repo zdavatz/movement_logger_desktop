@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Application identifier (must match provisioning profile). The
+         APPLE_TEAM_ID prefix is substituted in by the workflow. -->
+    <key>com.apple.application-identifier</key>
+    <string>__APPLE_TEAM_ID__.com.ywesee.movementlogger</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>__APPLE_TEAM_ID__</string>
+    <!-- App Sandbox: required for Mac App Store. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <!-- Hardened-runtime exemptions for egui/wgpu shader JIT. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <!-- File access: user-selected files (drop zone + file picker grant
+         the sandbox extension automatically; we re-declare it so the
+         output-folder picker also works). -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <!-- Bluetooth LE access for the FileSync panel (scan + connect to
+         STBoxSync, read SD-card files over GATT). Required under the
+         App Sandbox; the system shows a one-time consent prompt. -->
+    <key>com.apple.security.device.bluetooth</key>
+    <true/>
+</dict>
+</plist>

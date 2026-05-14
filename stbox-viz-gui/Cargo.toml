@@ -1,0 +1,52 @@
+[package]
+name = "movement-logger"
+version = "0.0.1"
+edition = "2021"
+description = "MovementLogger — drag-and-drop GUI front-end for stbox-viz animate. SensorTile.box pumpfoil session video generator."
+license = "GPL-3.0-only"
+authors = ["Zeno R.R. Davatz <zdavatz@ywesee.com>"]
+homepage = "https://github.com/zdavatz/movement_logger_desktop"
+repository = "https://github.com/zdavatz/movement_logger_desktop"
+
+# Binary name is intentionally the camel-case "MovementLogger" so that
+# the macOS .app's CFBundleExecutable, the Windows MSIX entry-point, and
+# the Linux launcher all match the user-facing product name without an
+# extra rename step.
+[[bin]]
+name = "MovementLogger"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.29"
+rfd = "0.15"
+anyhow = "1"
+chrono = "0.4"
+# Decode assets/icon.png at startup → window icon + in-app top-right
+# logo. Default-features off to avoid pulling JPEG/TIFF/etc. — we only
+# ever load the PNG that's baked in via include_bytes!.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# BLE backend for the FileSync panel (download Sens/Gps/Bat/log files
+# from the SensorTile.box without swapping the SD card). btleplug uses
+# CoreBluetooth on macOS, BlueZ on Linux, WinRT on Windows — runs on a
+# tokio runtime that lives on a single worker thread so the egui UI
+# stays sync. `time` for connection timeouts, `sync` for `Mutex`.
+btleplug = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+futures = "0.3"
+uuid = "1"
+
+# In-app updater: hits the GitHub Releases API on startup, and when the
+# user clicks "Update now" on macOS downloads the notarized DMG, swaps
+# the .app, and relaunches. rustls-tls keeps the build self-contained
+# (no OpenSSL on Linux, no Schannel quirks on Windows).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+
+# Build-time icon embedding for Windows .exe (so explorer / taskbar
+# show the MovementLogger icon without an MSIX wrapper). No-op on other
+# platforms via the cfg gate in build.rs.
+[build-dependencies]
+winres = "0.1"
+

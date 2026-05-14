@@ -1,0 +1,13 @@
+[package]
+name = "usb-console"
+version = "0.0.1"
+edition = "2021"
+description = "Live debug console for the SensorTile.box PRO USB CDC firmware"
+
+[[bin]]
+name = "usb-console"
+path = "src/main.rs"
+
+[dependencies]
+rusb = "0.9"
+ctrlc = "3"

@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "stbox-viz",
+    "stbox-viz-gui",
+    "usb-console",
+]
+exclude = [
+    # Vendored, patched winit fork pulled in via [patch.crates-io] from
+    # stbox-viz-gui — it ships its own workspace which we must not nest
+    # under this one.
+    "winit-patched",
+]
+
+# Apply the App-Store-safe winit patch globally so any workspace member
+# that pulls in winit transitively (eframe → winit) sees the fork. The
+# patch removes the private `_CGSSetWindowBackgroundBlurRadius` symbol
+# call from `Window::set_blur`. Required for Apple's binary scanner to
+# accept Mac App Store uploads. See workspace CLAUDE.md.
+[patch.crates-io]
+winit = { path = "winit-patched" }
+
+# Workspace-level release profile. Cargo silently ignores member-level
+# `[profile.*]` blocks in a workspace, so any tuning lives here.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+

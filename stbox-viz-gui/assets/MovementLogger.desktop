@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MovementLogger
+GenericName=Pumpfoil session video generator
+Comment=Drop sensor + GPS + camera footage to render annotated session videos
+Exec=MovementLogger
+Icon=MovementLogger
+Terminal=false
+Categories=Utility;Graphics;Science;
+Keywords=pumpfoil;sensor;telemetry;sensortile;hydrofoil;
+StartupWMClass=MovementLogger

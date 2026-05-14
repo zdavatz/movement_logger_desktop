@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>MovementLogger</string>
+    <key>CFBundleIconFile</key>
+    <string>icon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.ywesee.movementlogger</string>
+    <key>CFBundleName</key>
+    <string>MovementLogger</string>
+    <key>CFBundleDisplayName</key>
+    <string>MovementLogger</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © ywesee GmbH. GPL-3.0-only.</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <!-- macOS BLE consent prompt text. Shown the first time the
+         FileSync panel scans for STBoxSync; without this string the
+         CoreBluetooth call returns "denied" silently. -->
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>MovementLogger uses Bluetooth to scan for the SensorTile.box (STBoxSync) and download recorded sensor / GPS / battery files from its SD card.</string>
+</dict>
+</plist>
