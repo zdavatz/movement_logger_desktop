@@ -1,6 +1,10 @@
 # MovementLogger Desktop
 
-Cross-platform (Windows / macOS / Linux) drag-and-drop GUI for SensorTile.box pumpfoil session telemetry. Drop a sensor CSV (auto-pairs the matching `_gps.csv`), an optional camera `.mov`/`.mp4`, and an optional board `.stl`; fill in a few optional fields; click **Generate**. The GUI shells out to the bundled `stbox-viz animate` CLI to render the annotated session video.
+Cross-platform (Windows / macOS / Linux) GUI companion for the SensorTile.box pumpfoil rig. Three tabs:
+
+- **Live** — subscribe to the new PumpLogger firmware's SensorStream characteristic and watch real-time IMU + magnetometer + baro + GPS readings update at 0.5 Hz, plus running sparklines for acc magnitude and pressure.
+- **Sync** — BLE FileSync: scan, connect (PIN 123456), list, and download `Sens*.csv` / `*_gps.csv` / `Bat*.csv` files from the SD card. Downloaded files auto-route into the Replay tab.
+- **Replay** — drag-and-drop sensor CSV + optional camera `.mov`/`.mp4` + optional board `.stl`, fill in a few fields, click **Generate**. The GUI shells out to the bundled `stbox-viz animate` CLI to render the annotated session video.
 
 Sources imported from [`fp-sns-stbox1/Utilities/rust`](https://github.com/zdavatz/fp-sns-stbox1) so this repo can ship its own release cadence.
 

@@ -28,7 +28,7 @@ use std::sync::{
 };
 use std::thread;
 
-use ble::{BleBackend, BleCmd, BleEvent};
+use ble::{BleBackend, BleCmd, BleEvent, LiveSample};
 
 /// Bundled-into-binary 512×512 PNG. The build pipeline already
 /// generates this file at the canonical asset path; including it as
@@ -40,6 +40,26 @@ const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 // ---------------------------------------------------------------------------
 //  App state
 // ---------------------------------------------------------------------------
+
+/// Top-level navigation. Live first to match the panel order Peter
+/// asked for (Live → Sync → Replay); Android/iOS apps will grow a Live
+/// tab in the same slot when their BLE support catches up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    Live,
+    Sync,
+    Replay,
+}
+
+impl Default for Tab {
+    fn default() -> Self { Tab::Live }
+}
+
+/// Number of recent SensorStream samples held for the Live tab's
+/// running time-series chart. At the 0.5 Hz spec cadence this is the
+/// last ~4 minutes; plenty to spot drift / oscillation without holding
+/// state forever.
+const LIVE_HISTORY_LEN: usize = 120;
 
 #[derive(Default)]
 struct AppState {
@@ -135,6 +155,29 @@ struct AppState {
     /// in BLE mode and Scan-able). Drives the countdown banner that
     /// replaces the file list while the box is silent.
     ble_session_running: Option<(std::time::Instant, u32)>,
+
+    // ----- UI top-level tab + Live tab state ---------------------------
+    /// Active top-level tab — drives the central panel switch.
+    current_tab: Tab,
+    /// Most recent SensorStream snapshot. Cleared on disconnect.
+    latest_sample: Option<LiveSample>,
+    /// Wall-clock instant the latest sample arrived. Used for the
+    /// "x s ago" freshness label so the user notices a stalled stream.
+    latest_sample_at: Option<std::time::Instant>,
+    /// Rolling history of acc-magnitude samples (in g) for the small
+    /// time-series chart on the Live tab. Tuple = (t_seconds_relative,
+    /// acc_g_magnitude). Bounded by LIVE_HISTORY_LEN.
+    live_acc_history: VecDeque<(f64, f64)>,
+    /// Rolling history of pressure (hPa). Same bound.
+    live_pressure_history: VecDeque<(f64, f64)>,
+    /// `timestamp_ms` of the first sample in `live_*_history`, used to
+    /// rebase the X axis so the plot reads "seconds since start" rather
+    /// than "ms since box boot" (which has no user meaning).
+    live_t0_ms: Option<u32>,
+    /// Total number of SensorStream samples received this connection —
+    /// shown in the Live tab as a "n samples" counter so the user can
+    /// tell the stream is alive even when the values look static.
+    live_sample_count: u64,
 
     // ----- In-app updater ----------------------------------------------
     /// Receiver for the one-shot startup version-check thread.
@@ -595,6 +638,16 @@ impl AppState {
                     self.ble_status = "disconnected".into();
                     self.ble_dl_queue.clear();
                     self.ble_dl_in_flight = false;
+                    /* Drop live state too — the box can drop the stream
+                       mid-connection (e.g. flaky link) and the next
+                       reconnect should start from a clean history,
+                       not graft new samples onto stale chart data. */
+                    self.latest_sample = None;
+                    self.latest_sample_at = None;
+                    self.live_acc_history.clear();
+                    self.live_pressure_history.clear();
+                    self.live_t0_ms = None;
+                    self.live_sample_count = 0;
                 }
                 BleEvent::ListEntry { name, size } => {
                     /* Default-tick only sensor-data rows (Sens*.csv,
@@ -653,6 +706,31 @@ impl AppState {
                     self.ble_status = format!("deleted {name}");
                     self.ble_files.retain(|f| f.name != name);
                     push_log(&self.log, format!("ble: deleted {name}"));
+                }
+                BleEvent::Sample(s) => {
+                    self.latest_sample = Some(s);
+                    self.latest_sample_at = Some(std::time::Instant::now());
+                    self.live_sample_count = self.live_sample_count.saturating_add(1);
+                    // Rebase time axis on the first sample so the chart
+                    // X starts at 0 regardless of how long the box has
+                    // been booted.
+                    let t0 = *self.live_t0_ms.get_or_insert(s.timestamp_ms);
+                    let dt = (s.timestamp_ms.wrapping_sub(t0)) as f64 / 1000.0;
+                    let (ax, ay, az) = (
+                        s.acc_mg[0] as f64 / 1000.0,
+                        s.acc_mg[1] as f64 / 1000.0,
+                        s.acc_mg[2] as f64 / 1000.0,
+                    );
+                    let acc_g = (ax * ax + ay * ay + az * az).sqrt();
+                    let pres_hpa = s.pressure_pa as f64 / 100.0;
+                    if self.live_acc_history.len() >= LIVE_HISTORY_LEN {
+                        self.live_acc_history.pop_front();
+                    }
+                    if self.live_pressure_history.len() >= LIVE_HISTORY_LEN {
+                        self.live_pressure_history.pop_front();
+                    }
+                    self.live_acc_history.push_back((dt, acc_g));
+                    self.live_pressure_history.push_back((dt, pres_hpa));
                 }
                 BleEvent::Error(msg) => {
                     self.ble_status = format!("error: {msg}");
@@ -972,18 +1050,28 @@ fn render_file_group(
 }
 
 impl AppState {
-    fn ui_ble_panel(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("BLE FileSync (download from PumpTsueri)")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Scan, connect (PIN 123456), list SD files, download.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_gray(180)),
-                );
-                ui.add_space(4.0);
+    /// Sync tab — BLE FileSync: scan, connect, list SD files, download
+    /// them onto disk. Body identical to the pre-tabbed `ui_ble_panel`
+    /// (the CollapsingHeader is dropped because the whole tab is
+    /// dedicated to this content). Indentation is preserved verbatim to
+    /// keep the diff readable.
+    fn ui_sync_tab(&mut self, ui: &mut egui::Ui) {
+        // Header strip — tab is dedicated, but a clear top label helps
+        // when the user has muscle memory of the older collapsing UI.
+        ui.heading("Sync");
+        ui.label(
+            egui::RichText::new(
+                "BLE FileSync — scan, connect (PIN 123456), list SD files, download.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(180)),
+        );
+        ui.add_space(4.0);
+        // Block-scoped to keep the body's existing closure-flavoured
+        // indentation; the outer `ui` is borrowed mutably below.
+        let ui = ui;
+        {
+            {
 
                 /* LOG session countdown banner. During a session the box
                    is in LOG mode and doesn't advertise — Scan returns
@@ -1273,11 +1361,194 @@ impl AppState {
                         }
                     }
                 }
-            });
+            }
+        }
     }
 }
 
 impl AppState {
+    /// Live tab — renders the most recent SensorStream snapshot from
+    /// the connected box. Gated on already being connected via the
+    /// Sync tab (since Connect is a multi-step flow with scan results
+    /// and per-device buttons that don't fit nicely above a 6-row
+    /// readout). The 0.5 Hz cadence is fixed in firmware, so this
+    /// panel updates exactly twice a second.
+    fn ui_live_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Live");
+        ui.label(
+            egui::RichText::new(
+                "SensorStream — 0.5 Hz packed all-sensor snapshot \
+                 (IMU + mag + baro + GPS).",
+            )
+            .small()
+            .color(egui::Color32::from_gray(180)),
+        );
+
+        // ----- Connection / capability gate ------------------------
+        let connected = matches!(self.ble_state, BleState::Connected);
+        if !connected {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("Not connected.")
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Open the Sync tab, run Scan, and Connect to a box (PIN 123456). \
+                         The live stream starts automatically — no extra button needed.",
+                    )
+                    .color(egui::Color32::from_gray(200)),
+                );
+                ui.add_space(8.0);
+                if ui.button("Go to Sync").clicked() {
+                    self.current_tab = Tab::Sync;
+                }
+            });
+            return;
+        }
+
+        // ----- Status strip ----------------------------------------
+        ui.add_space(6.0);
+        let freshness = self.latest_sample_at.map(|t| t.elapsed());
+        let stale = freshness.map(|d| d.as_secs() > 5).unwrap_or(true);
+        ui.horizontal(|ui| {
+            ui.label(format!("{} samples received", self.live_sample_count));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match freshness {
+                    Some(d) if !stale => {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_GREEN,
+                            format!("last sample {} ms ago", d.as_millis()),
+                        );
+                    }
+                    Some(d) => {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_YELLOW,
+                            format!(
+                                "no sample for {} s — check connection",
+                                d.as_secs()
+                            ),
+                        );
+                    }
+                    None => {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_YELLOW,
+                            "waiting for first SensorStream notify…",
+                        );
+                    }
+                }
+            });
+        });
+        // Keep ticking at ~4 Hz so the freshness label updates between
+        // samples without waiting on user input.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        ui.separator();
+
+        // ----- Readouts --------------------------------------------
+        let Some(s) = self.latest_sample else {
+            return;
+        };
+        let acc_g = |i: usize| s.acc_mg[i] as f32 / 1000.0;
+        let gyro_dps = |i: usize| s.gyro_cdps[i] as f32 / 100.0;
+        let pres_hpa = s.pressure_pa as f64 / 100.0;
+        let temp_c = s.temperature_cc as f32 / 100.0;
+
+        egui::Grid::new("live-readouts")
+            .num_columns(4)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Accel (g)").strong());
+                ui.label(format!("X {:+.3}", acc_g(0)));
+                ui.label(format!("Y {:+.3}", acc_g(1)));
+                ui.label(format!("Z {:+.3}", acc_g(2)));
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Gyro (°/s)").strong());
+                ui.label(format!("X {:+.2}", gyro_dps(0)));
+                ui.label(format!("Y {:+.2}", gyro_dps(1)));
+                ui.label(format!("Z {:+.2}", gyro_dps(2)));
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Mag (mG)").strong());
+                ui.label(format!("X {:+}", s.mag_mg[0]));
+                ui.label(format!("Y {:+}", s.mag_mg[1]));
+                ui.label(format!("Z {:+}", s.mag_mg[2]));
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Baro").strong());
+                ui.label(format!("{:.2} hPa", pres_hpa));
+                ui.label(format!("{:+.2} °C", temp_c));
+                ui.label(""); // pad to 4 cols
+                ui.end_row();
+
+                ui.label(egui::RichText::new("GPS").strong());
+                if let Some((lat, lon)) = s.lat_lon_deg() {
+                    ui.label(format!("{:.6}°", lat));
+                    ui.label(format!("{:.6}°", lon));
+                    ui.label(format!("{} m", s.gps_alt_m));
+                } else {
+                    // No fix yet (or no GPS module). Make the empty
+                    // state obvious so the user doesn't read "0.0, 0.0"
+                    // and panic.
+                    ui.colored_label(
+                        egui::Color32::LIGHT_YELLOW,
+                        "no fix",
+                    );
+                    ui.label("");
+                    ui.label("");
+                }
+                ui.end_row();
+
+                ui.label(egui::RichText::new("GPS aux").strong());
+                ui.label(format!("{} sats", s.gps_nsat));
+                ui.label(format!("fix-q {}", s.gps_fix_q));
+                ui.label(format!(
+                    "{:.2} km/h  ({:.1}°)",
+                    s.gps_speed_cmh as f64 / 100.0,
+                    s.gps_course_cdeg as f64 / 100.0,
+                ));
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Flags").strong());
+                let flag_col = |on: bool| {
+                    if on { egui::Color32::LIGHT_GREEN }
+                    else  { egui::Color32::from_gray(120) }
+                };
+                ui.colored_label(flag_col(s.gps_valid),     "gps_valid");
+                ui.colored_label(flag_col(s.logging_active), "logging");
+                ui.colored_label(flag_col(s.low_battery),    "low_batt");
+                ui.end_row();
+            });
+
+        ui.add_space(10.0);
+        ui.separator();
+
+        // ----- Sparklines ------------------------------------------
+        // Two thin painter-drawn time-series — acc magnitude (g) and
+        // pressure (hPa). At 0.5 Hz × 120 samples ≈ 4 min of history.
+        // egui_plot would give axis labels for free but pulls in another
+        // crate; for v0.0.3 the bare polylines are enough to spot
+        // oscillation / pressure trend at a glance.
+        ui.label(egui::RichText::new("Acc magnitude (g)").strong());
+        draw_sparkline(
+            ui,
+            &self.live_acc_history,
+            egui::Color32::from_rgb(80, 180, 250),
+            (0.5, 1.5),
+        );
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Pressure (hPa)").strong());
+        draw_sparkline(
+            ui,
+            &self.live_pressure_history,
+            egui::Color32::from_rgb(250, 180, 80),
+            (980.0, 1030.0),
+        );
+    }
+
     fn ingest_dropped(&mut self, files: &[egui::DroppedFile]) {
         for f in files {
             let Some(path) = f.path.as_ref() else { continue };
@@ -1390,11 +1661,40 @@ impl eframe::App for AppState {
             });
         });
 
+        // ----- Tab strip ---------------------------------------------
+        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                for (tab, label) in [
+                    (Tab::Live,   "Live"),
+                    (Tab::Sync,   "Sync"),
+                    (Tab::Replay, "Replay"),
+                ] {
+                    let selected = self.current_tab == tab;
+                    // SelectableLabel gives us the standard egui
+                    // pressed-look without the heavy CollapsingHeader
+                    // chrome. Click switches tabs.
+                    if ui.add(egui::SelectableLabel::new(selected, label)).clicked() {
+                        self.current_tab = tab;
+                    }
+                }
+            });
+            ui.add_space(2.0);
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(6.0);
 
             // ----- Update banner --------------------------------------
+            // Shared across all tabs so a user on Live still sees
+            // "Update available" without having to switch panes.
             self.render_update_banner(ui);
+
+            match self.current_tab {
+                Tab::Live   => { self.ui_live_tab(ui);   return; }
+                Tab::Sync   => { self.ui_sync_tab(ui);   return; }
+                Tab::Replay => { /* fall through to original layout */ }
+            }
 
             // ----- Drop zone ------------------------------------------
             let zone_color = if hovering {
@@ -1445,11 +1745,6 @@ impl eframe::App for AppState {
                     file_row(ui, "Board STL", &mut self.board_stl, &[("STL", &["stl"])]);
                     ui.end_row();
                 });
-
-            ui.separator();
-
-            // ----- BLE FileSync panel ---------------------------------
-            self.ui_ble_panel(ui);
 
             ui.separator();
 
@@ -1694,6 +1989,81 @@ fn file_row(
             *target = None;
         }
     });
+}
+
+/// Render a small painter-drawn time-series of `(t_s, value)` samples
+/// into the current row. `default_range` provides initial Y bounds when
+/// the data span is tiny (so a near-static value doesn't render as a
+/// flat line jittering on noise); when the actual sample range exceeds
+/// it, the painter expands to fit. Width fills available space; height
+/// is a fixed 60 px so two sparklines stack neatly without resize math.
+fn draw_sparkline(
+    ui: &mut egui::Ui,
+    history: &VecDeque<(f64, f64)>,
+    color: egui::Color32,
+    default_range: (f64, f64),
+) {
+    let desired = egui::vec2(ui.available_width(), 60.0);
+    let (rect, _resp) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    // Frame
+    painter.rect_filled(
+        rect,
+        4.0,
+        egui::Color32::from_rgb(20, 20, 28),
+    );
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+    );
+    if history.len() < 2 {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "waiting for samples…",
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_gray(140),
+        );
+        return;
+    }
+    let t_min = history.front().unwrap().0;
+    let t_max = history.back().unwrap().0.max(t_min + 1.0);
+    let mut v_min = default_range.0;
+    let mut v_max = default_range.1;
+    for &(_t, v) in history {
+        v_min = v_min.min(v);
+        v_max = v_max.max(v);
+    }
+    if (v_max - v_min).abs() < 1e-9 {
+        v_max = v_min + 1.0;
+    }
+    // Map sample → rect-local pixel.
+    let to_px = |t: f64, v: f64| -> egui::Pos2 {
+        let tx = (t - t_min) / (t_max - t_min);
+        let vy = (v - v_min) / (v_max - v_min);
+        let x = rect.left() + tx as f32 * rect.width();
+        // Flip Y so larger values draw higher.
+        let y = rect.bottom() - vy as f32 * rect.height();
+        egui::pos2(x, y)
+    };
+    let pts: Vec<egui::Pos2> = history.iter().map(|&(t, v)| to_px(t, v)).collect();
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.4, color)));
+    // Min/max labels in the corners so the user knows the Y scale.
+    painter.text(
+        egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        format!("{:.2}", v_max),
+        egui::FontId::proportional(10.0),
+        egui::Color32::from_gray(180),
+    );
+    painter.text(
+        egui::pos2(rect.left() + 4.0, rect.bottom() - 12.0),
+        egui::Align2::LEFT_TOP,
+        format!("{:.2}", v_min),
+        egui::FontId::proportional(10.0),
+        egui::Color32::from_gray(180),
+    );
 }
 
 #[cfg(target_os = "macos")]

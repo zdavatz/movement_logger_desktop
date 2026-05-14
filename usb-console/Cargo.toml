@@ -1,6 +1,6 @@
 [package]
 name = "usb-console"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "Live debug console for the SensorTile.box PRO USB CDC firmware"
 

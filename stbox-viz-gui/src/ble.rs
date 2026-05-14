@@ -41,9 +41,18 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
-const BOX_NAME:    &str  = "PumpTsueri";
-const FILECMD_UUID: Uuid = Uuid::from_u128(0x00000080_0010_11e1_ac36_0002a5d5c51b);
+/// Accepted advertise names. `PumpTsueri` is the legacy SDDataLogFileX
+/// firmware; `STBoxFs` is the bare-metal PumpLogger firmware (Peter's
+/// PR #18). Match either so a single GUI build handles both during the
+/// firmware transition.
+const BOX_NAMES: &[&str] = &["PumpTsueri", "STBoxFs"];
+
+const FILECMD_UUID:  Uuid = Uuid::from_u128(0x00000080_0010_11e1_ac36_0002a5d5c51b);
 const FILEDATA_UUID: Uuid = Uuid::from_u128(0x00000040_0010_11e1_ac36_0002a5d5c51b);
+/// SensorStream — 0.5 Hz packed 46-byte all-sensor snapshot. New in
+/// PumpLogger; not present in SDDataLogFileX (optional characteristic).
+/// See DESIGN.md §3 for the byte layout.
+const STREAM_UUID:   Uuid = Uuid::from_u128(0x00000100_0010_11e1_ac36_0002a5d5c51b);
 
 /// Watchdog — if no notification arrives for this long during an active
 /// LIST or READ, give up and surface a timeout error so the user isn't
@@ -109,6 +118,94 @@ pub enum BleEvent {
     DeleteDone { name: String },
     /// User-facing error — display in the log panel.
     Error(String),
+    /// One decoded SensorStream snapshot (0.5 Hz). Only emitted while
+    /// connected to a PumpLogger firmware that exposes the SensorStream
+    /// characteristic; legacy PumpTsueri builds never produce this event.
+    Sample(LiveSample),
+}
+
+/// One decoded SensorStream snapshot. Mirrors the 46-byte packed layout
+/// from DESIGN.md §3, scaled into convenient SI-ish units so the UI
+/// doesn't need to know the wire encoding.
+#[derive(Clone, Copy, Debug)]
+pub struct LiveSample {
+    /// Box-local monotonic milliseconds since boot. Used as the X axis
+    /// for time-series plots; not wall-clock time (the firmware has no
+    /// RTC).
+    pub timestamp_ms: u32,
+    /// Linear acceleration, mg per axis (LSM6DSV16X).
+    pub acc_mg: [i16; 3],
+    /// Angular rate, centi-degrees per second per axis (= raw_LSB ×
+    /// 1.75 truncated to i16; ±327.67 dps range). Divide by 100 for °/s.
+    pub gyro_cdps: [i16; 3],
+    /// Magnetic field, milligauss per axis (LIS2MDL).
+    pub mag_mg: [i16; 3],
+    /// Barometric pressure, raw Pascal (LPS22DF). Divide by 100 for hPa.
+    pub pressure_pa: i32,
+    /// Air temperature, 0.01 °C steps. Divide by 100 for °C.
+    pub temperature_cc: i16,
+    /// GPS latitude × 10⁷ (degrees). `0x7FFFFFFF` = no fix yet.
+    pub gps_lat_e7: i32,
+    /// GPS longitude × 10⁷.
+    pub gps_lon_e7: i32,
+    /// GPS altitude, signed metres.
+    pub gps_alt_m: i16,
+    /// GPS speed, cm/h × 10 (~ km/h × 100). Divide by 36 for km/h …
+    pub gps_speed_cmh: i16,
+    /// GPS course, centi-degrees (0..35999).
+    pub gps_course_cdeg: i16,
+    /// Fix quality. 0 = no fix, 1 = GPS, …
+    pub gps_fix_q: u8,
+    /// Number of satellites used in the current fix.
+    pub gps_nsat: u8,
+    /// True when the most-recent GPS fix is fresh (≤ 5 s old).
+    pub gps_valid: bool,
+    /// True when the firmware is also writing this snapshot to SD.
+    /// Normally always set in the no-mode design.
+    pub logging_active: bool,
+    /// True when the firmware has raised the low-battery warning.
+    pub low_battery: bool,
+}
+
+impl LiveSample {
+    /// Decode the 46-byte little-endian wire layout (DESIGN.md §3).
+    /// Returns None if `bytes` is the wrong length; the caller has
+    /// already reassembled chunked frames into 46 contiguous bytes
+    /// before reaching here.
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 46 { return None; }
+        // Length is fixed, so the slice → array conversions can't fail.
+        // `unwrap` keeps the call sites readable; the bounds check above
+        // is the precondition.
+        let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        let i32_at = |o: usize| i32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        let i16_at = |o: usize| i16::from_le_bytes(bytes[o..o + 2].try_into().unwrap());
+        let flags = bytes[44];
+        Some(Self {
+            timestamp_ms:    u32_at(0),
+            acc_mg:          [i16_at(4),  i16_at(6),  i16_at(8)],
+            gyro_cdps:       [i16_at(10), i16_at(12), i16_at(14)],
+            mag_mg:          [i16_at(16), i16_at(18), i16_at(20)],
+            pressure_pa:     i32_at(22),
+            temperature_cc:  i16_at(26),
+            gps_lat_e7:      i32_at(28),
+            gps_lon_e7:      i32_at(32),
+            gps_alt_m:       i16_at(36),
+            gps_speed_cmh:   i16_at(38),
+            gps_course_cdeg: i16_at(40),
+            gps_fix_q:       bytes[42],
+            gps_nsat:        bytes[43],
+            gps_valid:       flags & 0x01 != 0,
+            low_battery:     flags & 0x02 != 0,
+            logging_active:  flags & 0x04 != 0,
+        })
+    }
+
+    /// `lat_e7`/`lon_e7` as float degrees if the fix is valid, else None.
+    pub fn lat_lon_deg(&self) -> Option<(f64, f64)> {
+        if !self.gps_valid || self.gps_lat_e7 == i32::MAX { return None; }
+        Some((self.gps_lat_e7 as f64 / 1.0e7, self.gps_lon_e7 as f64 / 1.0e7))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -257,12 +354,33 @@ enum CurrentOp {
 
 type NotifStream = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
 
+/// 3-chunk reassembly state for the SensorStream MTU-fallback path
+/// (DESIGN.md §3 "MTU negotiation"). When the negotiated MTU is too
+/// small for a 46-byte single notify, the firmware splits the snapshot
+/// across three sequential notifies with first-byte sequence indices
+/// 0x00 / 0x01 / 0x02. Independent from `CurrentOp` because the stream
+/// runs concurrently with FileSync ops; a misordered or partial frame
+/// is silently dropped on the next 0x00 start byte.
+#[derive(Default)]
+struct StreamAsm {
+    buf: Vec<u8>,
+    /// Index of the next expected chunk (0 → wait for start, 1 / 2 →
+    /// middle / end).
+    next: u8,
+}
+
 struct WorkerState {
-    evt_tx:      Sender<BleEvent>,
-    adapter:     Option<Adapter>,
-    peripheral:  Option<Peripheral>,
+    evt_tx:       Sender<BleEvent>,
+    adapter:      Option<Adapter>,
+    peripheral:   Option<Peripheral>,
     notif_stream: Option<NotifStream>,
-    op:          CurrentOp,
+    op:           CurrentOp,
+    /// SensorStream chunked-mode reassembly buffer.
+    stream_asm:   StreamAsm,
+    /// True iff the connected peripheral exposed the SensorStream
+    /// characteristic — kept so we can emit a one-shot status line
+    /// telling the user whether the box's firmware supports live data.
+    stream_capable: bool,
 }
 
 impl WorkerState {
@@ -273,6 +391,8 @@ impl WorkerState {
             peripheral: None,
             notif_stream: None,
             op: CurrentOp::Idle,
+            stream_asm: StreamAsm::default(),
+            stream_capable: false,
         }
     }
 
@@ -341,24 +461,25 @@ impl WorkerState {
             let name  = props.as_ref().and_then(|pp| pp.local_name.clone());
             let addr  = props.as_ref().map(|pp| pp.address.to_string()).unwrap_or_default();
             // Debug: log every peripheral btleplug returned so we can see why
-            // PumpTsueri may be missing (cached as old name, no local_name in
-            // adv, etc.). Diagnostic — can be removed once stable.
+            // a known box may be missing (cached as old name, no local_name
+            // in adv, etc.). Diagnostic — can be removed once stable.
             self.emit(BleEvent::Status(format!(
                 "  seen: addr={} name={:?}", addr, name
             )));
-            // Match by name OR by MAC (in case btleplug didn't get local_name).
-            let name_ok = name.as_deref() == Some(BOX_NAME);
+            let name_ok = name.as_deref()
+                .map(|n| BOX_NAMES.iter().any(|w| *w == n))
+                .unwrap_or(false);
             if name_ok {
                 matched += 1;
                 self.emit(BleEvent::Discovered {
                     id: p.id().to_string(),
-                    name: name.unwrap_or_else(|| BOX_NAME.into()),
+                    name: name.unwrap_or_else(|| BOX_NAMES[0].into()),
                     rssi: props.and_then(|pp| pp.rssi),
                 });
             }
         }
         self.emit(BleEvent::Status(format!(
-            "scan saw {} peripheral(s), {} matched {}", all_count, matched, BOX_NAME
+            "scan saw {} peripheral(s), {} matched {:?}", all_count, matched, BOX_NAMES
         )));
         self.emit(BleEvent::ScanStopped);
     }
@@ -387,26 +508,50 @@ impl WorkerState {
             let _ = p.disconnect().await;
             return;
         }
-        // Verify both characteristics are present — bail loud if the
-        // box is running an old firmware that doesn't expose FileSync.
+        // Verify FileSync characteristics are present — bail loud if the
+        // box is running an old firmware that doesn't expose them.
         let chars = p.characteristics();
         let data_char = match chars.iter().find(|c| c.uuid == FILEDATA_UUID).cloned() {
             Some(c) => c,
             None => {
-                self.emit_err("PumpTsueri firmware doesn't expose FileSync chars — flash a newer build");
+                self.emit_err("Box firmware doesn't expose FileSync chars — flash a newer build");
                 let _ = p.disconnect().await;
                 return;
             }
         };
         if !chars.iter().any(|c| c.uuid == FILECMD_UUID) {
-            self.emit_err("PumpTsueri firmware doesn't expose FileSync chars — flash a newer build");
+            self.emit_err("Box firmware doesn't expose FileSync chars — flash a newer build");
             let _ = p.disconnect().await;
             return;
         }
         if let Err(e) = p.subscribe(&data_char).await {
-            self.emit_err(format!("subscribe: {e}"));
+            self.emit_err(format!("subscribe FileData: {e}"));
             let _ = p.disconnect().await;
             return;
+        }
+        // SensorStream is optional — only PumpLogger (Peter's PR #18)
+        // firmware exposes it. Subscribe if present, log if not, but
+        // never fail the connect: legacy SDDataLogFileX firmware (the
+        // PumpTsueri name) is FileSync-only and must keep working.
+        self.stream_capable = false;
+        if let Some(stream_char) = chars.iter().find(|c| c.uuid == STREAM_UUID).cloned() {
+            match p.subscribe(&stream_char).await {
+                Ok(()) => {
+                    self.stream_capable = true;
+                    self.emit(BleEvent::Status("SensorStream subscribed (live data at 0.5 Hz)".into()));
+                }
+                Err(e) => {
+                    /* Soft-fail: log it and carry on without live data.
+                       The user will still get FileSync. */
+                    self.emit(BleEvent::Status(format!(
+                        "SensorStream subscribe failed ({e}) — live tab will be empty"
+                    )));
+                }
+            }
+        } else {
+            self.emit(BleEvent::Status(
+                "SensorStream characteristic not advertised — legacy firmware, live tab will be empty".into()
+            ));
         }
         // Open the persistent notification stream BEFORE storing the
         // peripheral so a failure here drops everything cleanly.
@@ -440,8 +585,10 @@ impl WorkerState {
         } else if let CurrentOp::Deleting { name, .. } = &self.op {
             self.emit_err(format!("DELETE {name} aborted by disconnect"));
         }
-        self.op           = CurrentOp::Idle;
-        self.notif_stream = None;
+        self.op             = CurrentOp::Idle;
+        self.notif_stream   = None;
+        self.stream_asm     = StreamAsm::default();
+        self.stream_capable = false;
         if let Some(p) = self.peripheral.take() {
             let _ = p.disconnect().await;
         }
@@ -577,6 +724,12 @@ impl WorkerState {
     // ---------------- Notification dispatch --------------------------------
 
     async fn handle_notification(&mut self, n: ValueNotification) {
+        // SensorStream notifies are concurrent with FileSync, so handle
+        // them on their own path before touching `op`.
+        if n.uuid == STREAM_UUID {
+            self.handle_stream_notification(&n.value);
+            return;
+        }
         if n.uuid != FILEDATA_UUID { return; }
 
         // Take ownership of the op so we can mutate it freely without
@@ -685,6 +838,76 @@ impl WorkerState {
         // complete), put it back.
         if matches!(self.op, CurrentOp::Idle) {
             self.op = op;
+        }
+    }
+
+    // ---------------- SensorStream dispatch --------------------------------
+
+    /// Handle one notify on the SensorStream characteristic. Resolves
+    /// the two transport modes described in DESIGN.md §3:
+    ///
+    /// - **Single-notify (MTU upgrade accepted)**: payload is exactly
+    ///   46 bytes; decode + emit.
+    /// - **Chunked fallback (default-MTU host)**: three sequential
+    ///   notifies prefixed with sequence byte 0x00 / 0x01 / 0x02 over
+    ///   payloads of ~20 bytes each; reassemble into 46 bytes, decode,
+    ///   emit. Out-of-sequence chunks silently reset the reassembly to
+    ///   wait for the next 0x00 start.
+    ///
+    /// Malformed packets are dropped silently — the stream auto-resyncs
+    /// on the next 0x00, and at 0.5 Hz a lost frame is a 2 s gap that
+    /// the user might not even notice.
+    fn handle_stream_notification(&mut self, bytes: &[u8]) {
+        if bytes.len() == 46 {
+            // Single-notify path. Reset any in-flight chunked frame so
+            // a mid-frame MTU upgrade doesn't leave the asm in a bad
+            // state for the next chunked frame (defensive — should be
+            // either-or in practice).
+            self.stream_asm = StreamAsm::default();
+            if let Some(s) = LiveSample::parse(bytes) {
+                self.emit(BleEvent::Sample(s));
+            }
+            return;
+        }
+
+        // Chunked-mode path: 20-ish byte notifies with seq byte first.
+        if bytes.is_empty() { return; }
+        let seq = bytes[0];
+        let body = &bytes[1..];
+
+        match seq {
+            0x00 => {
+                // Start of a new frame — reset and seed with body bytes.
+                self.stream_asm.buf.clear();
+                self.stream_asm.buf.extend_from_slice(body);
+                self.stream_asm.next = 1;
+            }
+            0x01 => {
+                if self.stream_asm.next != 1 {
+                    // Out-of-order; drop and wait for the next 0x00.
+                    self.stream_asm = StreamAsm::default();
+                    return;
+                }
+                self.stream_asm.buf.extend_from_slice(body);
+                self.stream_asm.next = 2;
+            }
+            0x02 => {
+                if self.stream_asm.next != 2 {
+                    self.stream_asm = StreamAsm::default();
+                    return;
+                }
+                self.stream_asm.buf.extend_from_slice(body);
+                if self.stream_asm.buf.len() == 46 {
+                    if let Some(s) = LiveSample::parse(&self.stream_asm.buf) {
+                        self.emit(BleEvent::Sample(s));
+                    }
+                }
+                self.stream_asm = StreamAsm::default();
+            }
+            _ => {
+                // Unknown sequence byte — corrupt frame, reset.
+                self.stream_asm = StreamAsm::default();
+            }
         }
     }
 
