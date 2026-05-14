@@ -7,7 +7,7 @@
 
 use serde::Deserialize;
 
-const REPO: &str = "zdavatz/fp-sns-stbox1";
+const REPO: &str = "zdavatz/movement_logger_desktop";
 const TAG_PREFIX: &str = "v";
 
 #[derive(Deserialize)]
