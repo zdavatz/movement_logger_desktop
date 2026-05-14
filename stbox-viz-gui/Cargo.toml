@@ -1,6 +1,6 @@
 [package]
 name = "movement-logger"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 description = "MovementLogger — drag-and-drop GUI front-end for stbox-viz animate. SensorTile.box pumpfoil session video generator."
 license = "GPL-3.0-only"
@@ -49,4 +49,12 @@ serde = { version = "1", features = ["derive"] }
 # platforms via the cfg gate in build.rs.
 [build-dependencies]
 winres = "0.1"
+
+# Used only by examples/ble_probe.rs — a headless BLE diagnostic that
+# exercises the same scan + connect + subscribe sequence as the GUI but
+# routes btleplug's internal log output to stderr via env_logger so we
+# can capture which step fails on flaky macOS connects. Not pulled into
+# the shipped binary.
+[dev-dependencies]
+env_logger = "0.11"
 

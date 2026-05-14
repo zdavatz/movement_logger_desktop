@@ -45,6 +45,12 @@ use uuid::Uuid;
 /// firmware; `STBoxFs` is the bare-metal PumpLogger firmware (Peter's
 /// PR #18). Match either so a single GUI build handles both during the
 /// firmware transition.
+///
+/// Matched as a **substring**, not exact equality: the BlueNRG-LP SDK
+/// historically (pre-firmware-v0.0.3) populated the GAP Device Name
+/// characteristic with `BlueNRG [<configured>]`, which macOS Core
+/// Bluetooth then cached and replayed on scans — exact matching
+/// silently dropped the box. See issue #1.
 const BOX_NAMES: &[&str] = &["PumpTsueri", "STBoxFs"];
 
 const FILECMD_UUID:  Uuid = Uuid::from_u128(0x00000080_0010_11e1_ac36_0002a5d5c51b);
@@ -467,7 +473,7 @@ impl WorkerState {
                 "  seen: addr={} name={:?}", addr, name
             )));
             let name_ok = name.as_deref()
-                .map(|n| BOX_NAMES.iter().any(|w| *w == n))
+                .map(|n| BOX_NAMES.iter().any(|w| n.contains(w)))
                 .unwrap_or(false);
             if name_ok {
                 matched += 1;
