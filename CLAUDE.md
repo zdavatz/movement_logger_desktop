@@ -38,6 +38,8 @@ The GUI is intentionally thin: it composes a `stbox-viz animate …` command lin
 
 The egui UI is organised into three top-level tabs (`enum Tab` in `main.rs`): **Live** (SensorStream readouts), **Sync** (BLE FileSync), **Replay** (drag-and-drop CSV → animated video). Default tab is Live so the box-connected workflow lands there first; the previous single-panel layout collapsed into Replay. The egui top-bar in `update()` switches between them; the update-banner is rendered once above the active tab.
 
+The Live tab derives an "Orient (°)" row (pitch / roll / heading) inline in `ui_live_tab` from the raw accel + mag values — standard eCompass formulas, no fusion filter. Pitch/roll are only meaningful when |acc| ≈ 1 g (between strokes), and heading is mag-only (no gyro integration) so it wobbles visibly when the board moves. If a future change needs smoothed orientation, lift the math out of `ui_live_tab` into a filter that consumes `BleEvent::Sample` in `pump_ble_events` instead.
+
 BLE (`stbox-viz-gui/src/ble.rs`) runs its own tokio current-thread runtime on a worker thread; commands/events shuttle across `std::sync::mpsc` so the egui UI stays sync. Single notification stream demuxed by a `select!` loop on the worker side; the stream now carries both FileSync (FileData UUID `…40…`) and SensorStream (UUID `…100…`) notifies, branched on UUID. SensorStream is subscribed on Connect when the characteristic is present (PumpLogger firmware) and silently skipped on legacy SDDataLogFileX (`PumpTsueri`) builds. Wire spec for the 46-byte packed snapshot lives in upstream `DESIGN.md` §3; `LiveSample::parse` mirrors it.
 
 Two transport modes:

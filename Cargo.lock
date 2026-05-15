@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "movement-logger"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "btleplug",
@@ -3832,7 +3832,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stbox-viz"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4268,7 +4268,7 @@ checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "usb-console"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "ctrlc",
  "rusb",

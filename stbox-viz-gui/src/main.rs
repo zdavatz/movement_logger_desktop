@@ -1456,6 +1456,31 @@ impl AppState {
         let pres_hpa = s.pressure_pa as f64 / 100.0;
         let temp_c = s.temperature_cc as f32 / 100.0;
 
+        // Tilt-compensated orientation from the gravity + magnetic
+        // vectors. Pitch/roll come straight out of the accel reading
+        // (assumes the box is roughly static / 1 g, which is true at
+        // 0.5 Hz for a board on the water between strokes). Heading is
+        // the mag vector projected onto the local horizontal plane
+        // after de-rotating by pitch/roll — the standard "eCompass"
+        // formula. Result is in degrees; heading is wrapped to 0..360.
+        let (pitch_deg, roll_deg, heading_deg) = {
+            let ax = acc_g(0) as f64;
+            let ay = acc_g(1) as f64;
+            let az = acc_g(2) as f64;
+            let roll  = ay.atan2(az);
+            let pitch = (-ax).atan2((ay * ay + az * az).sqrt());
+            let mx = s.mag_mg[0] as f64;
+            let my = s.mag_mg[1] as f64;
+            let mz = s.mag_mg[2] as f64;
+            let (sr, cr) = (roll.sin(), roll.cos());
+            let (sp, cp) = (pitch.sin(), pitch.cos());
+            let xh = mx * cp + mz * sp;
+            let yh = mx * sr * sp + my * cr - mz * sr * cp;
+            let mut heading = (-yh).atan2(xh).to_degrees();
+            if heading < 0.0 { heading += 360.0; }
+            (pitch.to_degrees(), roll.to_degrees(), heading)
+        };
+
         egui::Grid::new("live-readouts")
             .num_columns(4)
             .spacing([16.0, 8.0])
@@ -1476,6 +1501,12 @@ impl AppState {
                 ui.label(format!("X {:+}", s.mag_mg[0]));
                 ui.label(format!("Y {:+}", s.mag_mg[1]));
                 ui.label(format!("Z {:+}", s.mag_mg[2]));
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Orient (°)").strong());
+                ui.label(format!("pitch {:+6.1}", pitch_deg));
+                ui.label(format!("roll {:+6.1}",  roll_deg));
+                ui.label(format!("hdg {:6.1}",    heading_deg));
                 ui.end_row();
 
                 ui.label(egui::RichText::new("Baro").strong());
