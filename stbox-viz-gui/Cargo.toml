@@ -1,6 +1,6 @@
 [package]
 name = "movement-logger"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 description = "MovementLogger — drag-and-drop GUI front-end for stbox-viz animate. SensorTile.box pumpfoil session video generator."
 license = "GPL-3.0-only"
@@ -43,6 +43,13 @@ uuid = "1"
 # (no OpenSSL on Linux, no Schannel quirks on Windows).
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
+
+# Local sync-state DB: tracks, per box, which SD-card files have
+# already been pulled so "Sync now" only fetches new sessions. The
+# `bundled` feature compiles SQLite from source so there's no system
+# libsqlite dependency — keeps the build self-contained the same way
+# rustls-tls does for TLS.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Build-time icon embedding for Windows .exe (so explorer / taskbar
 # show the MovementLogger icon without an MSIX wrapper). No-op on other

@@ -16,6 +16,7 @@
 
 mod ble;
 mod installer;
+mod sync_db;
 mod update;
 
 use eframe::egui;
@@ -155,6 +156,23 @@ struct AppState {
     /// in BLE mode and Scan-able). Drives the countdown banner that
     /// replaces the file list while the box is silent.
     ble_session_running: Option<(std::time::Instant, u32)>,
+
+    // ----- Sync (vs. plain transfer) -----------------------------------
+    /// Peripheral id of the box we're connected to, captured at Connect
+    /// time. Used as the per-box key in the sync DB so two different
+    /// boxes don't share sync history. Cleared on disconnect.
+    ble_connected_id: Option<String>,
+    /// Lazily-opened local sync-state DB (`~/.movementlogger/sync.db`).
+    /// `None` until the first sync; stays `None` (sync disabled, msg
+    /// set) if the DB can't be opened.
+    sync_db: Option<sync_db::SyncDb>,
+    /// True between a "Sync now" click and the LIST it triggers coming
+    /// back: the ListDone handler runs the diff only when this is set,
+    /// so the auto-LIST on Connect doesn't accidentally start a sync.
+    ble_sync_pending: bool,
+    /// One-line sync result/status ("Sync: 3 new, 12 already synced —
+    /// downloading…"), shown in the Sync tab. Empty = no sync yet.
+    ble_sync_msg: String,
 
     // ----- UI top-level tab + Live tab state ---------------------------
     /// Active top-level tab — drives the central panel switch.
@@ -628,6 +646,7 @@ impl AppState {
                        list pane already showed "No file list yet — hit
                        Refresh." which looked like a transient state. */
                     self.ble_files.clear();
+                    self.ble_sync_msg.clear();
                     if let Some(b) = self.ble.as_ref() {
                         b.send(BleCmd::List);
                     }
@@ -648,6 +667,8 @@ impl AppState {
                     self.live_pressure_history.clear();
                     self.live_t0_ms = None;
                     self.live_sample_count = 0;
+                    self.ble_connected_id = None;
+                    self.ble_sync_pending = false;
                 }
                 BleEvent::ListEntry { name, size } => {
                     /* Default-tick only sensor-data rows (Sens*.csv,
@@ -665,6 +686,15 @@ impl AppState {
                 }
                 BleEvent::ListDone => {
                     self.ble_status = format!("listing done ({} files)", self.ble_files.len());
+                    /* A "Sync now" click clears the list and sends LIST,
+                       then waits here: the diff needs the *complete*
+                       fresh listing, not whatever was on screen before.
+                       The auto-LIST on Connect leaves ble_sync_pending
+                       false, so it never triggers a sync by itself. */
+                    if self.ble_sync_pending {
+                        self.ble_sync_pending = false;
+                        self.run_sync_diff();
+                    }
                 }
                 BleEvent::ReadStarted { name, size } => {
                     self.ble_status = format!("reading {name} ({size} B)…");
@@ -693,6 +723,34 @@ impl AppState {
                             // Generate without re-dragging.
                             self.auto_route_downloaded(&name, &path);
                             push_log(&self.log, format!("ble: saved {}", path.display()));
+                            /* Record into the sync DB regardless of how
+                               this read was triggered (Sync now *or* a
+                               manual "Download selected"): a file that's
+                               already on disk shouldn't be re-pulled by
+                               a later sync, no matter who fetched it.
+                               Keyed by the LIST size, not content.len(),
+                               so it matches the diff lookup exactly. */
+                            if let Some(box_id) = self.ble_connected_id.clone() {
+                                let size = self
+                                    .ble_files
+                                    .iter()
+                                    .find(|f| f.name == name)
+                                    .map(|f| f.size)
+                                    .unwrap_or(content.len() as u64);
+                                let path_str = path.display().to_string();
+                                if self.ensure_sync_db().is_some() {
+                                    if let Some(db) = self.sync_db.as_ref() {
+                                        if let Err(e) =
+                                            db.mark_synced(&box_id, &name, size, &path_str)
+                                        {
+                                            push_log(
+                                                &self.log,
+                                                format!("ble: sync DB write failed: {e}"),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             self.ble_status = format!("save failed: {e}");
@@ -768,6 +826,62 @@ impl AppState {
         b.send(BleCmd::Read { name: name.clone(), size });
         self.ble_dl_in_flight = true;
         push_log(&self.log, format!("ble: reading {name} ({size} B)"));
+    }
+
+    /// Lazily open the sync DB. Returns None (and sets `ble_sync_msg`)
+    /// if it can't be opened so the caller can bail without panicking —
+    /// a broken DB must not take down BLE.
+    fn ensure_sync_db(&mut self) -> Option<&sync_db::SyncDb> {
+        if self.sync_db.is_none() {
+            let path = sync_db::default_db_path();
+            match sync_db::SyncDb::open(&path) {
+                Ok(db) => self.sync_db = Some(db),
+                Err(e) => {
+                    self.ble_sync_msg =
+                        format!("sync disabled — can't open {}: {e}", path.display());
+                    push_log(&self.log, format!("ble: sync DB open failed: {e}"));
+                    return None;
+                }
+            }
+        }
+        self.sync_db.as_ref()
+    }
+
+    /// Run the diff after a Sync-triggered LIST: enqueue every sensor-
+    /// data file on the box not already in the DB for this box. Never
+    /// deletes anything (additive-only, by design). Debug/firmware-info
+    /// rows are left out — same policy as the default-tick filter, so a
+    /// sync mirrors *sessions*, not noise.
+    fn run_sync_diff(&mut self) {
+        let Some(box_id) = self.ble_connected_id.clone() else {
+            self.ble_sync_msg = "sync: no box id (reconnect and retry)".into();
+            return;
+        };
+        if self.ensure_sync_db().is_none() {
+            return; // ble_sync_msg already set with the reason
+        }
+        let db = self.sync_db.as_ref().unwrap();
+        let mut new = 0usize;
+        let mut skipped = 0usize;
+        self.ble_dl_queue.clear();
+        for f in self.ble_files.iter() {
+            if !is_sensor_data_name(&f.name) {
+                continue;
+            }
+            if db.is_synced(&box_id, &f.name, f.size) {
+                skipped += 1;
+            } else {
+                new += 1;
+                self.ble_dl_queue.push_back((f.name.clone(), f.size));
+            }
+        }
+        self.ble_sync_msg = if new == 0 {
+            format!("Sync: up to date ({skipped} already synced, nothing new)")
+        } else {
+            format!("Sync: {new} new, {skipped} already synced — downloading…")
+        };
+        push_log(&self.log, format!("ble: {}", self.ble_sync_msg));
+        self.advance_download_queue();
     }
 
     /// Drain pending update-check + install-pipeline events into the
@@ -1061,7 +1175,9 @@ impl AppState {
         ui.heading("Sync");
         ui.label(
             egui::RichText::new(
-                "BLE FileSync — scan, connect (PIN 123456), list SD files, download.",
+                "BLE FileSync — scan, connect (PIN 123456), list SD files. \
+                 \"Download selected\" = manual transfer; \"Sync now\" = pull \
+                 every new session, tracked in a local DB (never deletes on the box).",
             )
             .small()
             .color(egui::Color32::from_gray(180)),
@@ -1132,6 +1248,29 @@ impl AppState {
                         if let Some(b) = self.ble.as_ref() { b.send(BleCmd::List); }
                     }
                     if ui
+                        .add_enabled(
+                            connected && !self.ble_dl_in_flight && !self.ble_sync_pending,
+                            egui::Button::new("Sync now"),
+                        )
+                        .on_hover_text(
+                            "Pull every session file on the SD card that isn't already \
+                             in the local sync DB (~/.movementlogger/sync.db). \
+                             Additive only — never deletes anything on the box. \
+                             Re-runnable: already-synced files are skipped.",
+                        )
+                        .clicked()
+                    {
+                        /* Fresh LIST first; the diff runs in the ListDone
+                           handler when ble_sync_pending is set. Don't
+                           diff the on-screen list directly — it may be
+                           stale (older session, pre-Refresh). */
+                        self.ble_files.clear();
+                        self.ble_sync_pending = true;
+                        self.ble_sync_msg = "Sync: listing SD card…".into();
+                        if let Some(b) = self.ble.as_ref() { b.send(BleCmd::List); }
+                        push_log(&self.log, "ble: Sync now — listing".into());
+                    }
+                    if ui
                         .add_enabled(connected, egui::Button::new("STOP_LOG"))
                         .on_hover_text("Tells the box to gracefully close any active session — required before READ if logging is busy")
                         .clicked()
@@ -1186,6 +1325,8 @@ impl AppState {
                         self.ble_files.clear();
                         self.ble_dl_queue.clear();
                         self.ble_dl_in_flight = false;
+                        self.ble_connected_id = None;
+                        self.ble_sync_pending = false;
                         self.ble_status = format!("LOG session: {} s", self.ble_session_duration_s);
                         /* Start the countdown banner. Stored as
                            (start_instant, duration_seconds) so each
@@ -1218,6 +1359,8 @@ impl AppState {
                         self.ble_files.clear();
                         self.ble_dl_queue.clear();
                         self.ble_dl_in_flight = false;
+                        self.ble_connected_id = None;
+                        self.ble_sync_pending = false;
                         self.ble_status = "disconnecting…".into();
                         push_log(&self.log, "ble: Disconnect requested".into());
                     }
@@ -1254,6 +1397,10 @@ impl AppState {
                             if ui.button("Connect").clicked() {
                                 self.ble_state = BleState::Connecting;
                                 self.ble_status = "connecting…".into();
+                                /* Capture the box id now so the sync DB
+                                   can key per-box; the worker's Connected
+                                   event doesn't echo the id back. */
+                                self.ble_connected_id = Some(d.id.clone());
                                 if let Some(b) = self.ble.as_ref() {
                                     b.send(BleCmd::Connect(d.id.clone()));
                                 }
@@ -1264,6 +1411,13 @@ impl AppState {
 
                 // ----- File list / download ------------------------
                 if matches!(self.ble_state, BleState::Connected) {
+                    if !self.ble_sync_msg.is_empty() {
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            egui::Color32::from_rgb(120, 200, 140),
+                            &self.ble_sync_msg,
+                        );
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label("Save to:");

@@ -3,7 +3,7 @@
 Cross-platform (Windows / macOS / Linux) GUI companion for the SensorTile.box pumpfoil rig. Three tabs:
 
 - **Live** — subscribe to the new PumpLogger firmware's SensorStream characteristic and watch real-time IMU + magnetometer + baro + GPS readings update at 0.5 Hz, plus derived pitch / roll / tilt-compensated heading in degrees and running sparklines for acc magnitude and pressure.
-- **Sync** — BLE FileSync: scan, connect (PIN 123456), list, and download `Sens*.csv` / `*_gps.csv` / `Bat*.csv` files from the SD card. Downloaded files auto-route into the Replay tab.
+- **Sync** — BLE FileSync: scan, connect (PIN 123456), list SD files. Two modes: **Download selected** is a manual one-off transfer of the files you tick; **Sync now** pulls every session file (`Sens*.csv` / `*_gps.csv` / `Bat*.csv` / `Mic*.wav`) that isn't already recorded in a local SQLite DB (`~/.movementlogger/sync.db`), so re-running it only fetches new sessions. Sync is additive — it **never deletes** anything on the box. Downloaded files auto-route into the Replay tab.
 - **Replay** — drag-and-drop sensor CSV + optional camera `.mov`/`.mp4` + optional board `.stl`, fill in a few fields, click **Generate**. The GUI shells out to the bundled `stbox-viz animate` CLI to render the annotated session video.
 
 Sources imported from [`fp-sns-stbox1/Utilities/rust`](https://github.com/zdavatz/fp-sns-stbox1) so this repo can ship its own release cadence.
