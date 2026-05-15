@@ -14,18 +14,21 @@
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-/// `~/.movementlogger/sync.db` (Windows: `%USERPROFILE%\.movementlogger\sync.db`).
+/// `~/.movementlogger/sqlite/sync.db`
+/// (Windows: `%USERPROFILE%\.movementlogger\sqlite\sync.db`).
 ///
 /// Anchored to the home dir, *not* to the user-selectable download
 /// folder: if the DB lived next to the files, changing the "Save to"
 /// folder would orphan the history and re-pull every session. Home is
 /// the one path that's stable across folder changes and app updates.
+/// The DB lives in its own `sqlite/` subdir so the data root stays
+/// tidy if other state is added next to it later.
 pub fn default_db_path() -> PathBuf {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".movementlogger").join("sync.db")
+    home.join(".movementlogger").join("sqlite").join("sync.db")
 }
 
 pub struct SyncDb {
