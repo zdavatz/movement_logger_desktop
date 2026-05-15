@@ -1485,10 +1485,18 @@ impl AppState {
             .num_columns(4)
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
-                ui.label(egui::RichText::new("Accel (g)").strong());
-                ui.label(format!("X {:+.3}", acc_g(0)));
-                ui.label(format!("Y {:+.3}", acc_g(1)));
-                ui.label(format!("Z {:+.3}", acc_g(2)));
+                // Per-axis tilt straight from the gravity projection:
+                // 0 g → 0° (axis horizontal), +1 g → +90° (axis points
+                // straight down), -1 g → -90° (straight up). arcsin of
+                // the clamped g value; clamp guards the >1 g motion
+                // spikes that would otherwise produce NaN.
+                let tilt_deg = |i: usize| {
+                    (acc_g(i).clamp(-1.0, 1.0)).asin().to_degrees()
+                };
+                ui.label(egui::RichText::new("Accel (g / °)").strong());
+                ui.label(format!("X {:+.3}  {:+5.1}°", acc_g(0), tilt_deg(0)));
+                ui.label(format!("Y {:+.3}  {:+5.1}°", acc_g(1), tilt_deg(1)));
+                ui.label(format!("Z {:+.3}  {:+5.1}°", acc_g(2), tilt_deg(2)));
                 ui.end_row();
 
                 ui.label(egui::RichText::new("Gyro (°/s)").strong());
