@@ -173,6 +173,12 @@ struct AppState {
     /// One-line sync result/status ("Sync: 3 new, 12 already synced —
     /// downloading…"), shown in the Sync tab. Empty = no sync yet.
     ble_sync_msg: String,
+    /// Last "Save to" validation failure, shown as a prominent red
+    /// banner under the field. `Some` blocks Download/Sync so a bad
+    /// path can't silently no-op (the original bug: a relative or
+    /// macOS-TCC-blocked path made the app *say* it saved while the
+    /// file went nowhere the user expected). Cleared on a good path.
+    ble_save_err: Option<String>,
 
     // ----- UI top-level tab + Live tab state ---------------------------
     /// Active top-level tab — drives the central panel switch.
@@ -847,12 +853,42 @@ impl AppState {
         self.sync_db.as_ref()
     }
 
+    /// Resolve + probe `ble_out_dir`. On success canonicalises the
+    /// field (writes the expanded absolute path back so the user sees
+    /// where files really go) and clears the error. On failure sets
+    /// `ble_save_err` + status + log and returns None so the caller
+    /// aborts instead of silently enqueuing reads that save nowhere.
+    fn validate_save_dir(&mut self) -> Option<PathBuf> {
+        match resolve_save_dir(&self.ble_out_dir)
+            .and_then(|d| probe_save_dir(&d).map(|()| d))
+        {
+            Ok(d) => {
+                self.ble_save_err = None;
+                self.ble_out_dir = d.clone();
+                Some(d)
+            }
+            Err(e) => {
+                self.ble_status = format!("save path invalid: {e}");
+                push_log(&self.log, format!("ble: save path invalid: {e}"));
+                self.ble_save_err = Some(e);
+                None
+            }
+        }
+    }
+
     /// Run the diff after a Sync-triggered LIST: enqueue every sensor-
     /// data file on the box not already in the DB for this box. Never
     /// deletes anything (additive-only, by design). Debug/firmware-info
     /// rows are left out — same policy as the default-tick filter, so a
     /// sync mirrors *sessions*, not noise.
     fn run_sync_diff(&mut self) {
+        if self.validate_save_dir().is_none() {
+            // Bad Save-to path — surface it as the sync result too so
+            // the user isn't left wondering why nothing downloaded.
+            self.ble_sync_msg =
+                format!("Sync aborted — {}", self.ble_save_err.clone().unwrap_or_default());
+            return;
+        }
         let Some(box_id) = self.ble_connected_id.clone() else {
             self.ble_sync_msg = "sync: no box id (reconnect and retry)".into();
             return;
@@ -1064,6 +1100,68 @@ fn save_downloaded_file(dir: &Path, name: &str, content: &[u8]) -> std::io::Resu
     let path = dir.join(name);
     std::fs::write(&path, content)?;
     Ok(path)
+}
+
+/// Expand a leading `~` and require an absolute path. Pure path math,
+/// no filesystem access — cheap enough to call every frame for the
+/// live indicator. The absolute-path requirement is the core fix for
+/// the silent-misplace bug: `PathBuf::from("~/Downloads")` or a bare
+/// relative path is otherwise created *relative to the process cwd*,
+/// so the app reports `saved <path>` while the file is nowhere the
+/// user is looking.
+fn resolve_save_dir(raw: &Path) -> Result<PathBuf, String> {
+    let s = raw.to_string_lossy();
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("Save-to path is empty — pick a folder with Browse….".into());
+    }
+    let expanded: PathBuf = if s == "~" || s.starts_with("~/") {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .ok_or("can't expand ~ — no HOME / USERPROFILE set")?;
+        if s == "~" { home } else { home.join(&s[2..]) }
+    } else {
+        PathBuf::from(s)
+    };
+    if !expanded.is_absolute() {
+        return Err(format!(
+            "\u{201c}{}\u{201d} is not an absolute path. Use a full path \
+             like /Users/you/Downloads (Browse… fills one in).",
+            expanded.display()
+        ));
+    }
+    Ok(expanded)
+}
+
+/// Authoritative writability check: actually create the directory and
+/// write+delete a probe file. Called at Download/Sync time (not every
+/// frame). Surfaces macOS TCC / permission denials that the path-only
+/// check can't see — exactly the failures that used to look like a
+/// successful save.
+fn probe_save_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("Can't create \u{201c}{}\u{201d}: {e}", dir.display()))?;
+    let probe = dir.join(".movementlogger_write_test");
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => {
+            let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                " — macOS may be blocking it (TCC): grant the app access under \
+                 System Settings → Privacy & Security → Files and Folders / \
+                 Full Disk Access, or pick a folder you own."
+            } else {
+                ""
+            };
+            Err(format!(
+                "Folder \u{201c}{}\u{201d} is not writable: {e}{hint}",
+                dir.display()
+            ))
+        }
+    }
 }
 
 /// True for the four sensor-data row types the firmware creates per
@@ -1424,13 +1522,40 @@ impl AppState {
                         let mut s = self.ble_out_dir.display().to_string();
                         if ui.text_edit_singleline(&mut s).changed() {
                             self.ble_out_dir = PathBuf::from(s);
+                            // Drop the stale probe error while the user is
+                            // mid-edit; it's re-checked on the next attempt.
+                            self.ble_save_err = None;
                         }
                         if ui.button("Browse…").clicked() {
                             if let Some(p) = rfd::FileDialog::new().pick_folder() {
                                 self.ble_out_dir = p;
+                                self.ble_save_err = None;
                             }
                         }
                     });
+                    /* Inline path feedback. resolve_save_dir is pure path
+                       math (no FS), cheap to run every frame — it catches
+                       empty / relative / ~ paths the instant they're typed.
+                       The deeper writability/TCC failure only shows after a
+                       Download/Sync attempt (probe needs real FS access);
+                       that lands in ble_save_err. */
+                    let red = egui::Color32::from_rgb(225, 90, 90);
+                    match resolve_save_dir(&self.ble_out_dir) {
+                        Err(e) => {
+                            ui.colored_label(red, format!("⚠ {e}"));
+                        }
+                        Ok(abs) => {
+                            if let Some(err) = &self.ble_save_err {
+                                ui.colored_label(red, format!("⚠ {err}"));
+                            } else if abs != self.ble_out_dir {
+                                ui.label(
+                                    egui::RichText::new(format!("→ {}", abs.display()))
+                                        .small()
+                                        .color(egui::Color32::from_gray(150)),
+                                );
+                            }
+                        }
+                    }
 
                     if self.ble_files.is_empty() {
                         ui.label(
@@ -1501,17 +1626,24 @@ impl AppState {
                             "Download selected".to_string()
                         };
                         if ui.add_enabled(!any_in_flight, egui::Button::new(dl_label)).clicked() {
-                            /* Queue all ticked, not-yet-downloaded files
-                               serially. The first one is sent immediately
-                               by advance_download_queue(); the rest start
-                               on each ReadDone / READ-error event. */
-                            self.ble_dl_queue.clear();
-                            for f in self.ble_files.iter() {
-                                if f.selected && !f.downloaded {
-                                    self.ble_dl_queue.push_back((f.name.clone(), f.size));
+                            /* Validate the Save-to folder *before* queuing
+                               anything. A bad path used to slip through and
+                               every read would fail its save silently; now
+                               the user gets a red banner and nothing is
+                               enqueued. */
+                            if self.validate_save_dir().is_some() {
+                                /* Queue all ticked, not-yet-downloaded files
+                                   serially. The first one is sent immediately
+                                   by advance_download_queue(); the rest start
+                                   on each ReadDone / READ-error event. */
+                                self.ble_dl_queue.clear();
+                                for f in self.ble_files.iter() {
+                                    if f.selected && !f.downloaded {
+                                        self.ble_dl_queue.push_back((f.name.clone(), f.size));
+                                    }
                                 }
+                                self.advance_download_queue();
                             }
-                            self.advance_download_queue();
                         }
                     }
                 }
