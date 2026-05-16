@@ -186,6 +186,11 @@ struct AppState {
     /// makes that skip everything already saved and re-pull only the
     /// file that was cut off. `None` = nothing to resume.
     ble_resume_box: Option<String>,
+    /// Last DELETE rejection from the box (NOT_FOUND / BUSY / IO_ERROR
+    /// / BAD_REQUEST). Shown as a prominent red banner so a failed
+    /// delete isn't only buried in the log. Cleared on a successful
+    /// delete, a new delete attempt, or disconnect.
+    ble_delete_err: Option<String>,
 
     // ----- UI top-level tab + Live tab state ---------------------------
     /// Active top-level tab — drives the central panel switch.
@@ -715,6 +720,7 @@ impl AppState {
                     self.live_sample_count = 0;
                     self.ble_connected_id = None;
                     self.ble_sync_pending = false;
+                    self.ble_delete_err = None;
                 }
                 BleEvent::ListEntry { name, size } => {
                     /* Default-tick only sensor-data rows (Sens*.csv,
@@ -809,6 +815,7 @@ impl AppState {
                 BleEvent::DeleteDone { name } => {
                     self.ble_status = format!("deleted {name}");
                     self.ble_files.retain(|f| f.name != name);
+                    self.ble_delete_err = None;
                     push_log(&self.log, format!("ble: deleted {name}"));
                 }
                 BleEvent::Sample(s) => {
@@ -841,6 +848,14 @@ impl AppState {
                     push_log(&self.log, format!("ble error: {msg}"));
                     if matches!(self.ble_state, BleState::Scanning | BleState::Connecting) {
                         self.ble_state = BleState::Idle;
+                    }
+                    /* Surface DELETE rejections as a prominent banner.
+                       The box refuses some Debug rows (8.3-name miss →
+                       NOT_FOUND, name >15 chars → BAD_REQUEST, logging
+                       active → BUSY); without this it only shows in the
+                       log and looks like the click did nothing. */
+                    if msg.starts_with("DELETE ") {
+                        self.ble_delete_err = Some(msg.clone());
                     }
                     /* A READ-side error (NOT_FOUND, BUSY, IO_ERROR, BAD_REQUEST,
                        timeout, disconnect mid-op) ends the in-flight read. Advance
@@ -1260,6 +1275,25 @@ fn is_sensor_data_name(name: &str) -> bool {
         || (lower.starts_with("mic")  && lower.ends_with(".wav"))
 }
 
+/// Names the box firmware can never delete, with the reason (for the
+/// disabled trash button's tooltip). Mirrors the firmware limits:
+/// `ble.c` rejects names >15 bytes with BAD_REQUEST, and
+/// `SDFat_Delete` only matches a real FAT 8.3 short name — so macOS
+/// AppleDouble sidecars (`._*`) and the virtual `PUMPTSUE.RI`
+/// placeholder always come back NOT_FOUND. Disabling the button for
+/// these stops it looking like a no-op click.
+fn delete_unsupported(name: &str) -> Option<&'static str> {
+    if name.starts_with("._") {
+        Some("macOS metadata sidecar — not a real file on the box's SD card, the firmware can't address it")
+    } else if name.eq_ignore_ascii_case("PUMPTSUE.RI") {
+        Some("virtual placeholder entry, not a real file — nothing to delete")
+    } else if name.len() > 15 {
+        Some("filename too long for the box's delete command (firmware caps it at 15 characters)")
+    } else {
+        None
+    }
+}
+
 /// Render one group ("Sensor" or "Debug") inside the BLE file list.
 /// Borrows `files` mutably to flip per-row checkboxes; pushes a delete
 /// target name when the user clicks the trash icon so the caller can
@@ -1314,14 +1348,23 @@ fn render_file_group(
                 );
             }
             let busy = f.bytes_done > 0 && !f.downloaded;
-            if ui.add_enabled(
-                !busy,
-                egui::Button::new("🗑").small(),
-            )
-                .on_hover_text("Delete this file from the SD card")
-                .clicked()
-            {
-                *delete_target = Some(f.name.clone());
+            match delete_unsupported(&f.name) {
+                Some(reason) => {
+                    // Greyed out: the firmware would just reply
+                    // NOT_FOUND / BAD_REQUEST — don't pretend it's
+                    // actionable. Tooltip explains why.
+                    ui.add_enabled(false, egui::Button::new("🗑").small())
+                        .on_disabled_hover_text(format!("Can't delete: {reason}"));
+                }
+                None => {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("🗑").small())
+                        .on_hover_text("Delete this file from the SD card")
+                        .clicked()
+                    {
+                        *delete_target = Some(f.name.clone());
+                    }
+                }
             }
         });
         if !f.downloaded && f.bytes_done > 0 && f.size > 0 {
@@ -1624,6 +1667,26 @@ impl AppState {
                             &self.ble_sync_msg,
                         );
                     }
+                    if let Some(err) = self.ble_delete_err.clone() {
+                        ui.add_space(4.0);
+                        egui::Frame::group(ui.style())
+                            .fill(egui::Color32::from_rgb(255, 230, 230))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgb(200, 80, 80),
+                            ))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(170, 30, 30),
+                                        format!("⚠ {err}"),
+                                    );
+                                    if ui.small_button("Dismiss").clicked() {
+                                        self.ble_delete_err = None;
+                                    }
+                                });
+                            });
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label("Save to:");
@@ -1721,6 +1784,7 @@ impl AppState {
                         if let Some(name) = delete_target {
                             if let Some(b) = self.ble.as_ref() {
                                 b.send(BleCmd::Delete { name: name.clone() });
+                                self.ble_delete_err = None; // clear stale failure on a fresh attempt
                                 push_log(&self.log, format!("ble: deleting {name}"));
                             }
                         }
