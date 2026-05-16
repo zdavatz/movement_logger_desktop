@@ -760,10 +760,42 @@ impl AppState {
                         if f.name == name { f.bytes_done = bytes_done; }
                     }
                 }
-                BleEvent::ReadDone { name, content } => {
-                    match save_downloaded_file(&self.ble_out_dir, &name, &content) {
+                BleEvent::ReadAborted { name, content, base } => {
+                    /* The link dropped mid-file. Persist the partial
+                       segment into <name>.part so the resume continues
+                       from the real break point, not the last completed
+                       segment. Not finalized, not marked synced — it's
+                       still incomplete. The Error("READ … aborted/timed
+                       out") that follows drives the resume/ banner. */
+                    if !content.is_empty() {
+                        match append_part(&self.ble_out_dir, &name, base, &content) {
+                            Ok(have) => push_log(
+                                &self.log,
+                                format!("ble: kept {have} B of {name} for resume"),
+                            ),
+                            Err(e) => push_log(
+                                &self.log,
+                                format!("ble: could not save partial {name}: {e}"),
+                            ),
+                        }
+                    }
+                    // bytes_done stays where it is so the bar reflects
+                    // the real resume point; do NOT advance the queue
+                    // here — the link-loss handling does that.
+                }
+                BleEvent::ReadDone { name, content, base } => {
+                    let size = self
+                        .ble_files
+                        .iter()
+                        .find(|f| f.name == name)
+                        .map(|f| f.size)
+                        .unwrap_or(base + content.len() as u64);
+                    let result = append_part(&self.ble_out_dir, &name, base, &content)
+                        .and_then(|_| finalize_part(&self.ble_out_dir, &name));
+                    match result {
                         Ok(path) => {
-                            self.ble_status = format!("saved {} ({} B)", path.display(), content.len());
+                            self.ble_status =
+                                format!("saved {} ({} B)", path.display(), size);
                             for f in self.ble_files.iter_mut() {
                                 if f.name == name {
                                     f.downloaded = true;
@@ -779,16 +811,9 @@ impl AppState {
                                this read was triggered (Sync now *or* a
                                manual "Download selected"): a file that's
                                already on disk shouldn't be re-pulled by
-                               a later sync, no matter who fetched it.
-                               Keyed by the LIST size, not content.len(),
-                               so it matches the diff lookup exactly. */
+                               a later sync. Keyed by the LIST size so it
+                               matches the diff lookup exactly. */
                             if let Some(box_id) = self.ble_connected_id.clone() {
-                                let size = self
-                                    .ble_files
-                                    .iter()
-                                    .find(|f| f.name == name)
-                                    .map(|f| f.size)
-                                    .unwrap_or(content.len() as u64);
                                 let path_str = path.display().to_string();
                                 if self.ensure_sync_db().is_some() {
                                     if let Some(db) = self.sync_db.as_ref() {
@@ -898,10 +923,21 @@ impl AppState {
     fn advance_download_queue(&mut self) {
         if self.ble_dl_in_flight { return; }
         let Some((name, size)) = self.ble_dl_queue.pop_front() else { return; };
+        // Resume from whatever is already in <name>.part. The firmware
+        // seeks to this offset, so a re-queued interrupted file
+        // continues instead of restarting.
+        let offset = part_offset(&self.ble_out_dir, &name, size);
         let Some(b) = self.ble.as_ref() else { return; };
-        b.send(BleCmd::Read { name: name.clone(), size });
+        b.send(BleCmd::Read { name: name.clone(), size, offset });
         self.ble_dl_in_flight = true;
-        push_log(&self.log, format!("ble: reading {name} ({size} B)"));
+        if offset > 0 {
+            push_log(
+                &self.log,
+                format!("ble: resuming {name} at {offset}/{size} B"),
+            );
+        } else {
+            push_log(&self.log, format!("ble: reading {name} ({size} B)"));
+        }
     }
 
     /// Lazily open the sync DB. Returns None (and sets `ble_sync_msg`)
@@ -1191,11 +1227,64 @@ impl AppState {
 
 /// Save a downloaded file under `dir`, creating the directory if
 /// needed. Returns the resolved destination path.
-fn save_downloaded_file(dir: &Path, name: &str, content: &[u8]) -> std::io::Result<PathBuf> {
+/// Resume-aware download assembly. Every download streams into a
+/// sibling `<name>.part`; only a fully-received file is renamed to its
+/// final name. The `.part` length is the single source of truth for
+/// "how many bytes do we already have" — it survives an app restart,
+/// so a resume after a crash/quit is just as lossless as one after a
+/// reconnect. A file only counts as synced once it's the final name.
+fn part_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.part"))
+}
+
+/// Bytes already downloaded for `name` (the resume offset). 0 if no
+/// `.part` yet. If a stale `.part` is somehow larger than the file's
+/// real size it's corrupt/leftover — delete it and restart from 0
+/// rather than seek past EOF.
+fn part_offset(dir: &Path, name: &str, full_size: u64) -> u64 {
+    let p = part_path(dir, name);
+    match std::fs::metadata(&p) {
+        Ok(m) if m.len() <= full_size => m.len(),
+        Ok(_) => {
+            let _ = std::fs::remove_file(&p);
+            0
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Append a streamed segment to `<name>.part` (creating it). `base` is
+/// the offset the segment started at; it must equal the current
+/// `.part` length or the resume is misaligned (we requested READ at
+/// the `.part` length, so this only trips on a logic bug) — in that
+/// case truncate to `base` first so we never write a corrupt file.
+fn append_part(dir: &Path, name: &str, base: u64, bytes: &[u8]) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom, Write};
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(name);
-    std::fs::write(&path, content)?;
-    Ok(path)
+    let p = part_path(dir, name);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&p)?;
+    let cur = f.metadata()?.len();
+    if cur != base {
+        // Realign defensively (shouldn't happen — offset is derived
+        // from this same file's length before the READ).
+        f.set_len(base.min(cur))?;
+    }
+    f.seek(SeekFrom::End(0))?;
+    f.write_all(bytes)?;
+    f.flush()?;
+    Ok(f.metadata()?.len())
+}
+
+/// Rename the completed `<name>.part` to its final name, replacing any
+/// previous copy. Returns the final path.
+fn finalize_part(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let final_path = dir.join(name);
+    std::fs::rename(part_path(dir, name), &final_path)?;
+    Ok(final_path)
 }
 
 /// Expand a leading `~` and require an absolute path. Pure path math,

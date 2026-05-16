@@ -59,6 +59,15 @@ The box firmware only speaks LIST / READ / DELETE / STOP_LOG / START_LOG — the
 - Every successful save (`ReadDone`) records into the DB regardless of whether it came from Sync or a manual download, so a later sync skips anything already on disk.
 - **Sync never issues DELETE** — additive only, by explicit product decision. Don't add a delete-after-sync path without re-confirming.
 
+### Resume + auto-reconnect (v0.0.11)
+
+Downloads are resumable at the byte level. The firmware READ opcode takes `<name>\0<offset:u32-LE>` and `SDFat_Seek`s there (`movement_logger_firmware/Src/ble.c` READ handler), so the desktop never restarts a file from 0 after a drop:
+
+- Every download streams into a sibling `<name>.part`; only a complete file is renamed to its final name (`part_path` / `append_part` / `finalize_part` in `main.rs`). The `.part` length is the resume offset and the single source of truth — it survives an app restart, so a resume after a crash/quit is as lossless as one after a reconnect. `mark_synced` only fires on the finalized name.
+- `advance_download_queue` derives the offset from `.part` and sends `BleCmd::Read { name, size, offset }`. A stale `.part` larger than the LIST size is treated as corrupt → deleted → restart from 0.
+- On a mid-READ drop the worker emits `BleEvent::ReadAborted { name, content, base }` (from `disconnect_inner` and the watchdog timeout) carrying the partial segment; `main` appends it to `.part` so the resume continues from the true break point, not the last completed segment.
+- The worker does a **bounded** auto-reconnect itself (`auto_reconnect`, `RECONNECT_ATTEMPTS`×`RECONNECT_INTERVAL` + a short rescan each round, reusing `connect_core`). Success → `Connected` (main re-LISTs, the sync diff re-queues the unfinished file, which resumes from its `.part`). Exhaustion → `Disconnected` → the existing manual-reconnect banner; still lossless via `.part`. Caveat: the worker can't process commands (incl. Disconnect) while inside `auto_reconnect` — acceptable because it's bounded (~50 s worst case).
+
 ## In-app updater — sharp edge
 
 `stbox-viz-gui/src/update.rs` hardcodes the repo it polls for new releases. When importing fixes from `fp-sns-stbox1/Utilities/rust`, the upstream version of this file has `const REPO: &str = "zdavatz/fp-sns-stbox1"` — that is the **firmware** repo, not this one. **Always check this constant after a pull from upstream**:

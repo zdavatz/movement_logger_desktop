@@ -75,6 +75,14 @@ const OP_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
    producing rows. */
 const LIST_INACTIVITY_DONE: Duration = Duration::from_millis(500);
 
+/// Bounded auto-reconnect after an unexpected mid-transfer drop:
+/// `RECONNECT_ATTEMPTS` tries, each preceded by a wait + a short scan
+/// (~3 s) so the box has time to re-advertise. ~10 × (2 s + 3 s) ≈
+/// 50 s of effort, then give up and let the user reconnect manually
+/// (still lossless — the `.part` file holds the resume point).
+const RECONNECT_ATTEMPTS: u32 = 10;
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
+
 // ---------------------------------------------------------------------------
 //  Public command / event API
 // ---------------------------------------------------------------------------
@@ -90,9 +98,13 @@ pub enum BleCmd {
     Disconnect,
     /// Send a LIST opcode to the connected box.
     List,
-    /// Send a READ opcode for `name`; expected total length is `size`
-    /// from the prior LIST so the worker knows when to stop accumulating.
-    Read { name: String, size: u64 },
+    /// Send a READ opcode for `name`; `size` is the full file length
+    /// from the prior LIST so the worker knows when EOF is reached.
+    /// `offset` is the byte position to resume from (0 = whole file) —
+    /// the firmware seeks there before streaming, so an interrupted
+    /// transfer continues instead of restarting (`ble.c` READ handler
+    /// `<name>\0<offset:u32-LE>`).
+    Read { name: String, size: u64, offset: u64 },
     /// Side-channel STOP_LOG opcode — no FileData reply.
     StopLog,
     /// START_LOG opcode (issue #15) — box writes BKP1R/BKP2R + reboots
@@ -118,8 +130,19 @@ pub enum BleEvent {
     ListEntry { name: String, size: u64 },
     ListDone,
     ReadStarted { name: String, size: u64 },
+    /// `bytes_done` is absolute (resume base + bytes streamed this
+    /// segment), so the progress bar is correct across a resume.
     ReadProgress { name: String, bytes_done: u64 },
-    ReadDone { name: String, content: Vec<u8> },
+    /// A READ segment finished at EOF. `content` is just this segment
+    /// (from `base` to EOF); `base` is the offset it was requested at.
+    /// The caller appends `content` at `base` into the `.part` file.
+    ReadDone { name: String, content: Vec<u8>, base: u64 },
+    /// A READ was cut off (link lost / timeout) partway. `content` is
+    /// the bytes streamed this segment before the cut, `base` the
+    /// offset it started at — the caller appends them to `.part` so
+    /// the resume continues from the real break point, not the last
+    /// completed segment.
+    ReadAborted { name: String, content: Vec<u8>, base: u64 },
     /// DELETE finished successfully (status byte 0x00 received).
     DeleteDone { name: String },
     /// User-facing error — display in the log panel.
@@ -317,8 +340,28 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>) {
                         None    => {
                             // The peripheral dropped the stream — treat
                             // as a remote-side disconnect.
+                            let was_transfer =
+                                matches!(state.op, CurrentOp::Reading { .. });
                             state.emit_err("notification stream closed");
+                            // disconnect_inner emits ReadAborted with the
+                            // partial bytes (→ appended to .part) and
+                            // tears the connection down.
                             state.disconnect_inner().await;
+                            if was_transfer {
+                                if let Some(id) = state.last_id.clone() {
+                                    if state.auto_reconnect(id).await {
+                                        // Reconnected: Connected emitted,
+                                        // main re-lists + resumes from the
+                                        // .part offset. Stay in the loop.
+                                        continue;
+                                    }
+                                }
+                                // Bounded retries exhausted (or no id):
+                                // hand control back to the user. main
+                                // shows the manual-reconnect banner; the
+                                // .part keeps the resume lossless.
+                                state.emit(BleEvent::Disconnected);
+                            }
                         }
                     }
                 }
@@ -346,6 +389,9 @@ enum CurrentOp {
     Reading {
         name: String,
         expected: u64,
+        /// Byte offset this READ was requested at (bytes already on
+        /// disk in `.part`). Absolute progress = base + content.len().
+        base: u64,
         content: Vec<u8>,
         last_emit: u64,
         last_progress: Instant,
@@ -387,6 +433,11 @@ struct WorkerState {
     /// characteristic — kept so we can emit a one-shot status line
     /// telling the user whether the box's firmware supports live data.
     stream_capable: bool,
+    /// Peripheral id of the last successful connect — the auto-reconnect
+    /// target. Set by `connect` / `auto_reconnect`, never cleared (a
+    /// stale id just makes a future reconnect fail one round and fall
+    /// back to manual).
+    last_id: Option<String>,
 }
 
 impl WorkerState {
@@ -399,6 +450,7 @@ impl WorkerState {
             op: CurrentOp::Idle,
             stream_asm: StreamAsm::default(),
             stream_capable: false,
+            last_id: None,
         }
     }
 
@@ -438,7 +490,7 @@ impl WorkerState {
                 self.emit(BleEvent::Disconnected);
             }
             BleCmd::List        => self.list().await,
-            BleCmd::Read { name, size } => self.read(name, size).await,
+            BleCmd::Read { name, size, offset } => self.read(name, size, offset).await,
             BleCmd::StopLog     => self.stop_log().await,
             BleCmd::StartLog { duration_seconds } => self.start_log(duration_seconds).await,
             BleCmd::Delete { name } => self.delete(name).await,
@@ -495,45 +547,53 @@ impl WorkerState {
             self.emit_err("already connected — disconnect first");
             return;
         }
-        let Some(adapter) = self.ensure_adapter().await else { return; };
-        let peripherals = match adapter.peripherals().await {
-            Ok(p) => p,
-            Err(e) => { self.emit_err(format!("peripherals: {e}")); return; }
-        };
-        let Some(p) = peripherals.into_iter().find(|x| x.id().to_string() == id) else {
-            self.emit_err("peripheral gone — rescan");
-            return;
-        };
-        self.emit(BleEvent::Status("connecting…".into()));
-        if let Err(e) = p.connect().await {
-            self.emit_err(format!("connect: {e}"));
-            return;
+        match self.connect_core(&id).await {
+            Ok(()) => {
+                self.last_id = Some(id);
+                self.emit(BleEvent::Connected);
+            }
+            Err(e) => self.emit_err(e),
         }
+    }
+
+    /// The connect work, factored out so the bounded auto-reconnect
+    /// loop can reuse it. Sets `peripheral` / `notif_stream` / `op` on
+    /// success; emits only informational Status lines (SensorStream
+    /// presence). Returns Err(reason) instead of emitting an error, so
+    /// the caller decides whether a failed attempt is fatal (manual
+    /// Connect) or just one retry (auto-reconnect).
+    async fn connect_core(&mut self, id: &str) -> Result<(), String> {
+        let Some(adapter) = self.ensure_adapter().await else {
+            return Err("no BLE adapter".into());
+        };
+        let peripherals = adapter
+            .peripherals()
+            .await
+            .map_err(|e| format!("peripherals: {e}"))?;
+        let p = peripherals
+            .into_iter()
+            .find(|x| x.id().to_string() == id)
+            .ok_or_else(|| "peripheral gone — rescan".to_string())?;
+        p.connect().await.map_err(|e| format!("connect: {e}"))?;
         if let Err(e) = p.discover_services().await {
-            self.emit_err(format!("discover_services: {e}"));
             let _ = p.disconnect().await;
-            return;
+            return Err(format!("discover_services: {e}"));
         }
-        // Verify FileSync characteristics are present — bail loud if the
-        // box is running an old firmware that doesn't expose them.
         let chars = p.characteristics();
         let data_char = match chars.iter().find(|c| c.uuid == FILEDATA_UUID).cloned() {
             Some(c) => c,
             None => {
-                self.emit_err("Box firmware doesn't expose FileSync chars — flash a newer build");
                 let _ = p.disconnect().await;
-                return;
+                return Err("Box firmware doesn't expose FileSync chars — flash a newer build".into());
             }
         };
         if !chars.iter().any(|c| c.uuid == FILECMD_UUID) {
-            self.emit_err("Box firmware doesn't expose FileSync chars — flash a newer build");
             let _ = p.disconnect().await;
-            return;
+            return Err("Box firmware doesn't expose FileSync chars — flash a newer build".into());
         }
         if let Err(e) = p.subscribe(&data_char).await {
-            self.emit_err(format!("subscribe FileData: {e}"));
             let _ = p.disconnect().await;
-            return;
+            return Err(format!("subscribe FileData: {e}"));
         }
         // SensorStream is optional — only PumpLogger (Peter's PR #18)
         // firmware exposes it. Subscribe if present, log if not, but
@@ -547,8 +607,6 @@ impl WorkerState {
                     self.emit(BleEvent::Status("SensorStream subscribed (live data at 0.5 Hz)".into()));
                 }
                 Err(e) => {
-                    /* Soft-fail: log it and carry on without live data.
-                       The user will still get FileSync. */
                     self.emit(BleEvent::Status(format!(
                         "SensorStream subscribe failed ({e}) — live tab will be empty"
                     )));
@@ -559,39 +617,89 @@ impl WorkerState {
                 "SensorStream characteristic not advertised — legacy firmware, live tab will be empty".into()
             ));
         }
-        // Open the persistent notification stream BEFORE storing the
-        // peripheral so a failure here drops everything cleanly.
         let stream: NotifStream = match p.notifications().await {
             Ok(s) => Box::pin(s),
             Err(e) => {
-                self.emit_err(format!("notifications: {e}"));
                 let _ = p.disconnect().await;
-                return;
+                return Err(format!("notifications: {e}"));
             }
         };
         self.peripheral   = Some(p);
         self.notif_stream = Some(stream);
         self.op           = CurrentOp::Idle;
-        self.emit(BleEvent::Connected);
+        Ok(())
+    }
+
+    /// Bounded auto-reconnect after an unexpected mid-transfer drop.
+    /// Up to `RECONNECT_ATTEMPTS` tries, ~`RECONNECT_INTERVAL` apart,
+    /// re-scanning then re-connecting to the same peripheral id. The
+    /// box needs a moment to start advertising again once it's back in
+    /// range, hence the scan + delay each round. Returns true (and has
+    /// emitted Connected) on success; false if exhausted — the caller
+    /// then emits Disconnected so the UI falls back to manual reconnect
+    /// (the resume `.part` makes that lossless too).
+    async fn auto_reconnect(&mut self, id: String) -> bool {
+        for attempt in 1..=RECONNECT_ATTEMPTS {
+            self.emit(BleEvent::Status(format!(
+                "link lost — auto-reconnecting (attempt {attempt}/{RECONNECT_ATTEMPTS})…"
+            )));
+            tokio::time::sleep(RECONNECT_INTERVAL).await;
+            // Kick a short scan so CoreBluetooth/BlueZ refreshes its
+            // peripheral cache; ignore the Discovered/ScanStopped spam
+            // by not routing through scan() (which emits them).
+            if let Some(adapter) = self.ensure_adapter().await {
+                if adapter.start_scan(ScanFilter::default()).await.is_ok() {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let _ = adapter.stop_scan().await;
+                }
+            }
+            match self.connect_core(&id).await {
+                Ok(()) => {
+                    self.last_id = Some(id);
+                    self.emit(BleEvent::Status(
+                        "auto-reconnected — resuming transfer".into(),
+                    ));
+                    self.emit(BleEvent::Connected);
+                    return true;
+                }
+                Err(e) => {
+                    self.emit(BleEvent::Status(format!(
+                        "reconnect attempt {attempt} failed: {e}"
+                    )));
+                }
+            }
+        }
+        false
     }
 
     /// Tear down peripheral + stream + op state without emitting the
     /// public `Disconnected` event. Used both by user-initiated
     /// disconnect and by failure paths inside the worker.
     async fn disconnect_inner(&mut self) {
-        // If a download was in flight when the user disconnected, surface
-        // it as an error so the UI doesn't keep saying "reading…" forever.
-        if let CurrentOp::Reading { name, content, expected, .. } = &self.op {
-            self.emit_err(format!(
-                "READ {name} aborted by disconnect at {}/{} B",
-                content.len(), expected
-            ));
-        } else if let CurrentOp::Listing { .. } = &self.op {
-            self.emit_err("LIST aborted by disconnect");
-        } else if let CurrentOp::Deleting { name, .. } = &self.op {
-            self.emit_err(format!("DELETE {name} aborted by disconnect"));
+        // If a download was in flight, hand the partial bytes back so
+        // the caller can append them to `.part` (resume continues from
+        // the real break point), then surface the abort so the UI
+        // doesn't keep saying "reading…" forever.
+        match std::mem::replace(&mut self.op, CurrentOp::Idle) {
+            CurrentOp::Reading { name, content, expected, base, .. } => {
+                let got = base + content.len() as u64;
+                self.emit(BleEvent::ReadAborted {
+                    name: name.clone(),
+                    content,
+                    base,
+                });
+                self.emit_err(format!(
+                    "READ {name} aborted by disconnect at {got}/{expected} B"
+                ));
+            }
+            CurrentOp::Listing { .. } => {
+                self.emit_err("LIST aborted by disconnect");
+            }
+            CurrentOp::Deleting { name, .. } => {
+                self.emit_err(format!("DELETE {name} aborted by disconnect"));
+            }
+            CurrentOp::Idle => {}
         }
-        self.op             = CurrentOp::Idle;
         self.notif_stream   = None;
         self.stream_asm     = StreamAsm::default();
         self.stream_capable = false;
@@ -636,7 +744,7 @@ impl WorkerState {
         self.emit(BleEvent::Status("LIST sent".into()));
     }
 
-    async fn read(&mut self, name: String, size: u64) {
+    async fn read(&mut self, name: String, size: u64, offset: u64) {
         if !matches!(self.op, CurrentOp::Idle) {
             self.emit_err("another op is in flight — wait or Disconnect");
             return;
@@ -645,19 +753,26 @@ impl WorkerState {
             self.emit_err("not connected");
             return;
         }
-        // Build opcode payload: 0x02 + filename bytes (no NUL).
-        let mut payload = Vec::with_capacity(1 + name.len());
+        // Opcode payload: 0x02 + name + NUL + 4-byte LE start offset.
+        // The firmware (ble.c READ handler) seeks to `offset` before
+        // streaming, so a resumed transfer continues mid-file. offset
+        // is u32 on the wire — SD files are well under 4 GiB.
+        let mut payload = Vec::with_capacity(name.len() + 6);
         payload.push(0x02);
         payload.extend_from_slice(name.as_bytes());
+        payload.push(0x00);
+        payload.extend_from_slice(&(offset as u32).to_le_bytes());
         if let Err(e) = self.write_cmd(&payload).await {
             self.emit_err(e);
             return;
         }
+        let remaining = size.saturating_sub(offset) as usize;
         self.op = CurrentOp::Reading {
             name: name.clone(),
             expected: size,
-            content: Vec::with_capacity(size as usize),
-            last_emit: 0,
+            base: offset,
+            content: Vec::with_capacity(remaining),
+            last_emit: offset,
             last_progress: Instant::now(),
             first_packet: true,
         };
@@ -767,7 +882,7 @@ impl WorkerState {
                     }
                 }
             }
-            CurrentOp::Reading { name, expected, content, last_emit, last_progress, first_packet } => {
+            CurrentOp::Reading { name, expected, base, content, last_emit, last_progress, first_packet } => {
                 *last_progress = Instant::now();
 
                 // Status-byte detection: only on the FIRST notify, only
@@ -794,23 +909,28 @@ impl WorkerState {
 
                 content.extend_from_slice(&n.value);
 
+                // Absolute position = resume base + bytes this segment.
                 // Throttle progress events — every ~4 KB or at EOF.
-                // 4 KB is a compromise between channel-spam and a smooth
-                // progress bar: at BLE FileSync's real-world ~1-3 KB/s the
-                // bar updates every 1-4 s. 16 KB was too coarse (5-16 s).
-                let done = content.len() as u64;
+                let done = *base + content.len() as u64;
                 if done - *last_emit >= 4 * 1024 || done >= *expected {
                     *last_emit = done;
                     self.emit(BleEvent::ReadProgress { name: name.clone(), bytes_done: done });
                 }
 
                 if done >= *expected {
-                    if content.len() as u64 > *expected {
-                        content.truncate(*expected as usize);
+                    // Trim any over-read so base + content == expected.
+                    let want = expected.saturating_sub(*base) as usize;
+                    if content.len() > want {
+                        content.truncate(want);
                     }
                     let final_content = std::mem::take(content);
                     let final_name    = std::mem::take(name);
-                    self.emit(BleEvent::ReadDone { name: final_name, content: final_content });
+                    let final_base    = *base;
+                    self.emit(BleEvent::ReadDone {
+                        name: final_name,
+                        content: final_content,
+                        base: final_base,
+                    });
                     self.op = CurrentOp::Idle;
                     return;
                 }
@@ -947,10 +1067,17 @@ impl WorkerState {
             CurrentOp::Listing { .. } => {
                 self.emit_err("LIST timed out — no notifies for 20 s");
             }
-            CurrentOp::Reading { name, content, expected, .. } => {
+            CurrentOp::Reading { name, content, expected, base, .. } => {
+                let got = base + content.len() as u64;
+                // Hand back the partial so the resume continues from
+                // here, not from the last fully-completed segment.
+                self.emit(BleEvent::ReadAborted {
+                    name: name.clone(),
+                    content,
+                    base,
+                });
                 self.emit_err(format!(
-                    "READ {name} timed out at {}/{} B — no notifies for 20 s",
-                    content.len(), expected
+                    "READ {name} timed out at {got}/{expected} B — no notifies for 20 s"
                 ));
             }
             CurrentOp::Deleting { name, .. } => {
