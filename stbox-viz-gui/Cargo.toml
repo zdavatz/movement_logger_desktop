@@ -1,6 +1,6 @@
 [package]
 name = "movement-logger"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2021"
 description = "MovementLogger — drag-and-drop GUI front-end for stbox-viz animate. SensorTile.box pumpfoil session video generator."
 license = "GPL-3.0-only"

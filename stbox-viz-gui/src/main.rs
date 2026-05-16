@@ -179,6 +179,13 @@ struct AppState {
     /// macOS-TCC-blocked path made the app *say* it saved while the
     /// file went nowhere the user expected). Cleared on a good path.
     ble_save_err: Option<String>,
+    /// Box id of an interrupted transfer/sync to auto-resume on the
+    /// next reconnect to that same box. Set when the BLE link drops
+    /// mid-batch (timeout / disconnect / shielded radio); consumed in
+    /// the `Connected` handler, which re-arms a sync — the SQLite DB
+    /// makes that skip everything already saved and re-pull only the
+    /// file that was cut off. `None` = nothing to resume.
+    ble_resume_box: Option<String>,
 
     // ----- UI top-level tab + Live tab state ---------------------------
     /// Active top-level tab — drives the central panel switch.
@@ -653,14 +660,47 @@ impl AppState {
                        Refresh." which looked like a transient state. */
                     self.ble_files.clear();
                     self.ble_sync_msg.clear();
+                    /* Resume an interrupted transfer/sync. If we just
+                       reconnected to the same box that was cut off mid-
+                       batch, arm a sync: the auto-LIST below produces a
+                       ListDone, and with ble_sync_pending set that runs
+                       run_sync_diff — which the SQLite DB makes skip
+                       everything already saved and re-pull only the
+                       file the drop interrupted. Resume only for the
+                       same box; a different box clears the flag so a
+                       stale resume can't fire later. */
+                    if self.ble_resume_box.is_some()
+                        && self.ble_resume_box == self.ble_connected_id
+                    {
+                        self.ble_sync_pending = true;
+                        self.ble_sync_msg =
+                            "Reconnected — resuming sync (skipping files already saved)…"
+                                .into();
+                        push_log(&self.log, "ble: reconnect — resuming interrupted sync".into());
+                    }
+                    self.ble_resume_box = None;
                     if let Some(b) = self.ble.as_ref() {
                         b.send(BleCmd::List);
                     }
                 }
                 BleEvent::Disconnected => {
+                    /* If a transfer/sync was live when the link dropped,
+                       remember which box so the next reconnect resumes
+                       it (via the DB diff). Capture before the field
+                       clears below. arm_sync_resume is idempotent with
+                       the Error-handler path that may have fired first. */
+                    let was_active = self.ble_dl_in_flight
+                        || !self.ble_dl_queue.is_empty()
+                        || self.ble_sync_pending
+                        || self.ble_resume_box.is_some();
+                    if was_active {
+                        self.arm_sync_resume();
+                    }
                     self.ble_state = BleState::Idle;
                     self.ble_files.clear();
-                    self.ble_status = "disconnected".into();
+                    if !was_active {
+                        self.ble_status = "disconnected".into();
+                    }
                     self.ble_dl_queue.clear();
                     self.ble_dl_in_flight = false;
                     /* Drop live state too — the box can drop the stream
@@ -812,7 +852,22 @@ impl AppState {
                        a real READ error, so don't advance on it. */
                     if msg.starts_with("READ ") {
                         self.ble_dl_in_flight = false;
-                        self.advance_download_queue();
+                        /* Link-loss vs. per-file failure. "timed out"
+                           (watchdog: no notifies for 20 s) and "aborted
+                           by disconnect" mean the radio is gone — don't
+                           grind the rest of the batch against a dead
+                           link 20 s at a time; park it and resume on
+                           reconnect. NOT_FOUND / BUSY / IO_ERROR /
+                           BAD_REQUEST are per-file (e.g. the phantom
+                           0-byte PUMPTSUE.RI) — skip just that row and
+                           keep the batch going as before. */
+                        let link_lost = msg.contains("timed out")
+                            || msg.contains("aborted by disconnect");
+                        if link_lost {
+                            self.arm_sync_resume();
+                        } else {
+                            self.advance_download_queue();
+                        }
                     }
                 }
             }
@@ -874,6 +929,32 @@ impl AppState {
                 None
             }
         }
+    }
+
+    /// Park an interrupted transfer/sync so it resumes on reconnect.
+    /// Called when the BLE link drops mid-batch (READ timeout, "aborted
+    /// by disconnect", or a plain Disconnected while a batch was live).
+    /// We don't try to keep the in-memory queue — on reconnect a fresh
+    /// LIST + the SQLite diff is the source of truth: completed files
+    /// are skipped, the half-pulled one (never marked synced, never
+    /// saved) is re-fetched whole. Captures the box id *now* because
+    /// the Disconnected handler clears `ble_connected_id` right after.
+    fn arm_sync_resume(&mut self) {
+        if self.ble_resume_box.is_none() {
+            if let Some(id) = self.ble_connected_id.clone() {
+                self.ble_resume_box = Some(id);
+            }
+        }
+        self.ble_dl_queue.clear();
+        self.ble_dl_in_flight = false;
+        self.ble_sync_pending = false;
+        self.ble_sync_msg = "⚠ Transfer interrupted (BLE link lost). Reconnect to \
+             the box — the sync resumes automatically and skips files already saved."
+            .into();
+        push_log(
+            &self.log,
+            "ble: transfer interrupted — armed to resume on reconnect".into(),
+        );
     }
 
     /// Run the diff after a Sync-triggered LIST: enqueue every sensor-
@@ -1287,6 +1368,31 @@ impl AppState {
         {
             {
 
+                /* Interrupted-transfer banner. Shown while disconnected
+                   after a mid-batch link loss (the ble_sync_msg surface
+                   only renders inside the connected block, so without
+                   this the guidance would be invisible exactly when the
+                   user needs it — at the Scan/Connect screen). */
+                if self.ble_resume_box.is_some()
+                    && !matches!(self.ble_state, BleState::Connected)
+                {
+                    egui::Frame::group(ui.style())
+                        .fill(egui::Color32::from_rgb(255, 244, 204))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(200, 150, 60),
+                        ))
+                        .show(ui, |ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(120, 80, 20),
+                                "Transfer interrupted (BLE link lost). Scan and \
+                                 reconnect to the same box — the sync resumes \
+                                 automatically and skips files already saved.",
+                            );
+                        });
+                    ui.add_space(4.0);
+                }
+
                 /* LOG session countdown banner. During a session the box
                    is in LOG mode and doesn't advertise — Scan returns
                    nothing — so the user needs a visible "wait this long"
@@ -1425,6 +1531,7 @@ impl AppState {
                         self.ble_dl_in_flight = false;
                         self.ble_connected_id = None;
                         self.ble_sync_pending = false;
+                        self.ble_resume_box = None; // intentional disconnect — don't auto-resume
                         self.ble_status = format!("LOG session: {} s", self.ble_session_duration_s);
                         /* Start the countdown banner. Stored as
                            (start_instant, duration_seconds) so each
@@ -1459,6 +1566,7 @@ impl AppState {
                         self.ble_dl_in_flight = false;
                         self.ble_connected_id = None;
                         self.ble_sync_pending = false;
+                        self.ble_resume_box = None; // intentional disconnect — don't auto-resume
                         self.ble_status = "disconnecting…".into();
                         push_log(&self.log, "ble: Disconnect requested".into());
                     }
