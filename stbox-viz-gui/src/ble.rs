@@ -593,23 +593,23 @@ impl WorkerState {
             .ok_or_else(|| "peripheral gone — rescan".to_string())?;
         p.connect().await.map_err(|e| format!("connect: {e}"))?;
         if let Err(e) = p.discover_services().await {
-            let _ = p.disconnect().await;
+            drop_link(&p).await;
             return Err(format!("discover_services: {e}"));
         }
         let chars = p.characteristics();
         let data_char = match chars.iter().find(|c| c.uuid == FILEDATA_UUID).cloned() {
             Some(c) => c,
             None => {
-                let _ = p.disconnect().await;
+                drop_link(&p).await;
                 return Err("Box firmware doesn't expose FileSync chars — flash a newer build".into());
             }
         };
         if !chars.iter().any(|c| c.uuid == FILECMD_UUID) {
-            let _ = p.disconnect().await;
+            drop_link(&p).await;
             return Err("Box firmware doesn't expose FileSync chars — flash a newer build".into());
         }
         if let Err(e) = p.subscribe(&data_char).await {
-            let _ = p.disconnect().await;
+            drop_link(&p).await;
             return Err(format!("subscribe FileData: {e}"));
         }
         // SensorStream is optional — only PumpLogger (Peter's PR #18)
@@ -637,7 +637,7 @@ impl WorkerState {
         let stream: NotifStream = match p.notifications().await {
             Ok(s) => Box::pin(s),
             Err(e) => {
-                let _ = p.disconnect().await;
+                drop_link(&p).await;
                 return Err(format!("notifications: {e}"));
             }
         };
@@ -721,7 +721,7 @@ impl WorkerState {
         self.stream_asm     = StreamAsm::default();
         self.stream_capable = false;
         if let Some(p) = self.peripheral.take() {
-            let _ = p.disconnect().await;
+            drop_link(&p).await;
         }
     }
 
@@ -1118,6 +1118,19 @@ impl WorkerState {
 // ---------------------------------------------------------------------------
 //  Parsing helpers
 // ---------------------------------------------------------------------------
+
+/// Disconnect a peripheral without letting it wedge the worker.
+///
+/// When the peer vanished without a clean LL_TERMINATE (box shielded /
+/// out of range), macOS CoreBluetooth's `disconnect()` can block until
+/// the link-supervision timeout — or effectively forever. That froze
+/// the worker *before* it reached the auto-reconnect (the exact
+/// "Sync bleibt stehen" Peter saw). Bound it: 3 s is plenty for a
+/// healthy disconnect; past that we just drop our handle and move on,
+/// which is enough to free our state and let reconnect proceed.
+async fn drop_link(p: &Peripheral) {
+    let _ = tokio::time::timeout(Duration::from_secs(3), p.disconnect()).await;
+}
 
 fn parse_list_row(line: &[u8]) -> Option<(String, u64)> {
     let s = std::str::from_utf8(line).ok()?;
