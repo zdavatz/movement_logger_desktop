@@ -8,6 +8,15 @@ Cross-platform (Windows / macOS / Linux) GUI companion for the SensorTile.box pu
 
 Sources imported from [`fp-sns-stbox1/Utilities/rust`](https://github.com/zdavatz/fp-sns-stbox1) so this repo can ship its own release cadence.
 
+## Supported hardware
+
+This GUI talks to one board only:
+
+- **STMicroelectronics STEVAL-MKBOXPRO** — *SensorTile.box PRO* (Rev_C), running the MovementLogger / PumpLogger firmware ([movement_logger_firmware](https://github.com/zdavatz/movement_logger_firmware)). MCU STM32U585AI; sensors LSM6DSV16X (IMU), LIS2MDL (mag), LPS22DF (baro), STTS22H (temp), STC3115 (fuel gauge), u-blox MAX-M10S (GPS); BLE via BlueNRG-LP.
+- **Buy:** [st.com → STEVAL-MKBOXPRO](https://www.st.com/en/evaluation-tools/steval-mkboxpro.html) (the product page lists ST's authorised distributors / "Buy" options).
+
+Older SensorTile.box variants (Rev_A/B, STWIN.box) are **not** supported by this firmware/GUI combination.
+
 ## Download
 
 Grab the latest archive for your platform from the [Releases page](https://github.com/zdavatz/movement_logger_desktop/releases).
