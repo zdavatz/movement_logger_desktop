@@ -366,7 +366,24 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>) {
                     }
                 }
                 _ = &mut watchdog => {
-                    state.tick_watchdog();
+                    if state.tick_watchdog() {
+                        // A READ stalled but CoreBluetooth still thinks
+                        // it's connected (no stream close). Tear the
+                        // half-dead link down ourselves and auto-
+                        // reconnect so the .part resume can continue —
+                        // this is the case Peter hit where the box
+                        // never saw a formal disconnect. tick_watchdog
+                        // already emitted ReadAborted (partial saved)
+                        // + the timeout error and set op = Idle.
+                        let id = state.last_id.clone();
+                        state.disconnect_inner().await;
+                        if let Some(id) = id {
+                            if state.auto_reconnect(id).await {
+                                continue;
+                            }
+                        }
+                        state.emit(BleEvent::Disconnected);
+                    }
                 }
             }
         } else {
@@ -1039,7 +1056,14 @@ impl WorkerState {
 
     // ---------------- Watchdog ---------------------------------------------
 
-    fn tick_watchdog(&mut self) {
+    /// Returns true iff a READ just stalled (no notifies for
+    /// `OP_IDLE_TIMEOUT`) — the caller should tear the half-dead link
+    /// down and auto-reconnect. This is the path that matters in
+    /// practice: a real-world drop (macOS BLE power-nap, link-
+    /// supervision timeout, worker falling behind) often does NOT
+    /// close the notification stream, so the stream-closed reconnect
+    /// path never fires — only the watchdog sees it.
+    fn tick_watchdog(&mut self) -> bool {
         let now = Instant::now();
 
         /* LIST inactivity-done fallback: if at least one row arrived and no
@@ -1051,7 +1075,7 @@ impl WorkerState {
             if *rows_seen > 0 && now.duration_since(*last_progress) > LIST_INACTIVITY_DONE {
                 self.op = CurrentOp::Idle;
                 self.emit(BleEvent::ListDone);
-                return;
+                return false;
             }
         }
 
@@ -1061,11 +1085,12 @@ impl WorkerState {
             CurrentOp::Deleting { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::Idle => false,
         };
-        if !stale { return; }
+        if !stale { return false; }
 
         match std::mem::replace(&mut self.op, CurrentOp::Idle) {
             CurrentOp::Listing { .. } => {
                 self.emit_err("LIST timed out — no notifies for 20 s");
+                false
             }
             CurrentOp::Reading { name, content, expected, base, .. } => {
                 let got = base + content.len() as u64;
@@ -1079,11 +1104,13 @@ impl WorkerState {
                 self.emit_err(format!(
                     "READ {name} timed out at {got}/{expected} B — no notifies for 20 s"
                 ));
+                true // stalled READ → caller reconnects + resumes
             }
             CurrentOp::Deleting { name, .. } => {
                 self.emit_err(format!("DELETE {name} timed out — no notify for 20 s"));
+                false
             }
-            CurrentOp::Idle => {}
+            CurrentOp::Idle => false,
         }
     }
 }
