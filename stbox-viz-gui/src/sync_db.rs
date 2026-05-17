@@ -1,12 +1,12 @@
-//! Local SQLite sync-state DB.
+//! Local SQLite sync-state DB — an **audit log** of completed pulls.
 //!
-//! Tracks, per box, which SD-card files have already been pulled to
-//! disk so a "Sync now" only fetches the sessions it hasn't seen yet.
-//! This layer is deliberately *not* the file-transfer path: transfer
-//! (LIST → READ → save) already exists in `ble.rs`/`main.rs`. Sync is
-//! the client-side bookkeeping on top of it — the box firmware has no
-//! sync concept (LIST/READ/DELETE only), so "what's already mirrored"
-//! lives entirely here.
+//! As of v0.0.14 the sync *decision* is made by comparing the local
+//! mirror file's size to the box's reported size (see `run_sync_diff`
+//! / `mirror_offset` in `main.rs`), which is what makes a
+//! continuously-growing log fetch only its new tail. This table is no
+//! longer consulted to decide what to fetch; it's kept as a per-box
+//! record of "this file reached this size at this time, saved here"
+//! for history/debugging.
 //!
 //! Policy (user decision, v0.0.6): sync is **purely additive** — it
 //! never issues DELETE. Nothing on the box is ever removed by a sync.
@@ -57,18 +57,6 @@ impl SyncDb {
              );",
         )?;
         Ok(Self { conn })
-    }
-
-    /// True iff this exact (box, name, size) triple was already pulled.
-    pub fn is_synced(&self, box_id: &str, name: &str, size: u64) -> bool {
-        self.conn
-            .query_row(
-                "SELECT 1 FROM synced_files \
-                 WHERE box_id = ?1 AND name = ?2 AND size = ?3",
-                rusqlite::params![box_id, name, size as i64],
-                |_| Ok(()),
-            )
-            .is_ok()
     }
 
     /// Record a successfully-saved file. INSERT OR REPLACE so a

@@ -62,6 +62,12 @@ impl Default for Tab {
 /// state forever.
 const LIVE_HISTORY_LEN: usize = 120;
 
+/// "Keep synced" idle poll interval — re-LIST + fetch any grown tail
+/// this often when there's nothing left to pull. A busy backlog runs
+/// back-to-back (the gap is measured from the previous trigger, which
+/// has long elapsed by the time a big pass finishes).
+const SYNC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Default)]
 struct AppState {
     /// Auto-detected sensor CSV (e.g. `Sens005.csv`). One per session.
@@ -170,6 +176,15 @@ struct AppState {
     /// back: the ListDone handler runs the diff only when this is set,
     /// so the auto-LIST on Connect doesn't accidentally start a sync.
     ble_sync_pending: bool,
+    /// "Keep synced" checkbox: while connected and idle, re-run a sync
+    /// pass every `SYNC_POLL_INTERVAL` so a continuously-growing log
+    /// keeps mirroring (each pass only fetches the new tail).
+    ble_keep_synced: bool,
+    /// When the last sync pass was *triggered*. The continuous loop
+    /// schedules the next pass `SYNC_POLL_INTERVAL` after this — so a
+    /// busy backlog runs back-to-back while an idle box is polled
+    /// every 30 s, not hammered.
+    ble_last_sync_at: Option<std::time::Instant>,
     /// One-line sync result/status ("Sync: 3 new, 12 already synced —
     /// downloading…"), shown in the Sync tab. Empty = no sync yet.
     ble_sync_msg: String,
@@ -768,7 +783,7 @@ impl AppState {
                        still incomplete. The Error("READ … aborted/timed
                        out") that follows drives the resume/ banner. */
                     if !content.is_empty() {
-                        match append_part(&self.ble_out_dir, &name, base, &content) {
+                        match append_mirror(&self.ble_out_dir, &name, base, &content) {
                             Ok(have) => push_log(
                                 &self.log,
                                 format!("ble: kept {have} B of {name} for resume"),
@@ -790,8 +805,8 @@ impl AppState {
                         .find(|f| f.name == name)
                         .map(|f| f.size)
                         .unwrap_or(base + content.len() as u64);
-                    let result = append_part(&self.ble_out_dir, &name, base, &content)
-                        .and_then(|_| finalize_part(&self.ble_out_dir, &name));
+                    let result = append_mirror(&self.ble_out_dir, &name, base, &content)
+                        .map(|_| mirror_path(&self.ble_out_dir, &name));
                     match result {
                         Ok(path) => {
                             self.ble_status =
@@ -923,10 +938,10 @@ impl AppState {
     fn advance_download_queue(&mut self) {
         if self.ble_dl_in_flight { return; }
         let Some((name, size)) = self.ble_dl_queue.pop_front() else { return; };
-        // Resume from whatever is already in <name>.part. The firmware
-        // seeks to this offset, so a re-queued interrupted file
-        // continues instead of restarting.
-        let offset = part_offset(&self.ble_out_dir, &name, size);
+        // Resume/grow from whatever is already mirrored locally. The
+        // firmware seeks to this offset, so an interrupted file
+        // continues and a grown log only fetches its new tail.
+        let offset = mirror_offset(&self.ble_out_dir, &name, size);
         let Some(b) = self.ble.as_ref() else { return; };
         b.send(BleCmd::Read { name: name.clone(), size, offset });
         self.ble_dl_in_flight = true;
@@ -1013,6 +1028,20 @@ impl AppState {
     /// deletes anything (additive-only, by design). Debug/firmware-info
     /// rows are left out — same policy as the default-tick filter, so a
     /// sync mirrors *sessions*, not noise.
+    /// Begin one sync pass: fresh LIST, then the diff runs in the
+    /// `ListDone` handler (gated on `ble_sync_pending`, so the auto-
+    /// LIST on Connect never starts a sync by itself). Used by the
+    /// "Sync now" button and the "Keep synced" continuous loop.
+    fn start_sync_pass(&mut self) {
+        if !matches!(self.ble_state, BleState::Connected) { return; }
+        self.ble_files.clear();
+        self.ble_sync_pending = true;
+        self.ble_last_sync_at = Some(std::time::Instant::now());
+        self.ble_sync_msg = "Sync: listing SD card…".into();
+        if let Some(b) = self.ble.as_ref() { b.send(BleCmd::List); }
+        push_log(&self.log, "ble: sync — listing".into());
+    }
+
     fn run_sync_diff(&mut self) {
         if self.validate_save_dir().is_none() {
             // Bad Save-to path — surface it as the sync result too so
@@ -1021,32 +1050,38 @@ impl AppState {
                 format!("Sync aborted — {}", self.ble_save_err.clone().unwrap_or_default());
             return;
         }
-        let Some(box_id) = self.ble_connected_id.clone() else {
+        if self.ble_connected_id.is_none() {
             self.ble_sync_msg = "sync: no box id (reconnect and retry)".into();
             return;
-        };
-        if self.ensure_sync_db().is_none() {
-            return; // ble_sync_msg already set with the reason
         }
-        let db = self.sync_db.as_ref().unwrap();
-        let mut new = 0usize;
-        let mut skipped = 0usize;
+        // Decide by local mirror size vs the box's current size, not a
+        // "have I ever seen this exact size" DB lookup. That's what
+        // makes a continuously-growing log work: each pass fetches only
+        // the new tail (offset = local size) instead of re-pulling the
+        // whole file, so no single big file can starve GPS/BAT either.
+        let mut fetch = 0usize;
+        let mut up_to_date = 0usize;
         self.ble_dl_queue.clear();
         for f in self.ble_files.iter() {
             if !is_sensor_data_name(&f.name) {
                 continue;
             }
-            if db.is_synced(&box_id, &f.name, f.size) {
-                skipped += 1;
+            let local = std::fs::metadata(mirror_path(&self.ble_out_dir, &f.name))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if local == f.size {
+                up_to_date += 1;
             } else {
-                new += 1;
+                // local < size → grow/resume; local > size → rotated
+                // (mirror_offset resets it). Either way, fetch.
+                fetch += 1;
                 self.ble_dl_queue.push_back((f.name.clone(), f.size));
             }
         }
-        self.ble_sync_msg = if new == 0 {
-            format!("Sync: up to date ({skipped} already synced, nothing new)")
+        self.ble_sync_msg = if fetch == 0 {
+            format!("Sync: up to date ({up_to_date} files)")
         } else {
-            format!("Sync: {new} new, {skipped} already synced — downloading…")
+            format!("Sync: fetching {fetch} ({up_to_date} up to date)…")
         };
         push_log(&self.log, format!("ble: {}", self.ble_sync_msg));
         self.advance_download_queue();
@@ -1225,27 +1260,33 @@ impl AppState {
     }
 }
 
-/// Save a downloaded file under `dir`, creating the directory if
-/// needed. Returns the resolved destination path.
-/// Resume-aware download assembly. Every download streams into a
-/// sibling `<name>.part`; only a fully-received file is renamed to its
-/// final name. The `.part` length is the single source of truth for
-/// "how many bytes do we already have" — it survives an app restart,
-/// so a resume after a crash/quit is just as lossless as one after a
-/// reconnect. A file only counts as synced once it's the final name.
-fn part_path(dir: &Path, name: &str) -> PathBuf {
-    dir.join(format!("{name}.part"))
+/// Live-mirror download assembly.
+///
+/// The local file `<dir>/<name>` *is* the running mirror — we
+/// accumulate straight into it, no `.part`/rename. The box's log files
+/// grow continuously while a session runs, so "done" is a moving
+/// target; what matters is that the local file is always a valid
+/// prefix of the box file (the logs are append-only) and we only ever
+/// fetch the bytes we don't have yet. This makes the local size the
+/// single source of truth for the resume/grow offset — survives an
+/// app restart, a dropped link, and "the file got bigger since last
+/// sync" identically.
+fn mirror_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(name)
 }
 
-/// Bytes already downloaded for `name` (the resume offset). 0 if no
-/// `.part` yet. If a stale `.part` is somehow larger than the file's
-/// real size it's corrupt/leftover — delete it and restart from 0
-/// rather than seek past EOF.
-fn part_offset(dir: &Path, name: &str, full_size: u64) -> u64 {
-    let p = part_path(dir, name);
+/// Where to resume `name` from given the box's current size.
+/// - local missing            → 0 (fresh)
+/// - local smaller than box   → local size (resume / fetch the delta)
+/// - local == box             → equal (caller treats as up-to-date)
+/// - local larger than box    → the file rotated (session reused the
+///   name, box file is now shorter) → truncate local, restart at 0
+fn mirror_offset(dir: &Path, name: &str, box_size: u64) -> u64 {
+    let p = mirror_path(dir, name);
     match std::fs::metadata(&p) {
-        Ok(m) if m.len() <= full_size => m.len(),
+        Ok(m) if m.len() <= box_size => m.len(),
         Ok(_) => {
+            // Rotated/shorter on the box — old local copy is stale.
             let _ = std::fs::remove_file(&p);
             0
         }
@@ -1253,15 +1294,15 @@ fn part_offset(dir: &Path, name: &str, full_size: u64) -> u64 {
     }
 }
 
-/// Append a streamed segment to `<name>.part` (creating it). `base` is
-/// the offset the segment started at; it must equal the current
-/// `.part` length or the resume is misaligned (we requested READ at
-/// the `.part` length, so this only trips on a logic bug) — in that
-/// case truncate to `base` first so we never write a corrupt file.
-fn append_part(dir: &Path, name: &str, base: u64, bytes: &[u8]) -> std::io::Result<u64> {
+/// Append a streamed segment to `<dir>/<name>` (creating it). `base`
+/// is the offset the segment started at; if it doesn't match the
+/// current file length the resume is misaligned (offset is derived
+/// from this same file's length before the READ) — realign to `base`
+/// so we never interleave a corrupt prefix.
+fn append_mirror(dir: &Path, name: &str, base: u64, bytes: &[u8]) -> std::io::Result<u64> {
     use std::io::{Seek, SeekFrom, Write};
     std::fs::create_dir_all(dir)?;
-    let p = part_path(dir, name);
+    let p = mirror_path(dir, name);
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -1269,22 +1310,12 @@ fn append_part(dir: &Path, name: &str, base: u64, bytes: &[u8]) -> std::io::Resu
         .open(&p)?;
     let cur = f.metadata()?.len();
     if cur != base {
-        // Realign defensively (shouldn't happen — offset is derived
-        // from this same file's length before the READ).
         f.set_len(base.min(cur))?;
     }
     f.seek(SeekFrom::End(0))?;
     f.write_all(bytes)?;
     f.flush()?;
     Ok(f.metadata()?.len())
-}
-
-/// Rename the completed `<name>.part` to its final name, replacing any
-/// previous copy. Returns the final path.
-fn finalize_part(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
-    let final_path = dir.join(name);
-    std::fs::rename(part_path(dir, name), &final_path)?;
-    Ok(final_path)
 }
 
 /// Expand a leading `~` and require an absolute path. Pure path math,
@@ -1589,22 +1620,31 @@ impl AppState {
                             egui::Button::new("Sync now"),
                         )
                         .on_hover_text(
-                            "Pull every session file on the SD card that isn't already \
-                             in the local sync DB (~/.movementlogger/sync.db). \
-                             Additive only — never deletes anything on the box. \
-                             Re-runnable: already-synced files are skipped.",
+                            "Fetch every session file that's larger on the box than \
+                             the local copy (only the new tail is pulled, so a \
+                             growing log isn't re-downloaded). Additive — never \
+                             deletes anything on the box.",
                         )
                         .clicked()
                     {
-                        /* Fresh LIST first; the diff runs in the ListDone
-                           handler when ble_sync_pending is set. Don't
-                           diff the on-screen list directly — it may be
-                           stale (older session, pre-Refresh). */
-                        self.ble_files.clear();
-                        self.ble_sync_pending = true;
-                        self.ble_sync_msg = "Sync: listing SD card…".into();
-                        if let Some(b) = self.ble.as_ref() { b.send(BleCmd::List); }
-                        push_log(&self.log, "ble: Sync now — listing".into());
+                        self.start_sync_pass();
+                    }
+                    if ui
+                        .checkbox(&mut self.ble_keep_synced, "Keep synced")
+                        .on_hover_text(format!(
+                            "Stay connected and re-sync every {} s so growing log \
+                             files keep mirroring without clicking Sync now again. \
+                             Each pass only fetches what grew.",
+                            SYNC_POLL_INTERVAL.as_secs()
+                        ))
+                        .changed()
+                        && self.ble_keep_synced
+                        && connected
+                        && !self.ble_sync_pending
+                        && !self.ble_dl_in_flight
+                    {
+                        // Kick the first pass immediately on enable.
+                        self.start_sync_pass();
                     }
                     if ui
                         .add_enabled(connected, egui::Button::new("STOP_LOG"))
@@ -2205,6 +2245,31 @@ impl eframe::App for AppState {
         self.pump_ble_events();
         // Same idea for the version-check + install pipeline.
         self.pump_update_events();
+
+        // "Keep synced": while connected and idle, kick a fresh sync
+        // pass on the poll interval so a continuously-growing log keeps
+        // mirroring (each pass only fetches the new tail). A busy
+        // backlog effectively runs back-to-back because the interval is
+        // measured from the previous *trigger*, long elapsed by the
+        // time a big pass drains.
+        if self.ble_keep_synced
+            && matches!(self.ble_state, BleState::Connected)
+            && !self.ble_sync_pending
+            && !self.ble_dl_in_flight
+            && self.ble_dl_queue.is_empty()
+        {
+            let due = self
+                .ble_last_sync_at
+                .map(|t| t.elapsed() >= SYNC_POLL_INTERVAL)
+                .unwrap_or(true);
+            if due {
+                self.start_sync_pass();
+            }
+        }
+        if self.ble_keep_synced && matches!(self.ble_state, BleState::Connected) {
+            // Keep ticking so the poll fires without user input.
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
 
         // Lazy-load the in-app logo on the first frame after the egui
         // context becomes available.
