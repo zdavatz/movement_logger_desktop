@@ -1386,6 +1386,26 @@ fn probe_save_dir(dir: &Path) -> Result<(), String> {
 /// list into the Sensor / Debug groups. macOS AppleDouble sidecars
 /// (`._<name>`) match the inner pattern by accident, so guard the
 /// prefix explicitly.
+/// Recency rank for the file list: the trailing per-session counter in
+/// `SensNNN.csv` / `GpsNNN.csv` / … — higher = later session = shown
+/// first. Names without a number rank lowest (-1).
+fn recency_key(name: &str) -> i64 {
+    let mut last: Option<i64> = None;
+    let mut cur = String::new();
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            last = cur.parse().ok();
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        last = cur.parse().ok();
+    }
+    last.unwrap_or(-1)
+}
+
 fn is_sensor_data_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if lower.starts_with("._") { return false; }
@@ -1885,6 +1905,15 @@ impl AppState {
                                 debug_idx.push(i);
                             }
                         }
+                        // Newest session first so the latest recording is
+                        // at the top — no scrolling to the end of the list.
+                        let files = &self.ble_files;
+                        let by_recency_desc = |a: &usize, b: &usize| {
+                            recency_key(&files[*b].name)
+                                .cmp(&recency_key(&files[*a].name))
+                        };
+                        sensor_idx.sort_by(by_recency_desc);
+                        debug_idx.sort_by(by_recency_desc);
 
                         egui::ScrollArea::vertical()
                             .max_height(220.0)
