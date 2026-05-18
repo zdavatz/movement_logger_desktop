@@ -2280,13 +2280,19 @@ impl eframe::App for AppState {
         }
 
         egui::TopBottomPanel::top("title").show(ctx, |ui| {
-            // No app-name + version heading here — the OS window
-            // title already shows it, no point duplicating.
             ui.horizontal(|ui| {
-                ui.hyperlink_to(
-                    "SensorTile.box pumpfoil session video generator",
-                    "https://github.com/zdavatz/fp-sns-stbox1",
-                );
+                ui.vertical(|ui| {
+                    // App name + version in the in-app header (the OS
+                    // title bar is easy to miss, esp. on macOS).
+                    ui.heading(format!(
+                        "MovementLogger v{}",
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                    ui.hyperlink_to(
+                        "SensorTile.box pumpfoil session video generator",
+                        "https://github.com/zdavatz/fp-sns-stbox1",
+                    );
+                });
                 // Right-anchor the logo so it sits in the top-right
                 // corner regardless of window width. Clicking it opens
                 // a mailto: to support — saves field testers having to
@@ -2758,7 +2764,7 @@ fn os_window_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
-    let title = format!("MovementLogger {}", env!("CARGO_PKG_VERSION"));
+    let title = format!("MovementLogger v{}", env!("CARGO_PKG_VERSION"));
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([880.0, 720.0])
         .with_min_inner_size([560.0, 480.0])
