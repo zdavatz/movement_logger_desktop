@@ -2282,12 +2282,8 @@ impl eframe::App for AppState {
         egui::TopBottomPanel::top("title").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    // App name + version in the in-app header (the OS
-                    // title bar is easy to miss, esp. on macOS).
-                    ui.heading(format!(
-                        "MovementLogger v{}",
-                        env!("CARGO_PKG_VERSION")
-                    ));
+                    // Name + version live in the OS title bar (set in
+                    // main()); don't repeat them in the in-app header.
                     ui.hyperlink_to(
                         "SensorTile.box pumpfoil session video generator",
                         "https://github.com/zdavatz/fp-sns-stbox1",
