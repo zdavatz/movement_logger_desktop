@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::agent_config::AgentConfig;
 use crate::ble::{BleBackend, BleCmd, BleEvent, LiveSample};
 use crate::sync_db;
 
@@ -346,6 +347,23 @@ pub fn is_synced_name(name: &str) -> bool {
 }
 
 impl SyncCore {
+    /// Snapshot the agent-relevant state into `~/.movementlogger/
+    /// config.toml`. Called by the GUI whenever box id / save dir /
+    /// keep-synced / box log mode changes, so the headless `--agent`
+    /// always has a current target. Best-effort; a write failure is
+    /// logged, not fatal.
+    pub fn persist_config(&self) {
+        let cfg = AgentConfig {
+            box_id: self.ble_connected_id.clone(),
+            save_dir: self.ble_out_dir.to_string_lossy().into_owned(),
+            keep_synced: self.ble_keep_synced,
+            log_mode_manual: self.ble_log_mode,
+        };
+        if let Err(e) = cfg.save() {
+            push_log(&self.log, format!("config: save failed: {e}"));
+        }
+    }
+
     /// Drain pending BLE events into the visible state. Called once per
     /// frame; egui repaints on a timer while a BLE op is in progress so
     /// events don't sit in the channel for long.
@@ -583,6 +601,10 @@ impl SyncCore {
                         &self.log,
                         format!("ble: box log mode = {}", if manual { "manual" } else { "auto" }),
                     );
+                    // The agent's autostart item is gated on AUTO; keep
+                    // config in step so it (de)registers on the next
+                    // GUI tick / agent poll.
+                    self.persist_config();
                 }
                 BleEvent::DeleteDone { name } => {
                     self.ble_status = format!("deleted {name}");
@@ -696,6 +718,7 @@ impl SyncCore {
             Ok(d) => {
                 self.ble_save_err = None;
                 self.ble_out_dir = d.clone();
+                self.persist_config();
                 Some(d)
             }
             Err(e) => {

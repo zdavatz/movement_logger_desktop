@@ -14,6 +14,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent_config;
 mod ble;
 mod installer;
 mod sync_core;
@@ -1051,7 +1052,7 @@ impl AppState {
                     {
                         self.sync.start_sync_pass();
                     }
-                    if ui
+                    let keep_changed = ui
                         .checkbox(&mut self.sync.ble_keep_synced, "Keep synced")
                         .on_hover_text(format!(
                             "Stay connected and re-sync every {} s so growing log \
@@ -1059,7 +1060,13 @@ impl AppState {
                              Each pass only fetches what grew.",
                             SYNC_POLL_INTERVAL.as_secs()
                         ))
-                        .changed()
+                        .changed();
+                    if keep_changed {
+                        // Persist so the agent honours (or stops) the
+                        // continuous mirror to match the GUI toggle.
+                        self.sync.persist_config();
+                    }
+                    if keep_changed
                         && self.sync.ble_keep_synced
                         && connected
                         && !self.sync.ble_sync_pending
@@ -1257,6 +1264,9 @@ impl AppState {
                                    can key per-box; the worker's Connected
                                    event doesn't echo the id back. */
                                 self.sync.ble_connected_id = Some(d.id.clone());
+                                // Persist the box id so the headless
+                                // agent reconnects to this same box.
+                                self.sync.persist_config();
                                 if let Some(b) = self.sync.ble.as_ref() {
                                     b.send(BleCmd::Connect(d.id.clone()));
                                 }
