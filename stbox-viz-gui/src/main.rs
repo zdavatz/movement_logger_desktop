@@ -1063,7 +1063,7 @@ impl AppState {
         let mut up_to_date = 0usize;
         self.ble_dl_queue.clear();
         for f in self.ble_files.iter() {
-            if !is_sensor_data_name(&f.name) {
+            if !is_synced_name(&f.name) {
                 continue;
             }
             let local = std::fs::metadata(mirror_path(&self.ble_out_dir, &f.name))
@@ -1413,6 +1413,21 @@ fn is_sensor_data_name(name: &str) -> bool {
         || (lower.starts_with("gps")  && lower.ends_with(".csv"))
         || (lower.starts_with("bat")  && lower.ends_with(".csv"))
         || (lower.starts_with("mic")  && lower.ends_with(".wav"))
+}
+
+/// Files the *Sync* pass mirrors: every per-session sensor-data file
+/// (`is_sensor_data_name`) **plus** the firmware's single rolling error
+/// log `ERRLOG.LOG` (`movement_logger_firmware/Src/errlog.c`). Peter
+/// needs the errlog to debug box-side stalls, and it's append-only just
+/// like the session logs, so the same live-mirror byte-resume path
+/// applies unchanged. Deliberately kept separate from
+/// `is_sensor_data_name` so the manual file list's default-tick and the
+/// Sensor/Debug split are untouched — `ERRLOG.LOG` still lands in the
+/// Debug group and stays un-ticked there; only *Sync now* / Keep-synced
+/// pull it. Match is case-insensitive (firmware writes it upper-case;
+/// macOS/FAT may surface either case).
+fn is_synced_name(name: &str) -> bool {
+    is_sensor_data_name(name) || name.eq_ignore_ascii_case("ERRLOG.LOG")
 }
 
 /// Names the box firmware can never delete, with the reason (for the
