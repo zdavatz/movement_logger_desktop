@@ -83,6 +83,20 @@ const LIST_INACTIVITY_DONE: Duration = Duration::from_millis(500);
 const RECONNECT_ATTEMPTS: u32 = 10;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Upper bound on every individual GATT step inside `connect_core`
+/// (connect / discover / subscribe / notifications). Same rationale as
+/// `drop_link`'s bounded `disconnect()`: on macOS CoreBluetooth none of
+/// these calls has an intrinsic timeout — after an unclean drop a stale
+/// connection state makes `connect()` or `discover_services()` block
+/// effectively forever. Unbounded, that froze the worker *inside*
+/// `auto_reconnect` on the very first attempt, so the 10-attempt loop
+/// never advanced and `Disconnected` was never emitted — the box kept
+/// advertising ("visible in BT") while the app sat dead. 12 s is plenty
+/// for a healthy connect+discover; past that the attempt fails and the
+/// reconnect loop moves on (or falls back to manual). Never drop these
+/// timeouts — it's the connect-side twin of the `drop_link` fix.
+const LINK_OP_TIMEOUT: Duration = Duration::from_secs(12);
+
 // ---------------------------------------------------------------------------
 //  Public command / event API
 // ---------------------------------------------------------------------------
@@ -591,10 +605,30 @@ impl WorkerState {
             .into_iter()
             .find(|x| x.id().to_string() == id)
             .ok_or_else(|| "peripheral gone — rescan".to_string())?;
-        p.connect().await.map_err(|e| format!("connect: {e}"))?;
-        if let Err(e) = p.discover_services().await {
-            drop_link(&p).await;
-            return Err(format!("discover_services: {e}"));
+        // Bounded — see LINK_OP_TIMEOUT. On a connect timeout there may
+        // be a pending CoreBluetooth connect; drop_link cancels it so
+        // the next reconnect attempt doesn't fight a half-open link.
+        match tokio::time::timeout(LINK_OP_TIMEOUT, p.connect()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                drop_link(&p).await;
+                return Err(format!("connect: {e}"));
+            }
+            Err(_) => {
+                drop_link(&p).await;
+                return Err("connect: timed out".into());
+            }
+        }
+        match tokio::time::timeout(LINK_OP_TIMEOUT, p.discover_services()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                drop_link(&p).await;
+                return Err(format!("discover_services: {e}"));
+            }
+            Err(_) => {
+                drop_link(&p).await;
+                return Err("discover_services: timed out".into());
+            }
         }
         let chars = p.characteristics();
         let data_char = match chars.iter().find(|c| c.uuid == FILEDATA_UUID).cloned() {
@@ -608,9 +642,16 @@ impl WorkerState {
             drop_link(&p).await;
             return Err("Box firmware doesn't expose FileSync chars — flash a newer build".into());
         }
-        if let Err(e) = p.subscribe(&data_char).await {
-            drop_link(&p).await;
-            return Err(format!("subscribe FileData: {e}"));
+        match tokio::time::timeout(LINK_OP_TIMEOUT, p.subscribe(&data_char)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                drop_link(&p).await;
+                return Err(format!("subscribe FileData: {e}"));
+            }
+            Err(_) => {
+                drop_link(&p).await;
+                return Err("subscribe FileData: timed out".into());
+            }
         }
         // SensorStream is optional — only PumpLogger (Peter's PR #18)
         // firmware exposes it. Subscribe if present, log if not, but
@@ -618,15 +659,22 @@ impl WorkerState {
         // PumpTsueri name) is FileSync-only and must keep working.
         self.stream_capable = false;
         if let Some(stream_char) = chars.iter().find(|c| c.uuid == STREAM_UUID).cloned() {
-            match p.subscribe(&stream_char).await {
-                Ok(()) => {
+            // Bounded like the rest, but a timeout/error here is
+            // non-fatal — just leave the live tab empty.
+            match tokio::time::timeout(LINK_OP_TIMEOUT, p.subscribe(&stream_char)).await {
+                Ok(Ok(())) => {
                     self.stream_capable = true;
                     self.emit(BleEvent::Status("SensorStream subscribed (live data at 0.5 Hz)".into()));
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     self.emit(BleEvent::Status(format!(
                         "SensorStream subscribe failed ({e}) — live tab will be empty"
                     )));
+                }
+                Err(_) => {
+                    self.emit(BleEvent::Status(
+                        "SensorStream subscribe timed out — live tab will be empty".into()
+                    ));
                 }
             }
         } else {
@@ -634,11 +682,17 @@ impl WorkerState {
                 "SensorStream characteristic not advertised — legacy firmware, live tab will be empty".into()
             ));
         }
-        let stream: NotifStream = match p.notifications().await {
-            Ok(s) => Box::pin(s),
-            Err(e) => {
+        let stream: NotifStream = match tokio::time::timeout(
+            LINK_OP_TIMEOUT, p.notifications()
+        ).await {
+            Ok(Ok(s)) => Box::pin(s),
+            Ok(Err(e)) => {
                 drop_link(&p).await;
                 return Err(format!("notifications: {e}"));
+            }
+            Err(_) => {
+                drop_link(&p).await;
+                return Err("notifications: timed out".into());
             }
         };
         self.peripheral   = Some(p);
@@ -1089,8 +1143,19 @@ impl WorkerState {
 
         match std::mem::replace(&mut self.op, CurrentOp::Idle) {
             CurrentOp::Listing { .. } => {
-                self.emit_err("LIST timed out — no notifies for 20 s");
-                false
+                // Treat a stalled LIST exactly like a stalled READ: tear
+                // the half-dead link down and auto-reconnect. Under
+                // "Keep synced" the worker spends most of its idle time
+                // in LIST (a fresh LIST every 30 s, plus the re-LIST
+                // after each reconnect), so a drop during LIST is the
+                // *common* case. Returning false here left peripheral +
+                // stream as Some (half-dead), no reconnect, and every
+                // subsequent 30 s LIST stalled the same way — sync
+                // silently dead while the box stayed visible in BT
+                // (exactly Peter's report). The reconnect re-LISTs and
+                // Keep-synced re-arms the pass, so this is lossless.
+                self.emit_err("LIST timed out — no notifies for 20 s, reconnecting");
+                true
             }
             CurrentOp::Reading { name, content, expected, base, .. } => {
                 let got = base + content.len() as u64;
