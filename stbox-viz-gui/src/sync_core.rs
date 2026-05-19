@@ -7,7 +7,136 @@
 //! change — these moved without edits. Later steps add `SyncCore`
 //! (the driver state + methods) here too.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+
+use crate::ble::BleBackend;
+use crate::sync_db;
+
+#[derive(Clone, Debug)]
+pub struct BleDevice {
+    pub id: String,
+    pub name: String,
+    pub rssi: Option<i16>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BleFile {
+    pub name: String,
+    pub size: u64,
+    pub selected: bool,
+    pub downloaded: bool,
+    /// Bytes received so far on the current read. Reset to 0 on
+    /// ReadStarted, advanced on each ReadProgress notify, and bumped to
+    /// `size` on ReadDone. Drives the per-row progress bar.
+    pub bytes_done: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BleState {
+    #[default]
+    Idle,
+    Scanning,
+    Connecting,
+    Connected,
+}
+
+/// UI-independent BLE-FileSync + Sync engine state. Lifted verbatim out
+/// of `AppState` (issue #14 part B step 2) so the headless `--agent`
+/// can drive the same engine the GUI does. `AppState` now owns one of
+/// these as `self.sync`; the GUI reads/writes its fields for display
+/// exactly as before. Step 3 moves the engine *methods* onto this
+/// struct; for now only the fields moved (no behaviour change).
+#[derive(Default)]
+pub struct SyncCore {
+    // ----- BLE FileSync state ------------------------------------------
+    /// Worker-thread backend. Lazily spawned on first BLE button click
+    /// so the tokio runtime doesn't start unless the user actually opens
+    /// the panel.
+    pub ble: Option<BleBackend>,
+    /// Discovered PumpTsueri peripherals from the most recent scan.
+    pub ble_devices: Vec<BleDevice>,
+    /// Connection lifecycle state — drives which buttons are enabled.
+    pub ble_state: BleState,
+    /// File listing returned by the most recent LIST. Each row carries
+    /// a checkbox the user can flip before hitting "Download selected".
+    pub ble_files: Vec<BleFile>,
+    /// One-line status badge (last `Status`/`Error` event from the worker).
+    pub ble_status: String,
+    /// Where downloaded files land. Defaults to a `csv/` subfolder so
+    /// they slot straight into the existing visualisation path.
+    pub ble_out_dir: PathBuf,
+    /// Session duration (seconds) the user types into the "Start session"
+    /// field. Sent as the START_LOG payload (issue #15). Default 1800 s
+    /// = 30 minutes.
+    pub ble_session_duration_s: u32,
+    /// Serial download queue. "Download selected" pushes all ticked files
+    /// here; the head is sent to the worker. The next entry is popped and
+    /// sent on ReadDone or on a READ-side error event. Required because
+    /// the worker has a single in-flight slot and blasting all reads in
+    /// one shot rejects all but the first with "another op is in flight".
+    pub ble_dl_queue: VecDeque<(String, u64)>,
+    /// True iff a Read is in flight in the worker (Download or queue head).
+    /// Drives queue advancement when a Read completes or errors out.
+    pub ble_dl_in_flight: bool,
+    /// `(start_instant, duration_seconds)` while a LOG session is running
+    /// on the box. Set when Start session is clicked, cleared when the
+    /// remaining time falls to zero (after which the box should be back
+    /// in BLE mode and Scan-able). Drives the countdown banner that
+    /// replaces the file list while the box is silent.
+    pub ble_session_running: Option<(std::time::Instant, u32)>,
+    /// The box's persisted log mode, from a GET_MODE reply (queried on
+    /// every Connect) or a confirmed SET_MODE. `None` = unknown / not
+    /// yet answered / legacy `PumpTsueri` firmware (no GET_MODE);
+    /// `Some(false)` = AUTO (box logs on power-on); `Some(true)` =
+    /// MANUAL (box idle until START_LOG). Mirrors the Android
+    /// `FileSyncUiState.logModeManual`.
+    pub ble_log_mode: Option<bool>,
+
+    // ----- Sync (vs. plain transfer) -----------------------------------
+    /// Peripheral id of the box we're connected to, captured at Connect
+    /// time. Used as the per-box key in the sync DB so two different
+    /// boxes don't share sync history. Cleared on disconnect.
+    pub ble_connected_id: Option<String>,
+    /// Lazily-opened local sync-state DB (`~/.movementlogger/sync.db`).
+    /// `None` until the first sync; stays `None` (sync disabled, msg
+    /// set) if the DB can't be opened.
+    pub sync_db: Option<sync_db::SyncDb>,
+    /// True between a "Sync now" click and the LIST it triggers coming
+    /// back: the ListDone handler runs the diff only when this is set,
+    /// so the auto-LIST on Connect doesn't accidentally start a sync.
+    pub ble_sync_pending: bool,
+    /// "Keep synced" checkbox: while connected and idle, re-run a sync
+    /// pass every `SYNC_POLL_INTERVAL` so a continuously-growing log
+    /// keeps mirroring (each pass only fetches the new tail).
+    pub ble_keep_synced: bool,
+    /// When the last sync pass was *triggered*. The continuous loop
+    /// schedules the next pass `SYNC_POLL_INTERVAL` after this — so a
+    /// busy backlog runs back-to-back while an idle box is polled
+    /// every 30 s, not hammered.
+    pub ble_last_sync_at: Option<std::time::Instant>,
+    /// One-line sync result/status ("Sync: 3 new, 12 already synced —
+    /// downloading…"), shown in the Sync tab. Empty = no sync yet.
+    pub ble_sync_msg: String,
+    /// Last "Save to" validation failure, shown as a prominent red
+    /// banner under the field. `Some` blocks Download/Sync so a bad
+    /// path can't silently no-op (the original bug: a relative or
+    /// macOS-TCC-blocked path made the app *say* it saved while the
+    /// file went nowhere the user expected). Cleared on a good path.
+    pub ble_save_err: Option<String>,
+    /// Box id of an interrupted transfer/sync to auto-resume on the
+    /// next reconnect to that same box. Set when the BLE link drops
+    /// mid-batch (timeout / disconnect / shielded radio); consumed in
+    /// the `Connected` handler, which re-arms a sync — the SQLite DB
+    /// makes that skip everything already saved and re-pull only the
+    /// file that was cut off. `None` = nothing to resume.
+    pub ble_resume_box: Option<String>,
+    /// Last DELETE rejection from the box (NOT_FOUND / BUSY / IO_ERROR
+    /// / BAD_REQUEST). Shown as a prominent red banner so a failed
+    /// delete isn't only buried in the log. Cleared on a successful
+    /// delete, a new delete attempt, or disconnect.
+    pub ble_delete_err: Option<String>,
+}
 
 /// Live-mirror download assembly.
 ///
