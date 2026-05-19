@@ -9,9 +9,39 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use crate::ble::BleBackend;
+use crate::ble::{BleBackend, BleCmd, BleEvent, LiveSample};
 use crate::sync_db;
+
+/// Append a line to the shared log buffer (the GUI's scrollable log
+/// panel; the headless agent drains the same buffer to stdout/file).
+/// Capped so a long-running session can't exhaust RAM.
+pub fn push_log(log: &Arc<Mutex<Vec<String>>>, line: String) {
+    if let Ok(mut v) = log.lock() {
+        const CAP: usize = 10_000;
+        if v.len() >= CAP {
+            v.drain(..CAP / 4);
+        }
+        v.push(line);
+    }
+}
+
+/// GUI-only side-effects the sync engine triggers but `SyncCore` itself
+/// must not own (they touch egui Live-tab chart state / the Replay
+/// form). The GUI implements this over borrows of those fields; the
+/// headless `--agent` uses a no-op impl.
+pub trait SyncHost {
+    /// A BLE link dropped — discard any live-stream chart history so a
+    /// reconnect starts clean (no-op for the agent).
+    fn on_link_reset(&mut self);
+    /// One decoded SensorStream snapshot arrived (GUI updates the Live
+    /// charts; the agent ignores it — it never subscribes to Live).
+    fn on_sample(&mut self, s: &LiveSample);
+    /// A file finished downloading — auto-route it into the Replay
+    /// form slots (no-op for the agent).
+    fn on_downloaded(&mut self, name: &str, path: &Path);
+}
 
 #[derive(Clone, Debug)]
 pub struct BleDevice {
@@ -136,6 +166,10 @@ pub struct SyncCore {
     /// delete isn't only buried in the log. Cleared on a successful
     /// delete, a new delete attempt, or disconnect.
     pub ble_delete_err: Option<String>,
+    /// Shared log sink. The GUI shares its scrollable-panel `Arc` here
+    /// so BLE/sync lines land in the same buffer as before; the agent
+    /// points it at a stdout/file drain.
+    pub log: Arc<Mutex<Vec<String>>>,
 }
 
 /// Live-mirror download assembly.
@@ -309,4 +343,458 @@ pub fn is_sensor_data_name(name: &str) -> bool {
 /// macOS/FAT may surface either case).
 pub fn is_synced_name(name: &str) -> bool {
     is_sensor_data_name(name) || name.eq_ignore_ascii_case("ERRLOG.LOG")
+}
+
+impl SyncCore {
+    /// Drain pending BLE events into the visible state. Called once per
+    /// frame; egui repaints on a timer while a BLE op is in progress so
+    /// events don't sit in the channel for long.
+    pub fn pump_ble_events(&mut self, host: &mut dyn SyncHost) {
+        let Some(b) = self.ble.as_ref() else { return; };
+        let events = b.try_recv_all();
+        for e in events {
+            match e {
+                BleEvent::Status(s) => {
+                    /* Mirror Status events into the Log so the user has a
+                       scrollable history of BLE state transitions — the
+                       single-line ble_status badge was the only surface
+                       before, which made it easy to miss a transient
+                       message like "LIST sent" or "STOP_LOG sent". Skip
+                       the high-frequency "reading X: N B" progress
+                       chatter — that already has the per-row progress
+                       bar; tee-ing it would drown out everything else. */
+                    if !s.starts_with("reading ") {
+                        push_log(&self.log, format!("ble: {s}"));
+                    }
+                    self.ble_status = s;
+                }
+                BleEvent::Discovered { id, name, rssi } => {
+                    if !self.ble_devices.iter().any(|d| d.id == id) {
+                        self.ble_devices.push(BleDevice { id, name, rssi });
+                    }
+                }
+                BleEvent::ScanStopped => {
+                    self.ble_state = BleState::Idle;
+                    self.ble_status = format!("scan done ({} found)", self.ble_devices.len());
+                }
+                BleEvent::Connected => {
+                    self.ble_state = BleState::Connected;
+                    self.ble_status = "connected".into();
+                    /* Auto-refresh the file list on every successful
+                       Connect (initial or post-reconnect). Previously the
+                       user had to click Refresh manually — easy to miss
+                       after a Disconnect+Reconnect cycle because the
+                       list pane already showed "No file list yet — hit
+                       Refresh." which looked like a transient state. */
+                    self.ble_files.clear();
+                    self.ble_sync_msg.clear();
+                    /* Resume an interrupted transfer/sync. If we just
+                       reconnected to the same box that was cut off mid-
+                       batch, arm a sync: the auto-LIST below produces a
+                       ListDone, and with ble_sync_pending set that runs
+                       run_sync_diff — which the SQLite DB makes skip
+                       everything already saved and re-pull only the
+                       file the drop interrupted. Resume only for the
+                       same box; a different box clears the flag so a
+                       stale resume can't fire later. */
+                    if self.ble_resume_box.is_some()
+                        && self.ble_resume_box == self.ble_connected_id
+                    {
+                        self.ble_sync_pending = true;
+                        self.ble_sync_msg =
+                            "Reconnected — resuming sync (skipping files already saved)…"
+                                .into();
+                        push_log(&self.log, "ble: reconnect — resuming interrupted sync".into());
+                    }
+                    self.ble_resume_box = None;
+                    if let Some(b) = self.ble.as_ref() {
+                        b.send(BleCmd::List);
+                    }
+                }
+                BleEvent::Disconnected => {
+                    /* If a transfer/sync was live when the link dropped,
+                       remember which box so the next reconnect resumes
+                       it (via the DB diff). Capture before the field
+                       clears below. arm_sync_resume is idempotent with
+                       the Error-handler path that may have fired first. */
+                    let was_active = self.ble_dl_in_flight
+                        || !self.ble_dl_queue.is_empty()
+                        || self.ble_sync_pending
+                        || self.ble_resume_box.is_some();
+                    if was_active {
+                        self.arm_sync_resume();
+                    }
+                    self.ble_state = BleState::Idle;
+                    self.ble_files.clear();
+                    if !was_active {
+                        self.ble_status = "disconnected".into();
+                    }
+                    self.ble_dl_queue.clear();
+                    self.ble_dl_in_flight = false;
+                    /* Drop live state too — the box can drop the stream
+                       mid-connection (e.g. flaky link) and the next
+                       reconnect should start from a clean history,
+                       not graft new samples onto stale chart data. */
+                    host.on_link_reset();
+                    self.ble_connected_id = None;
+                    self.ble_sync_pending = false;
+                    self.ble_delete_err = None;
+                    /* Re-query the box log mode fresh on the next
+                       Connect (it could be a different box, or changed
+                       from another client) rather than show a stale
+                       value while disconnected. */
+                    self.ble_log_mode = None;
+                }
+                BleEvent::ListEntry { name, size } => {
+                    /* Default-tick only sensor-data rows (Sens*.csv,
+                       Gps*.csv, Bat*.csv, Mic*.wav). Everything else
+                       (FW_INFO, CHK, error log, macOS AppleDouble,
+                       0-byte phantoms like PUMPTSUE.RI) goes in the
+                       Debug group and stays unticked so a bulk
+                       Download grabs only what the user wants. */
+                    let selected = is_sensor_data_name(&name);
+                    self.ble_files.push(BleFile {
+                        name, size, selected,
+                        downloaded: false,
+                        bytes_done: 0,
+                    });
+                }
+                BleEvent::ListDone => {
+                    self.ble_status = format!("listing done ({} files)", self.ble_files.len());
+                    /* A "Sync now" click clears the list and sends LIST,
+                       then waits here: the diff needs the *complete*
+                       fresh listing, not whatever was on screen before.
+                       The auto-LIST on Connect leaves ble_sync_pending
+                       false, so it never triggers a sync by itself. */
+                    if self.ble_sync_pending {
+                        self.ble_sync_pending = false;
+                        self.run_sync_diff();
+                    } else if self.ble_log_mode.is_none() {
+                        /* Worker op is Idle right after ListDone and no
+                           sync is about to queue reads — a safe window to
+                           query the box log mode. (GET_MODE's reply is
+                           demuxed by the worker's `op`, so it must not
+                           race a LIST/READ; worker-side get_log_mode also
+                           self-guards on op==Idle.) Only when still
+                           unknown, so it's a one-shot per connection on
+                           PumpLogger firmware and a harmless no-op on
+                           legacy PumpTsueri (never replies → stays None). */
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::GetLogMode);
+                        }
+                    }
+                }
+                BleEvent::ReadStarted { name, size } => {
+                    self.ble_status = format!("reading {name} ({size} B)…");
+                    for f in self.ble_files.iter_mut() {
+                        if f.name == name { f.bytes_done = 0; }
+                    }
+                }
+                BleEvent::ReadProgress { name, bytes_done } => {
+                    self.ble_status = format!("reading {name}: {bytes_done} B");
+                    for f in self.ble_files.iter_mut() {
+                        if f.name == name { f.bytes_done = bytes_done; }
+                    }
+                }
+                BleEvent::ReadAborted { name, content, base } => {
+                    /* The link dropped mid-file. Persist the partial
+                       segment into <name>.part so the resume continues
+                       from the real break point, not the last completed
+                       segment. Not finalized, not marked synced — it's
+                       still incomplete. The Error("READ … aborted/timed
+                       out") that follows drives the resume/ banner. */
+                    if !content.is_empty() {
+                        match append_mirror(&self.ble_out_dir, &name, base, &content) {
+                            Ok(have) => push_log(
+                                &self.log,
+                                format!("ble: kept {have} B of {name} for resume"),
+                            ),
+                            Err(e) => push_log(
+                                &self.log,
+                                format!("ble: could not save partial {name}: {e}"),
+                            ),
+                        }
+                    }
+                    // bytes_done stays where it is so the bar reflects
+                    // the real resume point; do NOT advance the queue
+                    // here — the link-loss handling does that.
+                }
+                BleEvent::ReadDone { name, content, base } => {
+                    let size = self
+                        .ble_files
+                        .iter()
+                        .find(|f| f.name == name)
+                        .map(|f| f.size)
+                        .unwrap_or(base + content.len() as u64);
+                    let result = append_mirror(&self.ble_out_dir, &name, base, &content)
+                        .map(|_| mirror_path(&self.ble_out_dir, &name));
+                    match result {
+                        Ok(path) => {
+                            self.ble_status =
+                                format!("saved {} ({} B)", path.display(), size);
+                            for f in self.ble_files.iter_mut() {
+                                if f.name == name {
+                                    f.downloaded = true;
+                                    f.bytes_done = f.size;
+                                }
+                            }
+                            // Auto-route into the existing animate
+                            // pipeline so the user can immediately hit
+                            // Generate without re-dragging.
+                            host.on_downloaded(&name, &path);
+                            push_log(&self.log, format!("ble: saved {}", path.display()));
+                            /* Record into the sync DB regardless of how
+                               this read was triggered (Sync now *or* a
+                               manual "Download selected"): a file that's
+                               already on disk shouldn't be re-pulled by
+                               a later sync. Keyed by the LIST size so it
+                               matches the diff lookup exactly. */
+                            if let Some(box_id) = self.ble_connected_id.clone() {
+                                let path_str = path.display().to_string();
+                                if self.ensure_sync_db().is_some() {
+                                    if let Some(db) = self.sync_db.as_ref() {
+                                        if let Err(e) =
+                                            db.mark_synced(&box_id, &name, size, &path_str)
+                                        {
+                                            push_log(
+                                                &self.log,
+                                                format!("ble: sync DB write failed: {e}"),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.ble_status = format!("save failed: {e}");
+                            push_log(&self.log, format!("ble error: {e}"));
+                        }
+                    }
+                    self.ble_dl_in_flight = false;
+                    self.advance_download_queue();
+                }
+                BleEvent::LogMode { manual } => {
+                    self.ble_log_mode = Some(manual);
+                    self.ble_status = format!(
+                        "box log mode: {}",
+                        if manual { "manual" } else { "auto" }
+                    );
+                    push_log(
+                        &self.log,
+                        format!("ble: box log mode = {}", if manual { "manual" } else { "auto" }),
+                    );
+                }
+                BleEvent::DeleteDone { name } => {
+                    self.ble_status = format!("deleted {name}");
+                    self.ble_files.retain(|f| f.name != name);
+                    self.ble_delete_err = None;
+                    push_log(&self.log, format!("ble: deleted {name}"));
+                }
+                BleEvent::Sample(s) => {
+                    host.on_sample(&s);
+                }
+                BleEvent::Error(msg) => {
+                    self.ble_status = format!("error: {msg}");
+                    push_log(&self.log, format!("ble error: {msg}"));
+                    if matches!(self.ble_state, BleState::Scanning | BleState::Connecting) {
+                        self.ble_state = BleState::Idle;
+                    }
+                    /* Surface DELETE rejections as a prominent banner.
+                       The box refuses some Debug rows (8.3-name miss →
+                       NOT_FOUND, name >15 chars → BAD_REQUEST, logging
+                       active → BUSY); without this it only shows in the
+                       log and looks like the click did nothing. */
+                    if msg.starts_with("DELETE ") {
+                        self.ble_delete_err = Some(msg.clone());
+                    }
+                    /* A READ-side error (NOT_FOUND, BUSY, IO_ERROR, BAD_REQUEST,
+                       timeout, disconnect mid-op) ends the in-flight read. Advance
+                       the queue so the next ticked file gets its turn instead of
+                       the whole batch being eaten by one bad row (typical case:
+                       the phantom 0-byte `PUMPTSUE.RI` returning NOT_FOUND blocks
+                       all subsequent reads). The "another op is in flight" guard
+                       triggers when the worker rejects a queued Read — that's not
+                       a real READ error, so don't advance on it. */
+                    if msg.starts_with("READ ") {
+                        self.ble_dl_in_flight = false;
+                        /* Link-loss vs. per-file failure. "timed out"
+                           (watchdog: no notifies for 20 s) and "aborted
+                           by disconnect" mean the radio is gone — don't
+                           grind the rest of the batch against a dead
+                           link 20 s at a time; park it and resume on
+                           reconnect. NOT_FOUND / BUSY / IO_ERROR /
+                           BAD_REQUEST are per-file (e.g. the phantom
+                           0-byte PUMPTSUE.RI) — skip just that row and
+                           keep the batch going as before. */
+                        let link_lost = msg.contains("timed out")
+                            || msg.contains("aborted by disconnect");
+                        if link_lost {
+                            self.arm_sync_resume();
+                        } else {
+                            self.advance_download_queue();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pop the next file off the download queue and send it to the
+    /// worker. No-op if queue empty or another read is already in flight.
+    /// Called from ReadDone and READ-side error event handlers so each
+    /// completed read triggers the next, giving us serial multi-file
+    /// downloads instead of the original blast-all-at-once behaviour
+    /// (which had the worker reject every read after the first).
+    pub fn advance_download_queue(&mut self) {
+        if self.ble_dl_in_flight { return; }
+        let Some((name, size)) = self.ble_dl_queue.pop_front() else { return; };
+        // Resume/grow from whatever is already mirrored locally. The
+        // firmware seeks to this offset, so an interrupted file
+        // continues and a grown log only fetches its new tail.
+        let offset = mirror_offset(&self.ble_out_dir, &name, size);
+        let Some(b) = self.ble.as_ref() else { return; };
+        b.send(BleCmd::Read { name: name.clone(), size, offset });
+        self.ble_dl_in_flight = true;
+        if offset > 0 {
+            push_log(
+                &self.log,
+                format!("ble: resuming {name} at {offset}/{size} B"),
+            );
+        } else {
+            push_log(&self.log, format!("ble: reading {name} ({size} B)"));
+        }
+    }
+
+    /// Lazily open the sync DB. Returns None (and sets `ble_sync_msg`)
+    /// if it can't be opened so the caller can bail without panicking —
+    /// a broken DB must not take down BLE.
+    pub fn ensure_sync_db(&mut self) -> Option<&sync_db::SyncDb> {
+        if self.sync_db.is_none() {
+            let path = sync_db::default_db_path();
+            match sync_db::SyncDb::open(&path) {
+                Ok(db) => self.sync_db = Some(db),
+                Err(e) => {
+                    self.ble_sync_msg =
+                        format!("sync disabled — can't open {}: {e}", path.display());
+                    push_log(&self.log, format!("ble: sync DB open failed: {e}"));
+                    return None;
+                }
+            }
+        }
+        self.sync_db.as_ref()
+    }
+
+    /// Resolve + probe `ble_out_dir`. On success canonicalises the
+    /// field (writes the expanded absolute path back so the user sees
+    /// where files really go) and clears the error. On failure sets
+    /// `ble_save_err` + status + log and returns None so the caller
+    /// aborts instead of silently enqueuing reads that save nowhere.
+    pub fn validate_save_dir(&mut self) -> Option<PathBuf> {
+        match resolve_save_dir(&self.ble_out_dir)
+            .and_then(|d| probe_save_dir(&d).map(|()| d))
+        {
+            Ok(d) => {
+                self.ble_save_err = None;
+                self.ble_out_dir = d.clone();
+                Some(d)
+            }
+            Err(e) => {
+                self.ble_status = format!("save path invalid: {e}");
+                push_log(&self.log, format!("ble: save path invalid: {e}"));
+                self.ble_save_err = Some(e);
+                None
+            }
+        }
+    }
+
+    /// Park an interrupted transfer/sync so it resumes on reconnect.
+    /// Called when the BLE link drops mid-batch (READ timeout, "aborted
+    /// by disconnect", or a plain Disconnected while a batch was live).
+    /// We don't try to keep the in-memory queue — on reconnect a fresh
+    /// LIST + the SQLite diff is the source of truth: completed files
+    /// are skipped, the half-pulled one (never marked synced, never
+    /// saved) is re-fetched whole. Captures the box id *now* because
+    /// the Disconnected handler clears `ble_connected_id` right after.
+    pub fn arm_sync_resume(&mut self) {
+        if self.ble_resume_box.is_none() {
+            if let Some(id) = self.ble_connected_id.clone() {
+                self.ble_resume_box = Some(id);
+            }
+        }
+        self.ble_dl_queue.clear();
+        self.ble_dl_in_flight = false;
+        self.ble_sync_pending = false;
+        self.ble_sync_msg = "⚠ Transfer interrupted (BLE link lost). Reconnect to \
+             the box — the sync resumes automatically and skips files already saved."
+            .into();
+        push_log(
+            &self.log,
+            "ble: transfer interrupted — armed to resume on reconnect".into(),
+        );
+    }
+
+    /// Run the diff after a Sync-triggered LIST: enqueue every sensor-
+    /// data file on the box not already in the DB for this box. Never
+    /// deletes anything (additive-only, by design). Debug/firmware-info
+    /// rows are left out — same policy as the default-tick filter, so a
+    /// sync mirrors *sessions*, not noise.
+    /// Begin one sync pass: fresh LIST, then the diff runs in the
+    /// `ListDone` handler (gated on `ble_sync_pending`, so the auto-
+    /// LIST on Connect never starts a sync by itself). Used by the
+    /// "Sync now" button and the "Keep synced" continuous loop.
+    pub fn start_sync_pass(&mut self) {
+        if !matches!(self.ble_state, BleState::Connected) { return; }
+        self.ble_files.clear();
+        self.ble_sync_pending = true;
+        self.ble_last_sync_at = Some(std::time::Instant::now());
+        self.ble_sync_msg = "Sync: listing SD card…".into();
+        if let Some(b) = self.ble.as_ref() { b.send(BleCmd::List); }
+        push_log(&self.log, "ble: sync — listing".into());
+    }
+
+    pub fn run_sync_diff(&mut self) {
+        if self.validate_save_dir().is_none() {
+            // Bad Save-to path — surface it as the sync result too so
+            // the user isn't left wondering why nothing downloaded.
+            self.ble_sync_msg =
+                format!("Sync aborted — {}", self.ble_save_err.clone().unwrap_or_default());
+            return;
+        }
+        if self.ble_connected_id.is_none() {
+            self.ble_sync_msg = "sync: no box id (reconnect and retry)".into();
+            return;
+        }
+        // Decide by local mirror size vs the box's current size, not a
+        // "have I ever seen this exact size" DB lookup. That's what
+        // makes a continuously-growing log work: each pass fetches only
+        // the new tail (offset = local size) instead of re-pulling the
+        // whole file, so no single big file can starve GPS/BAT either.
+        let mut fetch = 0usize;
+        let mut up_to_date = 0usize;
+        self.ble_dl_queue.clear();
+        for f in self.ble_files.iter() {
+            if !is_synced_name(&f.name) {
+                continue;
+            }
+            let local = std::fs::metadata(mirror_path(&self.ble_out_dir, &f.name))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if local == f.size {
+                up_to_date += 1;
+            } else {
+                // local < size → grow/resume; local > size → rotated
+                // (mirror_offset resets it). Either way, fetch.
+                fetch += 1;
+                self.ble_dl_queue.push_back((f.name.clone(), f.size));
+            }
+        }
+        self.ble_sync_msg = if fetch == 0 {
+            format!("Sync: up to date ({up_to_date} files)")
+        } else {
+            format!("Sync: fetching {fetch} ({up_to_date} up to date)…")
+        };
+        push_log(&self.log, format!("ble: {}", self.ble_sync_msg));
+        self.advance_download_queue();
+    }
+
 }
