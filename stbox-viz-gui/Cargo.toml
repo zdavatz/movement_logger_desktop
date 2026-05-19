@@ -56,6 +56,11 @@ toml = "0.8"
 # Issue #14 part B.
 fs4 = { version = "1", features = ["sync"] }
 
+# SIGINT/SIGTERM (+ Windows console-close) handler for the headless
+# --agent so launchd/systemd stop runs the same clean BLE teardown the
+# GUI does in eframe::App::on_exit. Issue #14 part B.
+ctrlc = { version = "3", features = ["termination"] }
+
 # Local sync-state DB: tracks, per box, which SD-card files have
 # already been pulled so "Sync now" only fetches new sessions. The
 # `bundled` feature compiles SQLite from source so there's no system

@@ -14,6 +14,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod agent_config;
 mod ble;
 mod coord;
@@ -2304,6 +2305,14 @@ fn os_window_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    /* argv dispatch (issue #14 part B). The headless agent path must
+       return before ANY eframe/egui/winit code so the macOS winit
+       patch invariant holds and no window is created. */
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--agent") {
+        std::process::exit(agent::run());
+    }
+
     let title = format!("MovementLogger v{}", env!("CARGO_PKG_VERSION"));
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([880.0, 720.0])

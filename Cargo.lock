@@ -2441,6 +2441,7 @@ dependencies = [
  "anyhow",
  "btleplug",
  "chrono",
+ "ctrlc",
  "eframe",
  "egui",
  "env_logger",
