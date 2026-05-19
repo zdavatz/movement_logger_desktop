@@ -1711,6 +1711,7 @@ impl AppState {
                                Mac-side state proactively; the write
                                may race with the firmware reset but
                                either way Mac state becomes Idle. */
+                            b.request_abort();
                             b.send(BleCmd::Disconnect);
                         }
                         /* Flip the GUI to Idle optimistically (same as
@@ -1743,7 +1744,14 @@ impl AppState {
                         .add_enabled(connected, egui::Button::new("Disconnect"))
                         .clicked()
                     {
-                        if let Some(b) = self.ble.as_ref() { b.send(BleCmd::Disconnect); }
+                        if let Some(b) = self.ble.as_ref() {
+                            // Break any in-progress auto-reconnect loop
+                            // first — the worker can't read the command
+                            // channel while inside it, so the abort flag
+                            // is the only thing it polls there.
+                            b.request_abort();
+                            b.send(BleCmd::Disconnect);
+                        }
                         /* Optimistic state transition: drop straight to
                            Idle without waiting for the worker's eventual
                            Disconnected event. `peripheral.disconnect()`
@@ -2249,6 +2257,9 @@ impl eframe::App for AppState {
     /// in that case only a box reboot resets the link.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(b) = self.ble.as_ref() {
+            // Quitting mid-reconnect must not hang on the worker being
+            // stuck in an (Auto Mode: unbounded) reconnect loop.
+            b.request_abort();
             b.send(BleCmd::Disconnect);
             /* Give the worker thread ~250 ms to actually emit the
                disconnect over the air before the process exits. Not
@@ -2275,6 +2286,15 @@ impl eframe::App for AppState {
         // Same idea for the version-check + install pipeline.
         self.pump_update_events();
 
+        // Mirror "Keep synced" into the worker every frame (cheap
+        // relaxed atomic). It's what flips auto_reconnect between the
+        // bounded manual-mode budget and unbounded Auto-Mode retry, and
+        // un-ticking it mid-reconnect is what brings an unbounded loop
+        // back down to the bounded budget so it stops on its own.
+        if let Some(b) = self.ble.as_ref() {
+            b.set_keep_synced(self.ble_keep_synced);
+        }
+
         // "Keep synced": while connected and idle, kick a fresh sync
         // pass on the poll interval so a continuously-growing log keeps
         // mirroring (each pass only fetches the new tail). A busy
@@ -2295,8 +2315,13 @@ impl eframe::App for AppState {
                 self.start_sync_pass();
             }
         }
-        if self.ble_keep_synced && matches!(self.ble_state, BleState::Connected) {
-            // Keep ticking so the poll fires without user input.
+        if matches!(self.ble_state, BleState::Connected) {
+            // Keep ticking so the Keep-synced poll fires without user
+            // input — and so the worker's auto-reconnect Status lines
+            // (the loop emits one per attempt) render live. ble_state
+            // stays Connected for the whole reconnect window in both
+            // modes (no Disconnected until the bounded budget is spent),
+            // so this one condition covers active sync + reconnecting.
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
 

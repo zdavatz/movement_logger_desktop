@@ -35,7 +35,9 @@ use btleplug::api::{
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -75,13 +77,31 @@ const OP_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
    producing rows. */
 const LIST_INACTIVITY_DONE: Duration = Duration::from_millis(500);
 
-/// Bounded auto-reconnect after an unexpected mid-transfer drop:
-/// `RECONNECT_ATTEMPTS` tries, each preceded by a wait + a short scan
-/// (~3 s) so the box has time to re-advertise. ~10 × (2 s + 3 s) ≈
-/// 50 s of effort, then give up and let the user reconnect manually
-/// (still lossless — the `.part` file holds the resume point).
+/// Auto-reconnect after an unexpected mid-transfer drop. Two regimes,
+/// chosen at runtime by `BleShared::persist_reconnect` (mirrors the
+/// GUI's "Keep synced" checkbox):
+///
+/// - **Auto Mode (Keep synced on):** *unbounded* retries with
+///   exponential backoff (`RECONNECT_INTERVAL` → ×2 each round, capped
+///   at `RECONNECT_BACKOFF_CAP`). The firmware now self-heals and stays
+///   discoverable across many recovery cycles (movement_logger_firmware
+///   #3 builds #57–#65: HCI-disconnect + local re-adv, NRST chip-reset,
+///   stale-conn detect), so the old "give up after a few tries" cap was
+///   the *only* thing stopping a multi-hour sync from finishing. The
+///   user can leave the GUI running and the file is complete at the end
+///   even across 20–30 chip-reset cycles. The original bounded policy's
+///   premise (box went invisible until power-cycle) no longer holds.
+/// - **Manual mode (Keep synced off):** bounded — `RECONNECT_ATTEMPTS`
+///   tries, then give up → `Disconnected` → manual reconnect banner
+///   (still lossless: the live mirror holds the resume offset).
+///
+/// Both regimes poll `BleShared::abort_reconnect` between every attempt
+/// and during every backoff sleep, so a user Disconnect / app-quit /
+/// un-ticking "Keep synced" breaks the loop promptly even though the
+/// worker can't service its command channel while inside this function.
 const RECONNECT_ATTEMPTS: u32 = 10;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
+const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// Upper bound on every individual GATT step inside `connect_core`
 /// (connect / discover / subscribe / notifications). Same rationale as
@@ -255,9 +275,21 @@ impl LiveSample {
 //  Backend handle held by AppState
 // ---------------------------------------------------------------------------
 
+/// Lock-free state shared between the egui thread and the BLE worker,
+/// read by `auto_reconnect` (which can't service the command channel
+/// while it's looping). `persist_reconnect` = "Keep synced" is on
+/// (→ unbounded reconnect); `abort_reconnect` = the user wants out
+/// (Disconnect / quit / un-ticked Keep synced).
+#[derive(Clone, Default)]
+struct BleShared {
+    persist_reconnect: Arc<AtomicBool>,
+    abort_reconnect:   Arc<AtomicBool>,
+}
+
 pub struct BleBackend {
     cmd_tx: Sender<BleCmd>,
     evt_rx: Receiver<BleEvent>,
+    shared: BleShared,
 }
 
 impl BleBackend {
@@ -266,15 +298,32 @@ impl BleBackend {
     pub fn spawn() -> Self {
         let (cmd_tx, cmd_rx) = channel::<BleCmd>();
         let (evt_tx, evt_rx) = channel::<BleEvent>();
+        let shared = BleShared::default();
+        let worker_shared = shared.clone();
         thread::Builder::new()
             .name("ble-worker".into())
-            .spawn(move || worker_main(cmd_rx, evt_tx))
+            .spawn(move || worker_main(cmd_rx, evt_tx, worker_shared))
             .expect("spawn ble worker");
-        Self { cmd_tx, evt_rx }
+        Self { cmd_tx, evt_rx, shared }
     }
 
     pub fn send(&self, cmd: BleCmd) {
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// Mirror the GUI's "Keep synced" checkbox into the worker. Called
+    /// every frame — a relaxed atomic store, effectively free. When on,
+    /// `auto_reconnect` retries unbounded with exponential backoff.
+    pub fn set_keep_synced(&self, on: bool) {
+        self.shared.persist_reconnect.store(on, Ordering::Relaxed);
+    }
+
+    /// Ask any in-progress reconnect loop to stop. Must be sent *before*
+    /// `BleCmd::Disconnect` because the worker can't read its command
+    /// channel while inside `auto_reconnect` — this flag is the only
+    /// signal it polls there.
+    pub fn request_abort(&self) {
+        self.shared.abort_reconnect.store(true, Ordering::Relaxed);
     }
 
     /// Drain pending events without blocking. Caller iterates and
@@ -295,7 +344,7 @@ impl BleBackend {
 //  Worker thread + runtime
 // ---------------------------------------------------------------------------
 
-fn worker_main(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>) {
+fn worker_main(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared: BleShared) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -306,13 +355,13 @@ fn worker_main(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>) {
             return;
         }
     };
-    rt.block_on(worker_loop(cmd_rx, evt_tx));
+    rt.block_on(worker_loop(cmd_rx, evt_tx, shared));
 }
 
 /// The std mpsc receiver is sync-blocking, so we hop into a blocking
 /// task to drain it and forward into a tokio channel that the async
 /// loop can `select!` against alongside the BLE notification stream.
-async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>) {
+async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared: BleShared) {
     let (atx, mut arx) = tokio_mpsc::unbounded_channel::<BleCmd>();
     let _bridge = thread::spawn(move || {
         while let Ok(cmd) = cmd_rx.recv() {
@@ -320,7 +369,7 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>) {
         }
     });
 
-    let mut state = WorkerState::new(evt_tx);
+    let mut state = WorkerState::new(evt_tx, shared);
 
     loop {
         // The shape of `select!` depends on whether we have a live
@@ -469,10 +518,12 @@ struct WorkerState {
     /// stale id just makes a future reconnect fail one round and fall
     /// back to manual).
     last_id: Option<String>,
+    /// "Keep synced" + abort flags, shared with the egui thread.
+    shared: BleShared,
 }
 
 impl WorkerState {
-    fn new(evt_tx: Sender<BleEvent>) -> Self {
+    fn new(evt_tx: Sender<BleEvent>, shared: BleShared) -> Self {
         Self {
             evt_tx,
             adapter: None,
@@ -482,7 +533,33 @@ impl WorkerState {
             stream_asm: StreamAsm::default(),
             stream_capable: false,
             last_id: None,
+            shared,
         }
+    }
+
+    fn persist_reconnect(&self) -> bool {
+        self.shared.persist_reconnect.load(Ordering::Relaxed)
+    }
+    fn abort_requested(&self) -> bool {
+        self.shared.abort_reconnect.load(Ordering::Relaxed)
+    }
+    fn clear_abort(&self) {
+        self.shared.abort_reconnect.store(false, Ordering::Relaxed);
+    }
+
+    /// Sleep `dur`, but wake early (returning `true`) the moment an
+    /// abort is requested. Polls in ≤250 ms slices so a Disconnect /
+    /// quit during a long backoff is honoured promptly.
+    async fn sleep_or_abort(&self, dur: Duration) -> bool {
+        let slice = Duration::from_millis(250);
+        let mut left = dur;
+        while !left.is_zero() {
+            if self.abort_requested() { return true; }
+            let step = left.min(slice);
+            tokio::time::sleep(step).await;
+            left -= step;
+        }
+        self.abort_requested()
     }
 
     fn emit(&self, e: BleEvent) {
@@ -701,26 +778,63 @@ impl WorkerState {
         Ok(())
     }
 
-    /// Bounded auto-reconnect after an unexpected mid-transfer drop.
-    /// Up to `RECONNECT_ATTEMPTS` tries, ~`RECONNECT_INTERVAL` apart,
-    /// re-scanning then re-connecting to the same peripheral id. The
-    /// box needs a moment to start advertising again once it's back in
-    /// range, hence the scan + delay each round. Returns true (and has
-    /// emitted Connected) on success; false if exhausted — the caller
-    /// then emits Disconnected so the UI falls back to manual reconnect
-    /// (the resume `.part` makes that lossless too).
+    /// Auto-reconnect after an unexpected mid-transfer drop. Re-scans
+    /// then re-connects to the same peripheral id (the box needs a
+    /// moment to re-advertise once it's healed / back in range, hence
+    /// the scan + delay each round). Returns `true` (and has emitted
+    /// `Connected`) on success.
+    ///
+    /// Regime depends on `persist_reconnect` (the "Keep synced"
+    /// checkbox) — see the `RECONNECT_*` consts:
+    /// - **Auto Mode:** unbounded, exponential backoff. The only exits
+    ///   are success or an explicit abort.
+    /// - **Manual mode:** bounded to `RECONNECT_ATTEMPTS`, then return
+    ///   `false` → caller emits `Disconnected` → manual reconnect
+    ///   banner (lossless via the live mirror).
+    ///
+    /// Either way an abort (Disconnect / quit / "Keep synced" un-ticked
+    /// dropping us back to the bounded budget) breaks the loop promptly.
     async fn auto_reconnect(&mut self, id: String) -> bool {
-        for attempt in 1..=RECONNECT_ATTEMPTS {
-            self.emit(BleEvent::Status(format!(
-                "link lost — auto-reconnecting (attempt {attempt}/{RECONNECT_ATTEMPTS})…"
-            )));
-            tokio::time::sleep(RECONNECT_INTERVAL).await;
+        // A stale abort from a *previous* link must not kill this fresh
+        // recovery — the user pressing Disconnect now is what sets it.
+        self.clear_abort();
+        let mut backoff = RECONNECT_INTERVAL;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let persist = self.persist_reconnect();
+            // Manual mode (or Keep-synced just turned off mid-loop):
+            // honour the bounded budget and fall back to manual.
+            if !persist && attempt > RECONNECT_ATTEMPTS {
+                return false;
+            }
+            if self.abort_requested() {
+                self.clear_abort();
+                return false;
+            }
+            let label = if persist {
+                format!("link lost — auto-reconnecting (attempt {attempt}, Auto Mode)…")
+            } else {
+                format!(
+                    "link lost — auto-reconnecting (attempt {attempt}/{RECONNECT_ATTEMPTS})…"
+                )
+            };
+            self.emit(BleEvent::Status(label));
+
+            if self.sleep_or_abort(backoff).await {
+                self.clear_abort();
+                return false;
+            }
             // Kick a short scan so CoreBluetooth/BlueZ refreshes its
             // peripheral cache; ignore the Discovered/ScanStopped spam
             // by not routing through scan() (which emits them).
             if let Some(adapter) = self.ensure_adapter().await {
                 if adapter.start_scan(ScanFilter::default()).await.is_ok() {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    if self.sleep_or_abort(Duration::from_secs(3)).await {
+                        let _ = adapter.stop_scan().await;
+                        self.clear_abort();
+                        return false;
+                    }
                     let _ = adapter.stop_scan().await;
                 }
             }
@@ -737,10 +851,13 @@ impl WorkerState {
                     self.emit(BleEvent::Status(format!(
                         "reconnect attempt {attempt} failed: {e}"
                     )));
+                    // Exponential backoff (Auto Mode could otherwise
+                    // hammer the adapter for hours). Bounded mode never
+                    // gets far enough up the curve to matter.
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_CAP);
                 }
             }
         }
-        false
     }
 
     /// Tear down peripheral + stream + op state without emitting the
