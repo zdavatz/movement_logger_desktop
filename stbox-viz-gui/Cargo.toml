@@ -50,6 +50,12 @@ serde = { version = "1", features = ["derive"] }
 # which box/folder to mirror. Issue #14 part B.
 toml = "0.8"
 
+# Cross-platform advisory file locks for GUI<->agent coordination
+# (~/.movementlogger/{gui,ble,agent}.lock): the GUI and the headless
+# --agent must never drive the same BLE adapter / mirror at once.
+# Issue #14 part B.
+fs4 = { version = "1", features = ["sync"] }
+
 # Local sync-state DB: tracks, per box, which SD-card files have
 # already been pulled so "Sync now" only fetches new sessions. The
 # `bundled` feature compiles SQLite from source so there's no system

@@ -16,6 +16,7 @@
 
 mod agent_config;
 mod ble;
+mod coord;
 mod installer;
 mod sync_core;
 mod sync_db;
@@ -138,6 +139,13 @@ struct AppState {
     /// engine the GUI does. The GUI reads/writes `self.sync.<field>`
     /// exactly as it used to access `self.<field>`.
     sync: SyncCore,
+    /// Held for the GUI's whole lifetime once BLE is first used. Its
+    /// mere existence is the "a GUI is alive" signal the headless
+    /// agent polls (`coord::GUI_LOCK`); the OS frees it even on a
+    /// crash. `_ble_lock` is the BLE-adapter ownership token so the
+    /// agent never scans/connects while the GUI is driving the radio.
+    _gui_lock: Option<coord::LockGuard>,
+    _ble_lock: Option<coord::LockGuard>,
 
     // ----- UI top-level tab + Live tab state ---------------------------
     /// Active top-level tab — drives the central panel switch.
@@ -602,6 +610,21 @@ impl AppState {
 
     fn ensure_ble(&mut self) -> &BleBackend {
         if self.sync.ble.is_none() {
+            /* Claim adapter ownership before the worker starts. The
+               GUI must win over the background agent: it holds
+               `gui.lock` for its lifetime (the agent's presence
+               signal) and takes `ble.lock` (the adapter token). When
+               no agent is running both are free and this is instant;
+               the agent (step 6) yields `ble.lock` within ~1 s of
+               seeing `gui.lock` contended. Non-blocking so the UI
+               thread never freezes — a brief overlap on first launch
+               is harmless and self-heals as the agent backs off. */
+            if self._gui_lock.is_none() {
+                self._gui_lock = coord::try_acquire(coord::GUI_LOCK);
+            }
+            if self._ble_lock.is_none() {
+                self._ble_lock = coord::try_acquire(coord::BLE_LOCK);
+            }
             self.sync.ble = Some(BleBackend::spawn());
         }
         self.sync.ble.as_ref().unwrap()
@@ -1728,6 +1751,12 @@ impl eframe::App for AppState {
                practice. */
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
+        /* Release adapter ownership so a background agent can resume
+           the mirror as soon as the GUI is gone. Dropping the guards
+           unlocks; the OS would also free them on exit, but doing it
+           here narrows the handover gap. */
+        self._ble_lock = None;
+        self._gui_lock = None;
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
