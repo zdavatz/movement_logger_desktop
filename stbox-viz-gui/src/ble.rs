@@ -1260,19 +1260,25 @@ impl WorkerState {
 
         match std::mem::replace(&mut self.op, CurrentOp::Idle) {
             CurrentOp::Listing { .. } => {
-                // Treat a stalled LIST exactly like a stalled READ: tear
-                // the half-dead link down and auto-reconnect. Under
-                // "Keep synced" the worker spends most of its idle time
-                // in LIST (a fresh LIST every 30 s, plus the re-LIST
-                // after each reconnect), so a drop during LIST is the
-                // *common* case. Returning false here left peripheral +
-                // stream as Some (half-dead), no reconnect, and every
-                // subsequent 30 s LIST stalled the same way — sync
-                // silently dead while the box stayed visible in BT
-                // (exactly Peter's report). The reconnect re-LISTs and
-                // Keep-synced re-arms the pass, so this is lossless.
-                self.emit_err("LIST timed out — no notifies for 20 s, reconnecting");
-                true
+                // A stalled zero-row LIST does NOT reconnect (v0.0.21,
+                // reverses v0.0.18). The Android app — same box, same
+                // firmware, proven working where this desktop wasn't —
+                // does exactly this: on a stalled LIST it just logs the
+                // timeout, drops to Idle, and keeps the link; the next
+                // periodic LIST (every 30 s under Keep synced) retries
+                // on the still-alive link and succeeds. v0.0.18's
+                // premise ("a zero-row LIST stall is a genuinely dead
+                // link, reconnect it") is wrong: combined with v0.0.19's
+                // *unbounded* Auto-Mode reconnect it turned one slow
+                // LIST into an infinite teardown→reconnect→re-LIST→stall
+                // loop with the box advertising throughout — exactly
+                // Peter's "FileList geht nicht mehr, Box ist BT
+                // sichtbar". `op` is already Idle (replaced above), so
+                // the next op proceeds normally. Don't reinstate
+                // reconnect-on-LIST-stall without re-confirming against
+                // the Android reference behaviour.
+                self.emit_err("LIST timed out — no notifies for 20 s");
+                false
             }
             CurrentOp::Reading { name, content, expected, base, .. } => {
                 let got = base + content.len() as u64;
