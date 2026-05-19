@@ -560,9 +560,9 @@ fn push_log(log: &Arc<Mutex<Vec<String>>>, line: String) {
 
 impl AppState {
     fn new() -> Self {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let output_dir = cwd.join("gif");
-        let ble_out_dir = cwd.join("csv");
+        let base = default_save_base();
+        let output_dir = base.join("gif");
+        let ble_out_dir = base.join("csv");
         Self {
             output_dir,
             ble_out_dir,
@@ -1325,6 +1325,29 @@ fn append_mirror(dir: &Path, name: &str, base: u64, bytes: &[u8]) -> std::io::Re
 /// relative path is otherwise created *relative to the process cwd*,
 /// so the app reports `saved <path>` while the file is nowhere the
 /// user is looking.
+/// Base dir for the default `csv/` (downloads) and `gif/` (renders)
+/// folders. A macOS `.app` launched from Finder/Dock starts with
+/// `current_dir()` == `/` — a read-only volume — so the historical
+/// `cwd.join("csv")` became `/csv` and every download died with
+/// `Can't create "/csv": Read-only file system (os error 30)`
+/// (Peter, v0.0.20 on Mac). Use cwd only when it's a real writable
+/// working dir (the Linux/Windows `./MovementLogger` case — behaviour
+/// unchanged there); otherwise anchor under `$HOME/MovementLogger`,
+/// same `$HOME` rationale as the sync DB. The user can still override
+/// the folder in the Sync tab.
+fn default_save_base() -> PathBuf {
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd != Path::new("/") && probe_save_dir(&cwd).is_ok() {
+            return cwd;
+        }
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|h| h.join("MovementLogger"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn resolve_save_dir(raw: &Path) -> Result<PathBuf, String> {
     let s = raw.to_string_lossy();
     let s = s.trim();
