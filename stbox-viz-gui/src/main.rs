@@ -95,9 +95,16 @@ struct AppState {
     output_dir: PathBuf,
 
     // ----- Optional flags surfaced in the UI ----------------------------
-    /// Wall-clock start time, e.g. `10:16:09`. Empty = auto-detect via
-    /// pitch-oscillation session detector (no video alignment).
+    /// Wall-clock window start ("Von"), e.g. `10:16:09`, local time.
+    /// Empty = auto-detect via pitch-oscillation session detector (no
+    /// video alignment). Passed as `stbox-viz animate --at`.
     at: String,
+    /// Wall-clock window end ("Bis"), e.g. `10:24:00`, local time.
+    /// When set together with `at`, the merge video covers exactly
+    /// `at`→`to`: the GUI computes `--duration = to - at` so only that
+    /// slice of the sensor data is rendered. Empty = use the Duration
+    /// field / video length instead.
+    to: String,
     /// Local-time UTC offset in hours. 3 for Greek summer (EEST), 2 for
     /// Swiss summer (CEST), 1 for Swiss winter (CET).
     tz_offset_h: f64,
@@ -307,6 +314,25 @@ fn stbox_viz_path() -> PathBuf {
 //  Spawning + log pump
 // ---------------------------------------------------------------------------
 
+/// Parse a local wall-clock `HH:MM` or `HH:MM:SS` into seconds since
+/// midnight. `None` on any malformed/out-of-range field. Used only to
+/// derive the Bis−Von window length; the absolute `--at` string is
+/// still passed through verbatim so stbox-viz owns the real time math.
+fn parse_hms(s: &str) -> Option<i64> {
+    let mut it = s.trim().split(':');
+    let h: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let sec: i64 = match it.next() {
+        Some(x) => x.parse().ok()?,
+        None => 0,
+    };
+    if it.next().is_some() || !(0..24).contains(&h) || !(0..60).contains(&m) || !(0..60).contains(&sec)
+    {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + sec)
+}
+
 fn spawn_animate(state: &mut AppState) {
     let Some(sensor) = state.sensor_csv.clone() else {
         push_log(&state.log, "error: no sensor CSV — drop a Sens*.csv first.".into());
@@ -338,7 +364,41 @@ fn spawn_animate(state: &mut AppState) {
     if !state.date.trim().is_empty() {
         cmd.arg("--date").arg(state.date.trim());
     }
-    if state.duration_s > 0.0 {
+    /* "Von" → "Bis" window. When the user filled in Bis, the merge
+       video must cover exactly that wall-clock slice, so derive the
+       duration from Bis − Von and pass it to `--duration` (stbox-viz
+       animate has no native end-time flag). Fail loud on a bad/empty
+       Von or a non-increasing window instead of silently rendering
+       the wrong span. With Bis empty, fall back to the Duration
+       field exactly as before. */
+    let to = state.to.trim();
+    if !to.is_empty() {
+        let from = state.at.trim();
+        let parsed = parse_hms(from).zip(parse_hms(to));
+        match parsed {
+            Some((f, t)) if t > f => {
+                cmd.arg("--duration").arg(format!("{}", t - f));
+            }
+            Some((_, _)) => {
+                push_log(
+                    &state.log,
+                    "error: \u{201c}Bis\u{201d} must be later than \u{201c}Von\u{201d} \
+                     — fix the window and Generate again."
+                        .into(),
+                );
+                return;
+            }
+            None => {
+                push_log(
+                    &state.log,
+                    "error: \u{201c}Von\u{201d}/\u{201c}Bis\u{201d} must both be \
+                     HH:MM or HH:MM:SS (local time)."
+                        .into(),
+                );
+                return;
+            }
+        }
+    } else if state.duration_s > 0.0 {
         cmd.arg("--duration").arg(format!("{}", state.duration_s));
     }
     if state.dock_height_m.abs() > f64::EPSILON {
@@ -1955,8 +2015,22 @@ impl eframe::App for AppState {
                         .num_columns(2)
                         .spacing([10.0, 6.0])
                         .show(ui, |ui| {
-                            ui.label("Start time (HH:MM:SS, local)");
-                            ui.text_edit_singleline(&mut self.at);
+                            ui.label("Von (HH:MM:SS, local)");
+                            ui.text_edit_singleline(&mut self.at)
+                                .on_hover_text(
+                                    "Start of the window the merge video covers. \
+                                     Blank = auto-detect the session.",
+                                );
+                            ui.end_row();
+
+                            ui.label("Bis (HH:MM:SS, local)");
+                            ui.text_edit_singleline(&mut self.to)
+                                .on_hover_text(
+                                    "End of the window. Set together with Von to \
+                                     render exactly that slice (duration is \
+                                     computed as Bis − Von). Blank = use the \
+                                     Duration field below / video length.",
+                                );
                             ui.end_row();
 
                             ui.label("Timezone offset (hours)");
@@ -1967,7 +2041,7 @@ impl eframe::App for AppState {
                             ui.text_edit_singleline(&mut self.date);
                             ui.end_row();
 
-                            ui.label("Duration (s, 0 = video length)");
+                            ui.label("Duration (s, 0 = video length — ignored if Bis set)");
                             ui.add(egui::DragValue::new(&mut self.duration_s).speed(1.0).range(0.0..=600.0));
                             ui.end_row();
 
