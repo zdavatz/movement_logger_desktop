@@ -16,6 +16,7 @@
 
 mod agent;
 mod agent_config;
+mod autostart;
 mod ble;
 mod coord;
 mod installer;
@@ -2311,6 +2312,27 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--agent") {
         std::process::exit(agent::run());
+    }
+    // Autostart (de)registration entry points — invoked in a clean
+    // child by the updater/agent so the login item always points at
+    // the right (post-swap) bundle. No window.
+    if args.iter().any(|a| a == "--register-autostart") {
+        std::process::exit(match autostart::register() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("register-autostart: {e}");
+                1
+            }
+        });
+    }
+    if args.iter().any(|a| a == "--unregister-autostart") {
+        std::process::exit(match autostart::unregister() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("unregister-autostart: {e}");
+                1
+            }
+        });
     }
 
     let title = format!("MovementLogger v{}", env!("CARGO_PKG_VERSION"));

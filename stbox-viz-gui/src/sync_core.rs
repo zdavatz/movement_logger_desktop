@@ -605,6 +605,13 @@ impl SyncCore {
                     // config in step so it (de)registers on the next
                     // GUI tick / agent poll.
                     self.persist_config();
+                    /* Install the login item on AUTO, remove it on
+                       MANUAL. Best-effort — a failed plist/registry
+                       write must never break sync. Idempotent, so it's
+                       fine that both the GUI and the agent run this. */
+                    if let Err(e) = crate::autostart::sync_with_mode(manual) {
+                        push_log(&self.log, format!("autostart: {e}"));
+                    }
                 }
                 BleEvent::DeleteDone { name } => {
                     self.ble_status = format!("deleted {name}");

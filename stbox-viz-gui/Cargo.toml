@@ -71,6 +71,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Build-time icon embedding for Windows .exe (so explorer / taskbar
 # show the MovementLogger icon without an MSIX wrapper). No-op on other
 # platforms via the cfg gate in build.rs.
+# Windows login-item registration for the background agent (HKCU Run
+# key). Issue #14 part B step 7. Windows-only.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
 [build-dependencies]
 winres = "0.1"
 
