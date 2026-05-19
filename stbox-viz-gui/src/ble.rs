@@ -150,6 +150,17 @@ pub enum BleCmd {
     /// DELETE opcode — drop `name` from the SD card. Single-byte status
     /// reply: 0x00 OK / 0xB0 BUSY / 0xE1 NOT_FOUND / 0xE2 IO_ERROR / 0xE3 BAD_REQUEST.
     Delete { name: String },
+    /// SET_MODE opcode `0x06` + `<u8>` (0 = auto, 1 = manual). Sets the
+    /// box's *log mode* (not the sync) and persists it on the SD card
+    /// (`LOGMODE.CFG`): AUTO = the box opens a session on every power-on;
+    /// MANUAL = the box stays idle until a START_LOG. No FileData reply.
+    /// Legacy `PumpTsueri` firmware silently ignores this opcode.
+    SetLogMode { manual: bool },
+    /// GET_MODE opcode `0x07`. Box replies with a single byte over
+    /// FileData (0 = auto, 1 = manual) → `BleEvent::LogMode`. Legacy
+    /// `PumpTsueri` firmware never replies; the GettingMode op just times
+    /// out and drops to Idle (mode stays "unknown", no error surfaced).
+    GetLogMode,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +190,11 @@ pub enum BleEvent {
     ReadAborted { name: String, content: Vec<u8>, base: u64 },
     /// DELETE finished successfully (status byte 0x00 received).
     DeleteDone { name: String },
+    /// The box's current log mode, from a GET_MODE reply or a confirmed
+    /// SET_MODE round-trip. `manual = false` → AUTO (logs on power-on),
+    /// `true` → MANUAL (idle until START_LOG). Never emitted on legacy
+    /// `PumpTsueri` firmware (no GET_MODE) — the UI stays at "unknown".
+    LogMode { manual: bool },
     /// User-facing error — display in the log panel.
     Error(String),
     /// One decoded SensorStream snapshot (0.5 Hz). Only emitted while
@@ -482,6 +498,10 @@ enum CurrentOp {
     },
     /// DELETE in flight — waiting for the single-byte status response.
     Deleting { name: String, last_progress: Instant },
+    /// GET_MODE in flight — waiting for the single-byte mode response
+    /// (0 = auto, 1 = manual). Like Deleting, a stall just drops to Idle
+    /// without reconnecting (legacy firmware never replies).
+    GettingMode { last_progress: Instant },
 }
 
 type NotifStream = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
@@ -602,6 +622,8 @@ impl WorkerState {
             BleCmd::StopLog     => self.stop_log().await,
             BleCmd::StartLog { duration_seconds } => self.start_log(duration_seconds).await,
             BleCmd::Delete { name } => self.delete(name).await,
+            BleCmd::SetLogMode { manual } => self.set_log_mode(manual).await,
+            BleCmd::GetLogMode => self.get_log_mode().await,
         }
     }
 
@@ -886,6 +908,7 @@ impl WorkerState {
             CurrentOp::Deleting { name, .. } => {
                 self.emit_err(format!("DELETE {name} aborted by disconnect"));
             }
+            CurrentOp::GettingMode { .. } => {}
             CurrentOp::Idle => {}
         }
         self.notif_stream   = None;
@@ -1030,6 +1053,45 @@ impl WorkerState {
         )));
     }
 
+    /// SET_MODE (0x06) + 1-byte mode. Persisted on the box's SD card.
+    /// No FileData reply; we re-query with GET_MODE so the UI reflects
+    /// the box's actual persisted state rather than an optimistic guess.
+    async fn set_log_mode(&mut self, manual: bool) {
+        if self.peripheral.is_none() {
+            self.emit_err("not connected");
+            return;
+        }
+        if let Err(e) = self.write_cmd(&[0x06, manual as u8]).await {
+            self.emit_err(e);
+            return;
+        }
+        self.emit(BleEvent::Status(format!(
+            "SET_MODE {} sent",
+            if manual { "manual" } else { "auto" }
+        )));
+        // Confirm by reading it back (GET_MODE → LogMode event).
+        self.get_log_mode().await;
+    }
+
+    /// GET_MODE (0x07). Box replies with one byte over FileData
+    /// (0 = auto, 1 = manual); handled in the GettingMode op arm.
+    async fn get_log_mode(&mut self) {
+        if !matches!(self.op, CurrentOp::Idle) {
+            // Don't trample an in-flight LIST/READ — GET_MODE is
+            // best-effort; the next idle GetLogMode will succeed.
+            return;
+        }
+        if self.peripheral.is_none() {
+            self.emit_err("not connected");
+            return;
+        }
+        if let Err(e) = self.write_cmd(&[0x07]).await {
+            self.emit_err(e);
+            return;
+        }
+        self.op = CurrentOp::GettingMode { last_progress: Instant::now() };
+    }
+
     // ---------------- Notification dispatch --------------------------------
 
     async fn handle_notification(&mut self, n: ValueNotification) {
@@ -1146,6 +1208,17 @@ impl WorkerState {
                 self.op = CurrentOp::Idle;
                 return;
             }
+            CurrentOp::GettingMode { .. } => {
+                /* Firmware replies with exactly one byte: 0 = auto,
+                   1 = manual. Anything else → ignore (stay "unknown"). */
+                if let Some(&b) = n.value.first() {
+                    if b == 0 || b == 1 {
+                        self.emit(BleEvent::LogMode { manual: b == 1 });
+                    }
+                }
+                self.op = CurrentOp::Idle;
+                return;
+            }
         }
 
         // If we didn't already replace `self.op` above (i.e. op didn't
@@ -1254,6 +1327,7 @@ impl WorkerState {
             CurrentOp::Listing  { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::Reading  { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::Deleting { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
+            CurrentOp::GettingMode { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::Idle => false,
         };
         if !stale { return false; }
@@ -1296,6 +1370,12 @@ impl WorkerState {
             }
             CurrentOp::Deleting { name, .. } => {
                 self.emit_err(format!("DELETE {name} timed out — no notify for 20 s"));
+                false
+            }
+            CurrentOp::GettingMode { .. } => {
+                // Legacy PumpTsueri firmware never replies to GET_MODE.
+                // Silently drop to Idle (mode stays "unknown"); never
+                // reconnect — there's nothing wrong with the link.
                 false
             }
             CurrentOp::Idle => false,

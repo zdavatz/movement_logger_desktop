@@ -162,6 +162,13 @@ struct AppState {
     /// in BLE mode and Scan-able). Drives the countdown banner that
     /// replaces the file list while the box is silent.
     ble_session_running: Option<(std::time::Instant, u32)>,
+    /// The box's persisted log mode, from a GET_MODE reply (queried on
+    /// every Connect) or a confirmed SET_MODE. `None` = unknown / not
+    /// yet answered / legacy `PumpTsueri` firmware (no GET_MODE);
+    /// `Some(false)` = AUTO (box logs on power-on); `Some(true)` =
+    /// MANUAL (box idle until START_LOG). Mirrors the Android
+    /// `FileSyncUiState.logModeManual`.
+    ble_log_mode: Option<bool>,
 
     // ----- Sync (vs. plain transfer) -----------------------------------
     /// Peripheral id of the box we're connected to, captured at Connect
@@ -736,6 +743,11 @@ impl AppState {
                     self.ble_connected_id = None;
                     self.ble_sync_pending = false;
                     self.ble_delete_err = None;
+                    /* Re-query the box log mode fresh on the next
+                       Connect (it could be a different box, or changed
+                       from another client) rather than show a stale
+                       value while disconnected. */
+                    self.ble_log_mode = None;
                 }
                 BleEvent::ListEntry { name, size } => {
                     /* Default-tick only sensor-data rows (Sens*.csv,
@@ -761,6 +773,19 @@ impl AppState {
                     if self.ble_sync_pending {
                         self.ble_sync_pending = false;
                         self.run_sync_diff();
+                    } else if self.ble_log_mode.is_none() {
+                        /* Worker op is Idle right after ListDone and no
+                           sync is about to queue reads — a safe window to
+                           query the box log mode. (GET_MODE's reply is
+                           demuxed by the worker's `op`, so it must not
+                           race a LIST/READ; worker-side get_log_mode also
+                           self-guards on op==Idle.) Only when still
+                           unknown, so it's a one-shot per connection on
+                           PumpLogger firmware and a harmless no-op on
+                           legacy PumpTsueri (never replies → stays None). */
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::GetLogMode);
+                        }
                     }
                 }
                 BleEvent::ReadStarted { name, size } => {
@@ -851,6 +876,17 @@ impl AppState {
                     }
                     self.ble_dl_in_flight = false;
                     self.advance_download_queue();
+                }
+                BleEvent::LogMode { manual } => {
+                    self.ble_log_mode = Some(manual);
+                    self.ble_status = format!(
+                        "box log mode: {}",
+                        if manual { "manual" } else { "auto" }
+                    );
+                    push_log(
+                        &self.log,
+                        format!("ble: box log mode = {}", if manual { "manual" } else { "auto" }),
+                    );
                 }
                 BleEvent::DeleteDone { name } => {
                     self.ble_status = format!("deleted {name}");
@@ -1704,6 +1740,54 @@ impl AppState {
                         // Kick the first pass immediately on enable.
                         self.start_sync_pass();
                     }
+                    /* Box log mode (Auto/Manual) — iOS/Android parity.
+                       This is the *box's* SET_MODE/GET_MODE state, not
+                       the desktop sync: AUTO = box records on power-on,
+                       MANUAL = box idle until Start session. The box is
+                       the source of truth — a click sends SET_MODE and
+                       the worker re-reads via GET_MODE, so the highlight
+                       only flips once the box confirms. `None` (legacy
+                       PumpTsueri or not yet answered) = neither lit. */
+                    ui.separator();
+                    ui.label("Log mode:");
+                    let mode = self.ble_log_mode;
+                    if ui
+                        .add_enabled(
+                            connected,
+                            egui::SelectableLabel::new(mode == Some(false), "Auto"),
+                        )
+                        .on_hover_text("Box opens a logging session automatically on every power-on. Persisted on the box's SD card.")
+                        .clicked()
+                        && mode != Some(false)
+                    {
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::SetLogMode { manual: false });
+                        }
+                        push_log(&self.log, "ble: SET_MODE auto sent".into());
+                    }
+                    if ui
+                        .add_enabled(
+                            connected,
+                            egui::SelectableLabel::new(mode == Some(true), "Manual"),
+                        )
+                        .on_hover_text("Box stays idle after power-on until Start session (START_LOG). Persisted on the box's SD card.")
+                        .clicked()
+                        && mode != Some(true)
+                    {
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::SetLogMode { manual: true });
+                        }
+                        push_log(&self.log, "ble: SET_MODE manual sent".into());
+                    }
+                    ui.label(
+                        egui::RichText::new(match mode {
+                            None => "(unknown)",
+                            Some(false) => "records on power-on",
+                            Some(true) => "idle until Start session",
+                        })
+                        .weak(),
+                    );
+                    ui.separator();
                     if ui
                         .add_enabled(connected, egui::Button::new("STOP_LOG"))
                         .on_hover_text("Tells the box to gracefully close any active session — required before READ if logging is busy")
