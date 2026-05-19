@@ -80,6 +80,10 @@ pub fn run() -> i32 {
         }
     };
 
+    // Record our PID so the in-app updater can stop us before a
+    // bundle swap (the post-update GUI restarts a fresh agent).
+    coord::write_agent_pid();
+
     let stop = Arc::new(AtomicBool::new(false));
     {
         let s = stop.clone();
@@ -123,6 +127,7 @@ pub fn run() -> i32 {
     }
 
     drain_log(&log, &mut seen);
+    coord::clear_agent_pid();
     eprintln!("[agent] stopped");
     0
 }

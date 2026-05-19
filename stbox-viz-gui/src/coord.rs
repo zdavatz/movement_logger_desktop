@@ -40,6 +40,37 @@ fn lock_path(name: &str) -> PathBuf {
     movementlogger_home().join(name)
 }
 
+/// `~/.movementlogger/agent.pid` — the live agent writes its PID here
+/// (under `agent.lock`) so the in-app updater can stop it before
+/// swapping the bundle, then the post-update GUI restarts a fresh one.
+pub fn agent_pid_path() -> PathBuf {
+    movementlogger_home().join("agent.pid")
+}
+
+/// Best-effort: record this process's PID as the running agent.
+pub fn write_agent_pid() {
+    let p = agent_pid_path();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&p, std::process::id().to_string());
+}
+
+/// Best-effort: clear the agent PID file on clean exit.
+pub fn clear_agent_pid() {
+    let _ = std::fs::remove_file(agent_pid_path());
+}
+
+/// Read the recorded agent PID, if any and parseable.
+#[allow(dead_code)]
+pub fn read_agent_pid() -> Option<u32> {
+    std::fs::read_to_string(agent_pid_path())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// An exclusive advisory lock held for as long as this guard lives.
 /// Dropping it unlocks; the lock file itself is left in place (cheap,
 /// and avoids an unlink/recreate race with a waiter).

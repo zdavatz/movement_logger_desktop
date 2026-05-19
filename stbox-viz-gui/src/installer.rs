@@ -34,6 +34,32 @@ pub enum InstallEvent {
     Error(String),
 }
 
+/// Stop the background sync agent (if one is running) before swapping
+/// the bundle/binary, so it doesn't keep executing the old code or
+/// holding the old files open. Best-effort: SIGTERM on unix runs the
+/// agent's clean BLE teardown; the post-update GUI restarts a fresh
+/// agent (autostart re-register on startup). Issue #14 part B step 8.
+pub fn stop_running_agent() {
+    let Some(pid) = crate::coord::read_agent_pid() else { return };
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status();
+    }
+    // Give the agent a moment to drop the BLE link + release ble.lock
+    // before the swap helper (and the relaunched GUI) want the radio.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let _ = crate::coord::clear_agent_pid();
+}
+
 /// Walk up from the running executable to find the enclosing .app.
 /// macOS-only — returns None when running outside a bundle (e.g.
 /// `cargo run`) or on Linux/Windows.
@@ -191,6 +217,7 @@ fn detach_mount(mount: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn spawn_macos_swap_helper(current_app: &Path, staging: &Path) -> Result<(), String> {
+    stop_running_agent();
     let pid = std::process::id();
     let helper = std::env::temp_dir().join(format!("movement_logger_install_{}.sh", pid));
     let log = std::env::temp_dir().join(format!("movement_logger_install_{}.log", pid));
@@ -318,6 +345,7 @@ fn spawn_linux_swap_helper(
     main_staging: &Path,
     sidecar: Option<&(PathBuf, PathBuf)>,
 ) -> Result<(), String> {
+    stop_running_agent();
     let pid = std::process::id();
     let helper = std::env::temp_dir().join(format!("movement_logger_install_{}.sh", pid));
     let log = std::env::temp_dir().join(format!("movement_logger_install_{}.log", pid));
@@ -461,6 +489,7 @@ fn spawn_windows_swap_helper(
     main_staging: &Path,
     sidecar: Option<&(PathBuf, PathBuf)>,
 ) -> Result<(), String> {
+    stop_running_agent();
     let pid = std::process::id();
     let helper = std::env::temp_dir().join(format!("movement_logger_install_{}.ps1", pid));
     let log = std::env::temp_dir().join(format!("movement_logger_install_{}.log", pid));

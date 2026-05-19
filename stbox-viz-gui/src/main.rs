@@ -2335,6 +2335,15 @@ fn main() -> eframe::Result<()> {
         });
     }
 
+    /* If the box is in AUTO, (re-)install the login item on every GUI
+       launch. Idempotent, and crucially it re-points the plist /
+       .desktop / Run-key at the *current* bundle after an in-app
+       update swapped it — and on macOS bootstraps a fresh agent from
+       the new code without waiting for a re-login. Best-effort. */
+    if agent_config::AgentConfig::load().log_mode_manual == Some(false) {
+        let _ = autostart::register();
+    }
+
     let title = format!("MovementLogger v{}", env!("CARGO_PKG_VERSION"));
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([880.0, 720.0])
