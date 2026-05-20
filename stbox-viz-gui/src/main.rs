@@ -1115,8 +1115,18 @@ impl AppState {
                         let b = self.ensure_ble();
                         b.send(BleCmd::Scan);
                     }
+                    // Disable while ANY worker op is in flight — a big
+                    // keep-synced READ holds the BLE worker busy for
+                    // minutes, and tap-while-busy would pile a second
+                    // LIST behind the in-flight op (worker queues
+                    // commands serially so the click eventually fires
+                    // out of order, against an already-changed file
+                    // list). iOS/Android parity (2d001a4).
+                    let worker_busy = self.sync.ble_dl_in_flight
+                        || self.sync.ble_sync_pending
+                        || !self.sync.ble_dl_queue.is_empty();
                     if ui
-                        .add_enabled(connected, egui::Button::new("Refresh file list"))
+                        .add_enabled(connected && !worker_busy, egui::Button::new("Refresh file list"))
                         .clicked()
                     {
                         self.sync.ble_files.clear();
@@ -1124,7 +1134,7 @@ impl AppState {
                     }
                     if ui
                         .add_enabled(
-                            connected && !self.sync.ble_dl_in_flight && !self.sync.ble_sync_pending,
+                            connected && !worker_busy,
                             egui::Button::new("Sync now"),
                         )
                         .on_hover_text(
@@ -1367,6 +1377,40 @@ impl AppState {
                         ui.colored_label(
                             egui::Color32::from_rgb(120, 200, 140),
                             &self.sync.ble_sync_msg,
+                        );
+                    }
+                    // Cumulative byte-progress bar for the current sync
+                    // pass (iOS/Android parity, 2d001a4). Per-row bars
+                    // in the file list below still show individual file
+                    // progress; this is the roll-up so the user can see
+                    // "8 of 23 files, 142 / 312 MB, 45 %" at a glance.
+                    if self.sync.sync_pass_total > 0 {
+                        let total = self.sync.sync_pass_total;
+                        let remaining = self.sync.ble_dl_queue.len()
+                            + (self.sync.ble_dl_in_flight as usize);
+                        let done = total.saturating_sub(remaining);
+                        let frac = self.sync.sync_cumulative_fraction();
+                        let bytes = self.sync.sync_cumulative_bytes();
+                        let total_bytes = self.sync.sync_pass_total_bytes;
+                        let fmt_b = |b: u64| -> String {
+                            if b >= 1024 * 1024 {
+                                format!("{:.1} MB", b as f64 / 1_048_576.0)
+                            } else if b >= 1024 {
+                                format!("{:.0} kB", b as f64 / 1024.0)
+                            } else {
+                                format!("{b} B")
+                            }
+                        };
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(360.0)
+                                .text(format!(
+                                    "{done} of {total} files · {} / {} ({}%)",
+                                    fmt_b(bytes),
+                                    fmt_b(total_bytes),
+                                    (frac * 100.0) as u32,
+                                )),
                         );
                     }
                     if let Some(err) = self.sync.ble_delete_err.clone() {
@@ -1852,11 +1896,22 @@ impl eframe::App for AppState {
         // backlog effectively runs back-to-back because the interval is
         // measured from the previous *trigger*, long elapsed by the
         // time a big pass drains.
+        //
+        // `ble_resume_box.is_some()` means a transfer was cut mid-batch
+        // and we're inside the worker's silent auto_reconnect loop.
+        // `ble_state` stays Connected for the whole reconnect window
+        // (no Disconnected event until the bounded budget is spent), so
+        // without this guard the tick would fire `start_sync_pass`,
+        // send a LIST through the channel, and pile up duplicate ops
+        // behind the reconnect — the .connected handler already re-
+        // arms the sync with "Reconnected — resuming sync" so nothing
+        // is lost by skipping ticks in between. (iOS 8c90276 parity.)
         if self.sync.ble_keep_synced
             && matches!(self.sync.ble_state, BleState::Connected)
             && !self.sync.ble_sync_pending
             && !self.sync.ble_dl_in_flight
             && self.sync.ble_dl_queue.is_empty()
+            && self.sync.ble_resume_box.is_none()
         {
             let due = self
                 .sync

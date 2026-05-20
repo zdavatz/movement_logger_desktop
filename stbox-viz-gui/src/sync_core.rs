@@ -162,6 +162,26 @@ pub struct SyncCore {
     /// makes that skip everything already saved and re-pull only the
     /// file that was cut off. `None` = nothing to resume.
     pub ble_resume_box: Option<String>,
+    /// Name of the file the *sync* (or manual queue) is currently pulling.
+    /// Set when [`Self::advance_download_queue`] pops the next file onto
+    /// the worker, cleared on ReadDone / arm_sync_resume. Used to find
+    /// the per-file `bytes_done` for [`Self::sync_cumulative_bytes`] —
+    /// the queue is popped *before* the READ is sent, so we can't look
+    /// the in-flight file up there.
+    pub sync_in_flight_name: Option<String>,
+    /// Total file count of the current sync pass — set at `run_sync_diff`,
+    /// reset on completion / abort. Renders "Syncing X of N files" in the
+    /// cumulative progress line (iOS/Android parity).
+    pub sync_pass_total: usize,
+    /// Total byte count of the current sync pass (sum of every queued
+    /// file's box-reported size). Constant across the pass — denominator
+    /// for the cumulative progress bar.
+    pub sync_pass_total_bytes: u64,
+    /// Bytes drained — sum of completed files' final on-disk sizes. The
+    /// in-flight file's contribution comes from `ble_files[…].bytes_done`
+    /// via [`Self::sync_cumulative_bytes`] so the bar moves while the
+    /// current READ streams.
+    pub sync_pass_completed_bytes: u64,
     /// Last DELETE rejection from the box (NOT_FOUND / BUSY / IO_ERROR
     /// / BAD_REQUEST). Shown as a prominent red banner so a failed
     /// delete isn't only buried in the log. Cleared on a successful
@@ -347,6 +367,28 @@ pub fn is_synced_name(name: &str) -> bool {
 }
 
 impl SyncCore {
+    /// Live cumulative bytes pulled in the current sync pass — completed
+    /// files' final on-disk sizes + the in-flight file's `bytes_done`.
+    /// Use this for the overall progress-bar numerator. Matches iOS
+    /// `syncCumulativeBytes` / Android `syncCumulativeBytes`.
+    pub fn sync_cumulative_bytes(&self) -> u64 {
+        let in_flight = self
+            .sync_in_flight_name
+            .as_ref()
+            .and_then(|n| self.ble_files.iter().find(|f| f.name == *n))
+            .map(|f| f.bytes_done)
+            .unwrap_or(0);
+        self.sync_pass_completed_bytes + in_flight
+    }
+
+    /// 0…1 overall progress of the in-flight sync pass.
+    pub fn sync_cumulative_fraction(&self) -> f32 {
+        if self.sync_pass_total_bytes == 0 { 0.0 } else {
+            (self.sync_cumulative_bytes() as f32 / self.sync_pass_total_bytes as f32)
+                .clamp(0.0, 1.0)
+        }
+    }
+
     /// Snapshot the agent-relevant state into `~/.movementlogger/
     /// config.toml`. Called by the GUI whenever box id / save dir /
     /// keep-synced / box log mode changes, so the headless `--agent`
@@ -449,6 +491,10 @@ impl SyncCore {
                     }
                     self.ble_dl_queue.clear();
                     self.ble_dl_in_flight = false;
+                    self.sync_in_flight_name = None;
+                    self.sync_pass_total = 0;
+                    self.sync_pass_total_bytes = 0;
+                    self.sync_pass_completed_bytes = 0;
                     /* Drop live state too — the box can drop the stream
                        mid-connection (e.g. flaky link) and the next
                        reconnect should start from a clean history,
@@ -588,6 +634,18 @@ impl SyncCore {
                             push_log(&self.log, format!("ble error: {e}"));
                         }
                     }
+                    // Fold this file's final size into the cumulative-
+                    // byte counter so the overall progress bar snaps
+                    // forward as each file completes, then advance to
+                    // the next queue entry (matches iOS/Android
+                    // `syncPassCompletedBytes` accounting).
+                    if self.sync_in_flight_name.as_deref() == Some(name.as_str())
+                        && self.sync_pass_total > 0
+                    {
+                        self.sync_pass_completed_bytes =
+                            self.sync_pass_completed_bytes.saturating_add(size);
+                    }
+                    self.sync_in_flight_name = None;
                     self.ble_dl_in_flight = false;
                     self.advance_download_queue();
                 }
@@ -676,13 +734,25 @@ impl SyncCore {
     /// (which had the worker reject every read after the first).
     pub fn advance_download_queue(&mut self) {
         if self.ble_dl_in_flight { return; }
-        let Some((name, size)) = self.ble_dl_queue.pop_front() else { return; };
+        let Some((name, size)) = self.ble_dl_queue.pop_front() else {
+            // Queue drained. If a sync pass was running, mark it complete
+            // and clear the cumulative-progress totals so the UI line
+            // disappears between passes.
+            if self.sync_pass_total > 0 {
+                self.sync_pass_total = 0;
+                self.sync_pass_total_bytes = 0;
+                self.sync_pass_completed_bytes = 0;
+            }
+            self.sync_in_flight_name = None;
+            return;
+        };
         // Resume/grow from whatever is already mirrored locally. The
         // firmware seeks to this offset, so an interrupted file
         // continues and a grown log only fetches its new tail.
         let offset = mirror_offset(&self.ble_out_dir, &name, size);
         let Some(b) = self.ble.as_ref() else { return; };
         b.send(BleCmd::Read { name: name.clone(), size, offset });
+        self.sync_in_flight_name = Some(name.clone());
         self.ble_dl_in_flight = true;
         if offset > 0 {
             push_log(
@@ -754,6 +824,10 @@ impl SyncCore {
         self.ble_dl_queue.clear();
         self.ble_dl_in_flight = false;
         self.ble_sync_pending = false;
+        self.sync_in_flight_name = None;
+        self.sync_pass_total = 0;
+        self.sync_pass_total_bytes = 0;
+        self.sync_pass_completed_bytes = 0;
         self.ble_sync_msg = "⚠ Transfer interrupted (BLE link lost). Reconnect to \
              the box — the sync resumes automatically and skips files already saved."
             .into();
@@ -800,6 +874,7 @@ impl SyncCore {
         // the new tail (offset = local size) instead of re-pulling the
         // whole file, so no single big file can starve GPS/BAT either.
         let mut fetch = 0usize;
+        let mut fetch_bytes: u64 = 0;
         let mut up_to_date = 0usize;
         self.ble_dl_queue.clear();
         for f in self.ble_files.iter() {
@@ -815,9 +890,19 @@ impl SyncCore {
                 // local < size → grow/resume; local > size → rotated
                 // (mirror_offset resets it). Either way, fetch.
                 fetch += 1;
+                // Box sizes both sides of the bar: `bytes_done` from the
+                // worker is *absolute* (resume base + streamed), so the
+                // bar's "already-on-disk bytes count once the file
+                // becomes in-flight" — same semantic as iOS/Android.
+                fetch_bytes = fetch_bytes.saturating_add(f.size);
                 self.ble_dl_queue.push_back((f.name.clone(), f.size));
             }
         }
+        // Seed the cumulative progress card (iOS/Android parity). Both
+        // totals zero if there's nothing to fetch — UI hides the line.
+        self.sync_pass_total = fetch;
+        self.sync_pass_total_bytes = fetch_bytes;
+        self.sync_pass_completed_bytes = 0;
         self.ble_sync_msg = if fetch == 0 {
             format!("Sync: up to date ({up_to_date} files)")
         } else {
