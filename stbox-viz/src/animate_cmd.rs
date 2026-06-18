@@ -768,15 +768,6 @@ fn resolve_at_window(
     tz_offset_h: f64,
     date_arg: Option<&str>,
 ) -> Result<(usize, usize, NaiveDateTime)> {
-    let gps_path = guess_gps_path(sensor_path)
-        .ok_or_else(|| anyhow!("no GPS CSV next to {}; --at needs GPS to anchor wall-clock time",
-                               sensor_path.display()))?;
-    let mut rows = load_gps_csv(&gps_path)?;
-    rows.retain(|g| g.fix >= 1);
-    if rows.is_empty() {
-        anyhow::bail!("GPS CSV has no valid fixes; --at needs GPS to anchor wall-clock time");
-    }
-
     if let Some(vt) = video.and_then(ffprobe_creation_time) {
         let local = vt + ChronoDuration::milliseconds((tz_offset_h * 3600.0 * 1000.0) as i64);
         println!("  video creation_time: {} local (override --at to align precisely)",
@@ -785,6 +776,47 @@ fn resolve_at_window(
     let at_local_sec = parse_hhmm_to_sec(at_str)
         .ok_or_else(|| anyhow!("could not parse --at '{}', expected HH:MM[:SS]", at_str))?;
     let at_utc_sec_of_day = at_local_sec - tz_offset_h * 3600.0;
+
+    // Window length: explicit --duration → ffprobe video length → 60 s.
+    let dur = duration_arg.or_else(|| {
+        video.and_then(|v| ffprobe_duration(v).ok())
+    }).unwrap_or(60.0);
+    let date_utc = resolve_session_date(date_arg, sensor_path)?;
+    let local_secs = at_utc_sec_of_day + tz_offset_h * 3600.0;
+    let start_local = NaiveDateTime::new(date_utc, NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+        + ChronoDuration::milliseconds((local_secs * 1000.0).round() as i64);
+
+    // ---- PRIMARY: host-clock `# SYNC` anchors (firmware v0.0.10+). The box
+    // stamped (tick → host-epoch) pairs on every connect, so we can map each
+    // sensor tick to absolute wall-clock and slice the window directly — no
+    // GPS fix required, and drift-free across the session (the phone clock is
+    // the same domain as the video's creation_time). Falls through to the
+    // GPS-UTC path below for legacy / never-connected sessions.
+    let anchors = crate::io::read_sync_anchors(sensor_path).unwrap_or_default();
+    if !anchors.is_empty() {
+        let midnight_ms = NaiveDateTime::new(date_utc, NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+            .and_utc()
+            .timestamp_millis();
+        let start_ms = midnight_ms + (at_utc_sec_of_day * 1000.0) as i64;
+        let end_ms = start_ms + (dur * 1000.0) as i64;
+        let ticks: Vec<f64> = samples.iter().map(|r| r.ticks).collect();
+        let abs = crate::io::abs_times_from_sync_anchors(&ticks, &anchors);
+        let s = abs.iter().position(|&e| e >= start_ms).unwrap_or(0);
+        let e = abs.iter().position(|&e| e >= end_ms).unwrap_or(samples.len());
+        println!("  aligned via {} host # SYNC anchor(s) — drift-free, no GPS needed",
+                 anchors.len());
+        return Ok((s.min(samples.len()), e.min(samples.len()), start_local));
+    }
+
+    // ---- FALLBACK: GPS-UTC nearest-row anchoring (no host anchors present).
+    let gps_path = guess_gps_path(sensor_path)
+        .ok_or_else(|| anyhow!("no GPS CSV next to {}; --at needs GPS (or a host # SYNC anchor) to anchor wall-clock time",
+                               sensor_path.display()))?;
+    let mut rows = load_gps_csv(&gps_path)?;
+    rows.retain(|g| g.fix >= 1);
+    if rows.is_empty() {
+        anyhow::bail!("GPS CSV has no valid fixes; --at needs GPS (or a host # SYNC anchor) to anchor wall-clock time");
+    }
 
     // ThreadX runs on HSI (internal RC, ±1 % accuracy) so ticks drift
     // ~7 s over a 21-min session — linear extrapolation from the

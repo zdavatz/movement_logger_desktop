@@ -26,6 +26,10 @@
 //!   0x04 STOP_LOG            — no FileData reply
 //!   0x05 START_LOG <dur32_LE> — box reboots into LOG mode for `dur` s,
 //!                               then auto-reboots back to BLE (issue #15)
+//!   0x06 SET_MODE <u8>        — 0=auto / 1=manual; single-byte status
+//!   0x07 GET_MODE             — replies one byte 0=auto / 1=manual
+//!   0x08 SET_TIME <epoch64_LE> — host wall-clock ms; box stamps a `# SYNC`
+//!                               anchor into the open Sens/Gps CSVs (no RTC)
 //!
 //!   Status bytes: 0x00 OK, 0xB0 BUSY, 0xE1 NOT_FOUND, 0xE2 IO_ERROR, 0xE3 BAD_REQ.
 
@@ -161,6 +165,14 @@ pub enum BleCmd {
     /// `PumpTsueri` firmware never replies; the GettingMode op just times
     /// out and drops to Idle (mode stays "unknown", no error surfaced).
     GetLogMode,
+    /// SET_TIME opcode `0x08` + `<epoch_ms:u64-LE>` (firmware v0.0.10+).
+    /// The box has no RTC, so we push the host's current wall-clock millis
+    /// and the firmware stamps a `# SYNC epoch_ms=.. tick_ms=..` anchor into
+    /// the open Sens/Gps CSVs, pairing the host epoch with its free-running
+    /// ms counter so replay can resolve absolute time without a GPS fix.
+    /// Sent on every connect; *fire-and-forget* (no FileData reply tracked —
+    /// legacy firmware silently ignores 0x08).
+    SetTime { epoch_ms: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -624,6 +636,7 @@ impl WorkerState {
             BleCmd::Delete { name } => self.delete(name).await,
             BleCmd::SetLogMode { manual } => self.set_log_mode(manual).await,
             BleCmd::GetLogMode => self.get_log_mode().await,
+            BleCmd::SetTime { epoch_ms } => self.set_time(epoch_ms).await,
         }
     }
 
@@ -1017,6 +1030,29 @@ impl WorkerState {
             return;
         }
         self.emit(BleEvent::Status("STOP_LOG sent".into()));
+    }
+
+    /// Send SET_TIME (0x08) + 8-byte LE epoch-ms so the box stamps a
+    /// `# SYNC` anchor into the open Sens/Gps CSVs. Like `stop_log`, this is
+    /// fire-and-forget: it does NOT take a `CurrentOp` slot, so the box's
+    /// optional OK byte lands harmlessly while `op == Idle` and legacy
+    /// firmware without 0x08 can't stall the worker.
+    async fn set_time(&mut self, epoch_ms: u64) {
+        let mut payload = Vec::with_capacity(9);
+        payload.push(0x08);
+        payload.extend_from_slice(&epoch_ms.to_le_bytes());
+        if let Err(e) = self.write_cmd(&payload).await {
+            self.emit_err(e);
+            return;
+        }
+        /* Space SET_TIME from the auto-LIST that the connect handler queues
+           right behind it: the firmware holds only ONE pending FileCmd at a
+           time, so a LIST landing in the same connection interval would
+           clobber the SET_TIME before the box stamps its marker. The worker
+           processes commands sequentially, so this sleep delays the next
+           command — same trick `start_log` uses above. */
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        self.emit(BleEvent::Status("SET_TIME sent — box clock anchored to host".into()));
     }
 
     /// Send START_LOG (0x05) + 4-byte LE duration. Box validates duration

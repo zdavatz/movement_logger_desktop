@@ -468,6 +468,20 @@ impl SyncCore {
                     }
                     self.ble_resume_box = None;
                     if let Some(b) = self.ble.as_ref() {
+                        /* Stamp the box's open Sens/Gps CSVs with the host
+                           wall clock on every connect (SET_TIME 0x08): the box
+                           has no RTC, so this is what lets replay time-align
+                           without a GPS fix. Sample the epoch right before
+                           sending so it matches the box tick the firmware
+                           stamps. The worker sleeps 500 ms after SET_TIME, so
+                           the LIST below doesn't clobber it in the firmware's
+                           single command buffer. Fire-and-forget — legacy
+                           firmware ignores 0x08. */
+                        let epoch_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        b.send(BleCmd::SetTime { epoch_ms });
                         b.send(BleCmd::List);
                     }
                 }

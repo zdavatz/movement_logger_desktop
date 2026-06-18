@@ -72,6 +72,17 @@ impl Cols {
     }
 }
 
+/// Resolve the tick column + the divisor that maps it to 10 ms units.
+/// Compact schema (`ms`) stores raw milliseconds → ÷10; the legacy spaced
+/// `Time [10ms]` / `Time [mS]` column is already in 10 ms ticks → ÷1.
+fn tick_col(cols: &Cols) -> Result<(usize, f64)> {
+    if let Some(i) = cols.idx("ms") {
+        Ok((i, 10.0))
+    } else {
+        Ok((cols.idx_any(&["Time [10ms]", "Time [mS]"])?, 1.0))
+    }
+}
+
 fn parse_f64(s: &str) -> Result<f64> {
     s.trim()
         .parse::<f64>()
@@ -87,30 +98,38 @@ fn parse_i32(s: &str) -> Result<i32> {
 pub fn load_sensor_csv(path: &Path) -> Result<Vec<SensorRow>> {
     let mut rdr = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
+        // Skip the firmware's `# SYNC epoch_ms=.. tick_ms=..` marker lines
+        // (v0.0.10+) — they're host time-sync anchors, not data rows; pulled
+        // separately by `read_sync_anchors`.
+        .comment(Some(b'#'))
         .from_path(path)
         .with_context(|| format!("open {}", path.display()))?;
 
     let hdr = rdr.headers()?.clone();
     let cols = Cols::from_headers(&hdr);
 
-    let i_t = cols.idx_any(&["Time [10ms]", "Time [mS]"])?;
-    let i_ax = cols.idx_any(&["AccX [mg]"])?;
-    let i_ay = cols.idx_any(&["AccY [mg]"])?;
-    let i_az = cols.idx_any(&["AccZ [mg]"])?;
-    let i_gx = cols.idx_any(&["GyroX [mdps]"])?;
-    let i_gy = cols.idx_any(&["GyroY [mdps]"])?;
-    let i_gz = cols.idx_any(&["GyroZ [mdps]"])?;
-    let i_mx = cols.idx_any(&["MagX [mgauss]"])?;
-    let i_my = cols.idx_any(&["MagY [mgauss]"])?;
-    let i_mz = cols.idx_any(&["MagZ [mgauss]"])?;
-    let i_p = cols.idx_any(&["P [mB]"])?;
-    let i_t_c = cols.idx_any(&["T ['C]"])?;
+    // Accept BOTH the legacy spaced schema (`Time [10ms]`, `AccX [mg]`, …)
+    // and the post-22.4.2026 compact schema (`ms`, `ax_mg`, …). The compact
+    // `ms` column is in raw milliseconds, so divide by 10 to keep `ticks` in
+    // the 10 ms unit the alignment / fusion code expects.
+    let (i_t, tick_div) = tick_col(&cols)?;
+    let i_ax = cols.idx_any(&["AccX [mg]", "ax_mg"])?;
+    let i_ay = cols.idx_any(&["AccY [mg]", "ay_mg"])?;
+    let i_az = cols.idx_any(&["AccZ [mg]", "az_mg"])?;
+    let i_gx = cols.idx_any(&["GyroX [mdps]", "gx_mdps"])?;
+    let i_gy = cols.idx_any(&["GyroY [mdps]", "gy_mdps"])?;
+    let i_gz = cols.idx_any(&["GyroZ [mdps]", "gz_mdps"])?;
+    let i_mx = cols.idx_any(&["MagX [mgauss]", "mx_mg"])?;
+    let i_my = cols.idx_any(&["MagY [mgauss]", "my_mg"])?;
+    let i_mz = cols.idx_any(&["MagZ [mgauss]", "mz_mg"])?;
+    let i_p = cols.idx_any(&["P [mB]", "p_hPa"])?;
+    let i_t_c = cols.idx_any(&["T ['C]", "t_C"])?;
 
     let mut out = Vec::new();
     for (n, rec) in rdr.records().enumerate() {
         let rec = rec.with_context(|| format!("row {}", n + 2))?;
         out.push(SensorRow {
-            ticks: parse_f64(&rec[i_t])?,
+            ticks: parse_f64(&rec[i_t])? / tick_div,
             acc: [parse_f64(&rec[i_ax])?, parse_f64(&rec[i_ay])?, parse_f64(&rec[i_az])?],
             gyro: [parse_f64(&rec[i_gx])?, parse_f64(&rec[i_gy])?, parse_f64(&rec[i_gz])?],
             mag: [parse_f64(&rec[i_mx])?, parse_f64(&rec[i_my])?, parse_f64(&rec[i_mz])?],
@@ -124,28 +143,29 @@ pub fn load_sensor_csv(path: &Path) -> Result<Vec<SensorRow>> {
 pub fn load_gps_csv(path: &Path) -> Result<Vec<GpsRow>> {
     let mut rdr = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
+        .comment(Some(b'#'))
         .from_path(path)
         .with_context(|| format!("open {}", path.display()))?;
 
     let hdr = rdr.headers()?.clone();
     let cols = Cols::from_headers(&hdr);
 
-    let i_t = cols.idx_any(&["Time [10ms]", "Time [mS]"])?;
-    let i_utc = cols.idx_any(&["UTC"])?;
-    let i_lat = cols.idx_any(&["Lat"])?;
-    let i_lon = cols.idx_any(&["Lon"])?;
-    let i_alt = cols.idx_any(&["Alt [m]"])?;
-    let i_spd = cols.idx_any(&["Speed [km/h]"])?;
-    let i_crs = cols.idx_any(&["Course [deg]"])?;
-    let i_fix = cols.idx_any(&["Fix"])?;
-    let i_sat = cols.idx_any(&["NumSat"])?;
-    let i_hdp = cols.idx_any(&["HDOP"])?;
+    let (i_t, tick_div) = tick_col(&cols)?;
+    let i_utc = cols.idx_any(&["UTC", "utc"])?;
+    let i_lat = cols.idx_any(&["Lat", "lat"])?;
+    let i_lon = cols.idx_any(&["Lon", "lon"])?;
+    let i_alt = cols.idx_any(&["Alt [m]", "alt_m"])?;
+    let i_spd = cols.idx_any(&["Speed [km/h]", "speed_kmh"])?;
+    let i_crs = cols.idx_any(&["Course [deg]", "course_deg"])?;
+    let i_fix = cols.idx_any(&["Fix", "fix_q"])?;
+    let i_sat = cols.idx_any(&["NumSat", "nsat"])?;
+    let i_hdp = cols.idx_any(&["HDOP", "hdop"])?;
 
     let mut out = Vec::new();
     for (n, rec) in rdr.records().enumerate() {
         let rec = rec.with_context(|| format!("row {}", n + 2))?;
         out.push(GpsRow {
-            ticks: parse_f64(&rec[i_t])?,
+            ticks: parse_f64(&rec[i_t])? / tick_div,
             utc: rec[i_utc].to_string(),
             lat: parse_f64(&rec[i_lat])?,
             lon: parse_f64(&rec[i_lon])?,
@@ -158,4 +178,99 @@ pub fn load_gps_csv(path: &Path) -> Result<Vec<GpsRow>> {
         });
     }
     Ok(out)
+}
+
+/// A host-clock time-sync anchor the firmware stamps into Sens/Gps CSVs on
+/// each BLE connect (`SET_TIME` 0x08, v0.0.10+): a `# SYNC epoch_ms=… tick_ms=…`
+/// comment line pairing the host's absolute wall-clock millis with the box's
+/// free-running ms counter. Because the box has no RTC these are the only
+/// drift-free, GPS-independent way to map a logged row's tick to absolute time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SyncAnchor {
+    /// Box tick in 10 ms units — the same unit as `SensorRow::ticks` /
+    /// `GpsRow::ticks` — so it slots straight into the abs-time interpolation.
+    pub ticks: f64,
+    /// Host wall-clock epoch milliseconds pushed at this tick.
+    pub epoch_ms: i64,
+}
+
+/// Extract every `# SYNC epoch_ms=<u64> tick_ms=<u32>` marker from a Sens/Gps
+/// CSV. `tick_ms` is the box's raw `HAL_GetTick()` ms (same clock as the
+/// `ms` / `Time` column), so we divide by the file's tick divisor to land in
+/// the 10 ms row-tick unit. Returns an empty vec for files written by firmware
+/// that predates the marker (legacy / never-connected). Mirrors the iOS
+/// `CsvParsers.parseSyncAnchors`.
+pub fn read_sync_anchors(path: &Path) -> Result<Vec<SyncAnchor>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut tick_div = 10.0_f64; // compact `ms` schema → raw ms; ÷10 → 10ms ticks
+    let mut saw_header = false;
+    let mut out: Vec<SyncAnchor> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !saw_header {
+            saw_header = true;
+            // Legacy spaced header ("Time [10ms]", …) is already 10ms units.
+            if line.to_ascii_lowercase().contains("time [") {
+                tick_div = 1.0;
+            }
+            continue;
+        }
+        if !line.starts_with('#') || !line.contains("SYNC") {
+            continue;
+        }
+        let mut epoch_ms: Option<i64> = None;
+        let mut tick_ms: Option<f64> = None;
+        for tok in line.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("epoch_ms=") {
+                epoch_ms = v.parse::<i64>().ok();
+            } else if let Some(v) = tok.strip_prefix("tick_ms=") {
+                tick_ms = v.parse::<f64>().ok();
+            }
+        }
+        if let (Some(e), Some(t)) = (epoch_ms, tick_ms) {
+            if e > 0 {
+                out.push(SyncAnchor { ticks: t / tick_div, epoch_ms: e });
+            }
+        }
+    }
+    // Sort + dedupe by tick so the interpolation gets a clean monotone curve.
+    out.sort_by(|a, b| a.ticks.partial_cmp(&b.ticks).unwrap_or(std::cmp::Ordering::Equal));
+    out.dedup_by(|a, b| a.ticks == b.ticks);
+    Ok(out)
+}
+
+/// Map row ticks → absolute epoch ms through host-clock `# SYNC` anchors.
+/// Piecewise-linear between anchors (drift-free across a session); constant
+/// 10 ms/tick extrapolation before the first / after the last anchor. A single
+/// anchor degenerates to a fixed 10 ms/tick offset from that one connect.
+/// `anchors` must be tick-sorted + deduped (as `read_sync_anchors` returns).
+/// Mirrors the iOS `absTimesFromSyncAnchors`.
+pub fn abs_times_from_sync_anchors(ticks: &[f64], anchors: &[SyncAnchor]) -> Vec<i64> {
+    if ticks.is_empty() || anchors.is_empty() {
+        return Vec::new();
+    }
+    let first = anchors[0];
+    let last = anchors[anchors.len() - 1];
+    let mut out = Vec::with_capacity(ticks.len());
+    let mut j = 0usize;
+    for &t in ticks {
+        if t <= first.ticks {
+            out.push(first.epoch_ms + ((t - first.ticks) * 10.0) as i64);
+        } else if t >= last.ticks {
+            out.push(last.epoch_ms + ((t - last.ticks) * 10.0) as i64);
+        } else {
+            while j + 1 < anchors.len() && anchors[j + 1].ticks <= t {
+                j += 1;
+            }
+            let a = anchors[j];
+            let b = anchors[j + 1];
+            let frac = (t - a.ticks) / (b.ticks - a.ticks);
+            out.push(a.epoch_ms + ((b.epoch_ms - a.epoch_ms) as f64 * frac) as i64);
+        }
+    }
+    out
 }
