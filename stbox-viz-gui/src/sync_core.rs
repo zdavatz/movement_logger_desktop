@@ -187,6 +187,17 @@ pub struct SyncCore {
     /// delete isn't only buried in the log. Cleared on a successful
     /// delete, a new delete attempt, or disconnect.
     pub ble_delete_err: Option<String>,
+
+    // ----- Firmware upload (OTA) ---------------------------------------
+    /// `Some((bytes_done, total))` while a firmware upload is in flight —
+    /// set on `FlashStarted`, advanced on `FlashProgress`, cleared on
+    /// `FlashDone` / `FlashError` / disconnect. Drives the flash progress
+    /// bar and disables the other BLE actions for its duration.
+    pub ble_flash_progress: Option<(u64, u64)>,
+    /// Last firmware-upload result line for the Sync tab ("Firmware sent
+    /// — box rebooting…" on success, the mapped error on failure). Empty
+    /// = no upload attempted yet this session.
+    pub ble_flash_msg: String,
     /// Shared log sink. The GUI shares its scrollable-panel `Arc` here
     /// so BLE/sync lines land in the same buffer as before; the agent
     /// points it at a stdout/file drain.
@@ -517,6 +528,11 @@ impl SyncCore {
                     self.ble_connected_id = None;
                     self.ble_sync_pending = false;
                     self.ble_delete_err = None;
+                    /* Clear any in-flight firmware progress bar (the box
+                       reboots after a successful COMMIT, dropping the
+                       link). Keep `ble_flash_msg` so the success/error
+                       result stays visible on the post-flash screen. */
+                    self.ble_flash_progress = None;
                     /* Re-query the box log mode fresh on the next
                        Connect (it could be a different box, or changed
                        from another client) rather than show a stale
@@ -694,6 +710,47 @@ impl SyncCore {
                 BleEvent::Sample(s) => {
                     host.on_sample(&s);
                 }
+                BleEvent::FlashStarted { total } => {
+                    self.ble_flash_progress = Some((0, total));
+                    self.ble_flash_msg =
+                        format!("Uploading firmware — 0 / {} kB…", (total + 1023) / 1024);
+                    self.ble_status = "firmware upload started".into();
+                    push_log(&self.log, format!("ble: firmware upload started ({total} B)"));
+                }
+                BleEvent::FlashProgress { bytes_done, total } => {
+                    self.ble_flash_progress = Some((bytes_done, total));
+                    let pct = if total > 0 {
+                        (bytes_done as f64 / total as f64 * 100.0) as u32
+                    } else {
+                        0
+                    };
+                    self.ble_flash_msg = format!(
+                        "Uploading firmware — {} / {} kB ({pct}%)…",
+                        (bytes_done + 1023) / 1024,
+                        (total + 1023) / 1024,
+                    );
+                    self.ble_status = format!("firmware: {bytes_done}/{total} B");
+                }
+                BleEvent::FlashDone => {
+                    self.ble_flash_progress = None;
+                    self.ble_flash_msg =
+                        "Firmware sent — box is rebooting into the new firmware. \
+                         Reconnect in a few seconds."
+                            .into();
+                    self.ble_status = "firmware sent — box rebooting".into();
+                    push_log(&self.log, "ble: firmware upload complete — box rebooting".into());
+                    /* The box swaps banks and resets within ~200 ms of
+                       COMMIT, so the link is about to drop. Leave the
+                       Disconnected handler to clean BLE state up; don't
+                       arm a resume (this is an intentional reboot, not a
+                       lost transfer). */
+                }
+                BleEvent::FlashError { msg } => {
+                    self.ble_flash_progress = None;
+                    self.ble_flash_msg = format!("Firmware upload failed: {msg}");
+                    self.ble_status = format!("firmware error: {msg}");
+                    push_log(&self.log, format!("ble: firmware upload failed: {msg}"));
+                }
                 BleEvent::Error(msg) => {
                     self.ble_status = format!("error: {msg}");
                     push_log(&self.log, format!("ble error: {msg}"));
@@ -868,6 +925,55 @@ impl SyncCore {
         self.ble_sync_msg = "Sync: listing SD card…".into();
         if let Some(b) = self.ble.as_ref() { b.send(BleCmd::List); }
         push_log(&self.log, "ble: sync — listing".into());
+    }
+
+    /// Read a firmware `.bin` from `path` and start uploading it to the
+    /// connected box over BLE (dual-bank OTA). No-op (with a status
+    /// message) if not connected, another op is in flight, or the file
+    /// can't be read. The worker emits `FlashStarted/Progress/Done/Error`
+    /// which `pump_ble_events` folds into `ble_flash_progress` /
+    /// `ble_flash_msg`.
+    pub fn start_firmware_upload(&mut self, path: &Path) {
+        if !matches!(self.ble_state, BleState::Connected) {
+            self.ble_flash_msg = "Connect to a box before uploading firmware.".into();
+            return;
+        }
+        if self.ble_dl_in_flight
+            || self.ble_sync_pending
+            || !self.ble_dl_queue.is_empty()
+            || self.ble_flash_progress.is_some()
+        {
+            self.ble_flash_msg = "Another BLE op is in flight — wait for it to finish.".into();
+            return;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.ble_flash_msg = format!("Can't read firmware file: {e}");
+                push_log(&self.log, format!("ble: firmware read failed: {e}"));
+                return;
+            }
+        };
+        if bytes.is_empty() {
+            self.ble_flash_msg = "Firmware file is empty.".into();
+            return;
+        }
+        let len = bytes.len();
+        self.ble_flash_progress = Some((0, len as u64));
+        self.ble_flash_msg = format!(
+            "Uploading firmware ({}) — {} kB…",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            (len as f64 / 1024.0).round() as u64,
+        );
+        push_log(
+            &self.log,
+            format!("ble: uploading firmware {} ({len} B)", path.display()),
+        );
+        if let Some(b) = self.ble.as_ref() {
+            b.send(BleCmd::FlashFirmware { bytes: Arc::new(bytes) });
+        }
     }
 
     pub fn run_sync_diff(&mut self) {

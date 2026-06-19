@@ -1064,6 +1064,46 @@ impl AppState {
                     ui.add_space(4.0);
                 }
 
+                /* Post-flash banner. After a successful firmware upload
+                   the box reboots and the link drops, so the result
+                   message (and "reconnect in a few seconds" guidance) is
+                   only useful here, on the disconnected Scan/Connect
+                   screen. Shown whenever a flash result exists and we're
+                   not connected; the connected block shows progress
+                   instead. */
+                if !self.sync.ble_flash_msg.is_empty()
+                    && !matches!(self.sync.ble_state, BleState::Connected)
+                {
+                    let is_err = self.sync.ble_flash_msg.contains("failed")
+                        || self.sync.ble_flash_msg.contains("Can't")
+                        || self.sync.ble_flash_msg.contains("empty");
+                    let (fill, stroke, text) = if is_err {
+                        (
+                            egui::Color32::from_rgb(255, 230, 230),
+                            egui::Color32::from_rgb(200, 80, 80),
+                            egui::Color32::from_rgb(170, 30, 30),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgb(224, 245, 230),
+                            egui::Color32::from_rgb(80, 170, 110),
+                            egui::Color32::from_rgb(30, 120, 60),
+                        )
+                    };
+                    egui::Frame::group(ui.style())
+                        .fill(fill)
+                        .stroke(egui::Stroke::new(1.0, stroke))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(text, &self.sync.ble_flash_msg);
+                                if ui.small_button("Dismiss").clicked() {
+                                    self.sync.ble_flash_msg.clear();
+                                }
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+
                 /* LOG session countdown banner. During a session the box
                    is in LOG mode and doesn't advertise — Scan returns
                    nothing — so the user needs a visible "wait this long"
@@ -1124,7 +1164,8 @@ impl AppState {
                     // list). iOS/Android parity (2d001a4).
                     let worker_busy = self.sync.ble_dl_in_flight
                         || self.sync.ble_sync_pending
-                        || !self.sync.ble_dl_queue.is_empty();
+                        || !self.sync.ble_dl_queue.is_empty()
+                        || self.sync.ble_flash_progress.is_some();
                     if ui
                         .add_enabled(connected && !worker_busy, egui::Button::new("Refresh file list"))
                         .clicked()
@@ -1322,6 +1363,34 @@ impl AppState {
                         self.sync.ble_status = "disconnecting…".into();
                         push_log(&self.log, "ble: Disconnect requested".into());
                     }
+                    /* Firmware upload (dual-bank OTA). Picks a `.bin` and
+                       streams it over the same FileCmd characteristic as
+                       LIST/READ; the box verifies the SHA-256 on COMMIT,
+                       swaps banks, and reboots into the new firmware (the
+                       link drops — the user reconnects). Disabled while
+                       any other BLE op is in flight, since it claims the
+                       single-op worker slot for the whole upload. */
+                    if ui
+                        .add_enabled(
+                            connected && !worker_busy,
+                            egui::Button::new("Upload firmware"),
+                        )
+                        .on_hover_text(
+                            "Send a firmware .bin to the box over BLE. The box verifies \
+                             the image (SHA-256), swaps to the inactive flash bank, and \
+                             reboots into the new firmware — the connection drops, then \
+                             reconnect. The current firmware is untouched unless the \
+                             upload fully succeeds.",
+                        )
+                        .clicked()
+                    {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("firmware", &["bin"])
+                            .pick_file()
+                        {
+                            self.sync.start_firmware_upload(&p);
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !self.sync.ble_status.is_empty() {
                             /* Selectable so the user can copy error text
@@ -1411,6 +1480,47 @@ impl AppState {
                                     fmt_b(total_bytes),
                                     (frac * 100.0) as u32,
                                 )),
+                        );
+                    }
+                    /* Firmware-upload progress bar + result line. Shown
+                       while an upload is in flight and after it finishes
+                       (the result message persists until the next
+                       action). The box reboots on success, so the bar
+                       disappears with the link drop while the message
+                       stays. */
+                    if let Some((done, total)) = self.sync.ble_flash_progress {
+                        let frac = if total > 0 {
+                            (done as f32 / total as f32).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(360.0)
+                                .text(format!(
+                                    "Firmware {} / {} kB ({}%)",
+                                    (done + 1023) / 1024,
+                                    (total + 1023) / 1024,
+                                    (frac * 100.0) as u32,
+                                )),
+                        );
+                        // Keep repainting so the bar advances even when
+                        // the mouse is idle during the multi-minute upload.
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                    if !self.sync.ble_flash_msg.is_empty() {
+                        ui.add_space(2.0);
+                        let is_err = self.sync.ble_flash_msg.contains("failed")
+                            || self.sync.ble_flash_msg.contains("Can't")
+                            || self.sync.ble_flash_msg.contains("empty");
+                        ui.colored_label(
+                            if is_err {
+                                egui::Color32::from_rgb(225, 90, 90)
+                            } else {
+                                egui::Color32::from_rgb(120, 200, 140)
+                            },
+                            &self.sync.ble_flash_msg,
                         );
                     }
                     if let Some(err) = self.sync.ble_delete_err.clone() {
@@ -2441,6 +2551,16 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--agent") {
         std::process::exit(agent::run());
+    }
+    /* Headless one-shot firmware upload (`--flash-firmware <path.bin>`).
+       Like --agent, returns before any eframe/egui/winit code so no
+       window is created. */
+    if let Some(pos) = args.iter().position(|a| a == "--flash-firmware") {
+        let Some(path) = args.get(pos + 1) else {
+            eprintln!("--flash-firmware: missing <path.bin> argument");
+            std::process::exit(2);
+        };
+        std::process::exit(agent::flash(std::path::Path::new(path)));
     }
     // Autostart (de)registration entry points — invoked in a clean
     // child by the updater/agent so the login item always points at

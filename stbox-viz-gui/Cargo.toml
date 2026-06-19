@@ -1,6 +1,6 @@
 [package]
 name = "movement-logger"
-version = "0.0.28"
+version = "0.0.29"
 edition = "2021"
 description = "MovementLogger — drag-and-drop GUI front-end for stbox-viz animate. SensorTile.box pumpfoil session video generator."
 license = "GPL-3.0-only"
@@ -36,6 +36,12 @@ btleplug = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 futures = "0.3"
 uuid = "1"
+
+# SHA-256 of the firmware `.bin` for the BLE OTA flow: the box verifies
+# this digest on FW_COMMIT before swapping banks, so an image corrupted
+# in transit is rejected rather than bricking the box. Same digest the
+# release flow publishes alongside firmware-vX.Y.Z.bin.
+sha2 = "0.10"
 
 # In-app updater: hits the GitHub Releases API on startup, and when the
 # user clicks "Update now" on macOS downloads the notarized DMG, swaps

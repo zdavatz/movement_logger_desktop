@@ -225,6 +225,121 @@ fn run_session(
     drain_log(log, seen);
 }
 
+/// Headless one-shot firmware upload (`MovementLogger --flash-firmware
+/// <path.bin>`). Scans for the configured box (or the first box seen),
+/// connects, streams the image over BLE, and prints progress to stdout.
+/// Returns a process exit code (0 = sent + box rebooting, non-zero =
+/// error). Self-contained — drives the same `SyncCore` / `BleBackend`
+/// the GUI does (with a no-op `SyncHost`), so the wire protocol and
+/// single-op semantics are identical.
+pub fn flash(path: &std::path::Path) -> i32 {
+    if !path.exists() {
+        eprintln!("[flash] firmware file not found: {}", path.display());
+        return 2;
+    }
+
+    let cfg = AgentConfig::load();
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut seen = 0usize;
+
+    let mut sc = SyncCore::default();
+    sc.log = log.clone();
+    sc.ble_connected_id = cfg.box_id.clone();
+
+    let b = BleBackend::spawn();
+    // Bounded reconnect is fine for a one-shot — a flash is single-op and
+    // short; if the link is too flaky to start we just fail out.
+    b.send(BleCmd::Scan);
+    sc.ble = Some(b);
+    sc.ble_state = BleState::Scanning;
+
+    let mut host = NoopHost;
+    let mut last_scan = Instant::now();
+    let started = Instant::now();
+    let deadline = Duration::from_secs(600); // generous: ~2 KB/s, big image
+    let mut sent = false;
+    let mut last_pct = u64::MAX;
+
+    eprintln!("[flash] uploading {} — scanning for box…", path.display());
+
+    loop {
+        if started.elapsed() > deadline {
+            eprintln!("[flash] timed out");
+            teardown(&sc);
+            drain_log(&log, &mut seen);
+            return 1;
+        }
+        sc.pump_ble_events(&mut host);
+        drain_log(&log, &mut seen);
+
+        match sc.ble_state {
+            BleState::Idle | BleState::Scanning if sc.ble.is_some() => {
+                if let Some(d) = choose(&sc.ble_devices, &cfg.box_id) {
+                    let id = d.id.clone();
+                    sc.ble_connected_id = Some(id.clone());
+                    if let Some(b) = sc.ble.as_ref() {
+                        b.send(BleCmd::Connect(id));
+                    }
+                    sc.ble_state = BleState::Connecting;
+                    eprintln!("[flash] connecting…");
+                } else if last_scan.elapsed() >= RESCAN_INTERVAL {
+                    if let Some(b) = sc.ble.as_ref() {
+                        b.send(BleCmd::Scan);
+                    }
+                    sc.ble_state = BleState::Scanning;
+                    last_scan = Instant::now();
+                }
+            }
+            BleState::Connected => {
+                if !sent {
+                    sc.start_firmware_upload(path);
+                    sent = true;
+                    if sc.ble_flash_progress.is_none() {
+                        // start_firmware_upload rejected it (printed via
+                        // ble_flash_msg) — bail.
+                        eprintln!("[flash] {}", sc.ble_flash_msg);
+                        teardown(&sc);
+                        drain_log(&log, &mut seen);
+                        return 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Progress / terminal-state reporting off the SyncCore fields the
+        // event pump maintains.
+        if let Some((done, total)) = sc.ble_flash_progress {
+            let pct = if total > 0 { done * 100 / total } else { 0 };
+            if pct != last_pct {
+                last_pct = pct;
+                eprintln!("[flash] {pct}% ({done}/{total} B)");
+            }
+        } else if sent {
+            // Upload finished (progress cleared on Done/Error). The
+            // message distinguishes success from failure.
+            let ok = !(sc.ble_flash_msg.contains("failed")
+                || sc.ble_flash_msg.contains("Can't")
+                || sc.ble_flash_msg.contains("empty"));
+            eprintln!("[flash] {}", sc.ble_flash_msg);
+            teardown(&sc);
+            drain_log(&log, &mut seen);
+            return if ok { 0 } else { 1 };
+        }
+
+        std::thread::sleep(TICK);
+    }
+}
+
+/// Clean BLE teardown shared by the flash one-shot.
+fn teardown(sc: &SyncCore) {
+    if let Some(b) = sc.ble.as_ref() {
+        b.request_abort();
+        b.send(BleCmd::Disconnect);
+        std::thread::sleep(TEARDOWN_GRACE);
+    }
+}
+
 /// Sleep in short slices so a stop signal is honoured promptly.
 fn sleep_or_stop(stop: &Arc<AtomicBool>, total: Duration) {
     let mut left = total;

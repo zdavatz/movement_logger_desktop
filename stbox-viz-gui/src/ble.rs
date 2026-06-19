@@ -30,6 +30,17 @@
 //!   0x07 GET_MODE             — replies one byte 0=auto / 1=manual
 //!   0x08 SET_TIME <epoch64_LE> — host wall-clock ms; box stamps a `# SYNC`
 //!                               anchor into the open Sens/Gps CSVs (no RTC)
+//!   0x09 FW_BEGIN  <len32_LE><sha256:32> — open a firmware-update session
+//!                               (erases the inactive bank, ~1 s). Reply: 1
+//!                               byte 0x00 ready / 0xB0 busy / 0xE6 too-big /
+//!                               0xE5 erase-fail / 0xE3 bad-request.
+//!   0x0A FW_DATA   <off32_LE><bytes…> — one image chunk. Reply: 4-byte LE
+//!                               next-expected offset (ACK) or 1-byte error
+//!                               (0xE7 bad-seq / 0xE5 flash-fail).
+//!   0x0B FW_COMMIT — verify SHA-256, swap banks, RESET. Reply: 1 byte 0xA0
+//!                               OK (link drops ~200 ms later) / 0xE4 hash-
+//!                               mismatch / 0xE7 short-image / 0xE5 flash-fail.
+//!   0x0C FW_ABORT  — cancel the session. Reply: 1 byte 0x00.
 //!
 //!   Status bytes: 0x00 OK, 0xB0 BUSY, 0xE1 NOT_FOUND, 0xE2 IO_ERROR, 0xE3 BAD_REQ.
 
@@ -122,6 +133,38 @@ const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(60);
 const LINK_OP_TIMEOUT: Duration = Duration::from_secs(12);
 
 // ---------------------------------------------------------------------------
+//  Firmware-update (OTA) tuning
+// ---------------------------------------------------------------------------
+
+/// FileCmd opcodes for the firmware-update flow. Same characteristic /
+/// reply path as LIST/READ/DELETE — the box keeps the single-op model
+/// (a concurrent op is rejected with 0xB0 BUSY). See the module-doc
+/// opcode list and `Core/Src/ble_filesync.c`.
+const OP_FW_BEGIN:  u8 = 0x09;
+const OP_FW_DATA:   u8 = 0x0A;
+const OP_FW_COMMIT: u8 = 0x0B;
+const OP_FW_ABORT:  u8 = 0x0C;
+
+/// Bytes of image per FW_DATA chunk (the write is `1 + 4 + FW_CHUNK` =
+/// 165 B, safely under any negotiated MTU — btleplug doesn't expose the
+/// negotiated value, so a fixed conservative size is simplest. The
+/// protocol is offset-addressed, so the chunk size doesn't affect
+/// correctness, only throughput).
+const FW_CHUNK: usize = 160;
+
+/// FW_BEGIN erases the inactive flash bank (~1 s) before replying, so it
+/// needs a longer ceiling than a normal op. FW_COMMIT verifies the hash,
+/// swaps banks, and resets — its reply (0xA0) may never arrive because
+/// the link drops first, which we treat as success.
+const FW_BEGIN_TIMEOUT:  Duration = Duration::from_secs(8);
+const FW_COMMIT_TIMEOUT: Duration = Duration::from_secs(8);
+/// Per-chunk ACK wait. On timeout we resend the SAME offset (the box is
+/// idempotent for offset < its write cursor) up to `FW_DATA_RETRIES`
+/// times before failing the whole upload.
+const FW_DATA_TIMEOUT: Duration = Duration::from_secs(5);
+const FW_DATA_RETRIES: u32 = 5;
+
+// ---------------------------------------------------------------------------
 //  Public command / event API
 // ---------------------------------------------------------------------------
 
@@ -173,6 +216,15 @@ pub enum BleCmd {
     /// Sent on every connect; *fire-and-forget* (no FileData reply tracked —
     /// legacy firmware silently ignores 0x08).
     SetTime { epoch_ms: u64 },
+    /// Upload a firmware `.bin` to the box over BLE (dual-bank OTA).
+    /// `bytes` is the EXACT file content; the worker computes the
+    /// SHA-256, sends FW_BEGIN / a stream of FW_DATA chunks / FW_COMMIT,
+    /// and emits `FlashStarted` / `FlashProgress` / `FlashDone` /
+    /// `FlashError`. Drives the same single-op `CurrentOp` slot as READ,
+    /// so it's rejected while another op is in flight (and rejects other
+    /// ops while it runs). On success the box swaps banks + reboots —
+    /// the link drops and the user reconnects into the new firmware.
+    FlashFirmware { bytes: Arc<Vec<u8>> },
 }
 
 #[derive(Clone, Debug)]
@@ -213,6 +265,21 @@ pub enum BleEvent {
     /// connected to a PumpLogger firmware that exposes the SensorStream
     /// characteristic; legacy PumpTsueri builds never produce this event.
     Sample(LiveSample),
+    /// A firmware upload has started (FW_BEGIN accepted; the box erased
+    /// its inactive bank). `total` is the image byte length.
+    FlashStarted { total: u64 },
+    /// Firmware-upload progress — `bytes_done` of `total` image bytes
+    /// have been written + ACKed by the box.
+    FlashProgress { bytes_done: u64, total: u64 },
+    /// The firmware upload finished: FW_COMMIT succeeded (0xA0) or the
+    /// link dropped right after COMMIT. The box is rebooting into the
+    /// new firmware — the user should reconnect in a few seconds. A
+    /// `Disconnected` typically follows shortly after.
+    FlashDone,
+    /// The firmware upload failed (mapped error string). The session was
+    /// aborted (FW_ABORT best-effort); the box keeps its current
+    /// firmware (the bank swap only happens on a verified COMMIT).
+    FlashError { msg: String },
 }
 
 /// One decoded SensorStream snapshot. Mirrors the 46-byte packed layout
@@ -514,6 +581,16 @@ enum CurrentOp {
     /// (0 = auto, 1 = manual). Like Deleting, a stall just drops to Idle
     /// without reconnecting (legacy firmware never replies).
     GettingMode { last_progress: Instant },
+    /// Firmware upload in flight. Unlike the other ops, the flash is
+    /// driven *inline* by `flash_firmware` (it owns the notification
+    /// stream for its whole duration and reads each reply with its own
+    /// timeout/retry), so notifications never reach `handle_notification`
+    /// while this is set. The variant exists only as the single-op guard
+    /// (other commands are rejected with "another op is in flight") and a
+    /// `last_progress` slot for symmetry — the watchdog never fires for
+    /// it because `handle_command` doesn't return to the `select!` loop
+    /// until the flash completes.
+    Flashing { last_progress: Instant },
 }
 
 type NotifStream = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
@@ -637,6 +714,7 @@ impl WorkerState {
             BleCmd::SetLogMode { manual } => self.set_log_mode(manual).await,
             BleCmd::GetLogMode => self.get_log_mode().await,
             BleCmd::SetTime { epoch_ms } => self.set_time(epoch_ms).await,
+            BleCmd::FlashFirmware { bytes } => self.flash_firmware(bytes).await,
         }
     }
 
@@ -922,6 +1000,11 @@ impl WorkerState {
                 self.emit_err(format!("DELETE {name} aborted by disconnect"));
             }
             CurrentOp::GettingMode { .. } => {}
+            CurrentOp::Flashing { .. } => {
+                self.emit(BleEvent::FlashError {
+                    msg: "firmware upload aborted by disconnect".into(),
+                });
+            }
             CurrentOp::Idle => {}
         }
         self.notif_stream   = None;
@@ -1128,6 +1211,230 @@ impl WorkerState {
         self.op = CurrentOp::GettingMode { last_progress: Instant::now() };
     }
 
+    // ---------------- Firmware upload (OTA) --------------------------------
+
+    /// Pull the next FileData reply off the notification stream, draining
+    /// (and ignoring) any concurrent SensorStream notifies, with a
+    /// timeout. Used only by `flash_firmware`, which owns the stream for
+    /// the duration of the upload so notifications never reach
+    /// `handle_notification` while a flash is in flight. Returns:
+    /// - `Ok(Some(bytes))` — a FileData payload arrived,
+    /// - `Ok(None)`        — the stream closed (remote disconnect),
+    /// - `Err(())`         — `timeout` elapsed with no FileData reply.
+    async fn next_filedata(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, ()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(());
+            }
+            let Some(stream) = self.notif_stream.as_mut() else {
+                return Ok(None);
+            };
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(n)) => {
+                    if n.uuid == FILEDATA_UUID {
+                        return Ok(Some(n.value));
+                    }
+                    if n.uuid == STREAM_UUID {
+                        // Live-stream notify landed mid-flash — decode it
+                        // so the Live tab keeps ticking, then keep waiting
+                        // for the FileData reply we actually want.
+                        self.handle_stream_notification(&n.value);
+                    }
+                    // Any other characteristic — ignore, keep waiting.
+                }
+                Ok(None) => return Ok(None), // stream closed
+                Err(_) => return Err(()),    // timed out
+            }
+        }
+    }
+
+    /// Upload a firmware image to the box (dual-bank OTA). Sends
+    /// FW_BEGIN, streams FW_DATA chunks gated on the box's next-expected
+    /// offset ACK, then FW_COMMIT. Drives the single-op `CurrentOp` slot
+    /// (rejected while another op is in flight; rejects others while it
+    /// runs) but reads its replies *inline* off the notification stream
+    /// rather than through `handle_notification`, because each FW step is
+    /// a strict request→reply round-trip with its own timeout + retry —
+    /// the demuxed-notify model the other ops use doesn't fit a flow that
+    /// has to resend the same offset on a missed ACK. On any fatal error
+    /// it sends FW_ABORT best-effort and emits `FlashError`.
+    async fn flash_firmware(&mut self, bytes: Arc<Vec<u8>>) {
+        use sha2::{Digest, Sha256};
+
+        if !matches!(self.op, CurrentOp::Idle) {
+            self.emit(BleEvent::FlashError {
+                msg: "another op is in flight — wait or Disconnect".into(),
+            });
+            return;
+        }
+        if self.peripheral.is_none() {
+            self.emit(BleEvent::FlashError { msg: "not connected".into() });
+            return;
+        }
+        let image_len = bytes.len();
+        if image_len == 0 {
+            self.emit(BleEvent::FlashError { msg: "firmware file is empty".into() });
+            return;
+        }
+
+        // Claim the single-op slot for the whole upload.
+        self.op = CurrentOp::Flashing { last_progress: Instant::now() };
+
+        let sha = {
+            let mut h = Sha256::new();
+            h.update(bytes.as_slice());
+            h.finalize()
+        };
+
+        // --- FW_BEGIN: opcode + len(u32-LE) + sha256(32) = 37 bytes ----
+        let mut begin = Vec::with_capacity(37);
+        begin.push(OP_FW_BEGIN);
+        begin.extend_from_slice(&(image_len as u32).to_le_bytes());
+        begin.extend_from_slice(&sha);
+        if let Err(e) = self.write_cmd(&begin).await {
+            self.op = CurrentOp::Idle;
+            self.emit(BleEvent::FlashError { msg: format!("FW_BEGIN write: {e}") });
+            return;
+        }
+        match self.next_filedata(FW_BEGIN_TIMEOUT).await {
+            Ok(Some(v)) if v.first() == Some(&0x00) => { /* ready */ }
+            Ok(Some(v)) => {
+                let code = v.first().copied().unwrap_or(0);
+                self.op = CurrentOp::Idle;
+                self.abort_firmware().await;
+                self.emit(BleEvent::FlashError { msg: fw_begin_err(code) });
+                return;
+            }
+            Ok(None) => {
+                self.op = CurrentOp::Idle;
+                self.emit(BleEvent::FlashError {
+                    msg: "link dropped during FW_BEGIN".into(),
+                });
+                return;
+            }
+            Err(()) => {
+                self.op = CurrentOp::Idle;
+                self.abort_firmware().await;
+                self.emit(BleEvent::FlashError {
+                    msg: "FW_BEGIN timed out (bank erase) — try again".into(),
+                });
+                return;
+            }
+        }
+        self.emit(BleEvent::FlashStarted { total: image_len as u64 });
+
+        // --- FW_DATA: offset-gated chunk loop --------------------------
+        let mut offset = 0usize;
+        while offset < image_len {
+            let n = FW_CHUNK.min(image_len - offset);
+            let mut chunk = Vec::with_capacity(5 + n);
+            chunk.push(OP_FW_DATA);
+            chunk.extend_from_slice(&(offset as u32).to_le_bytes());
+            chunk.extend_from_slice(&bytes[offset..offset + n]);
+
+            let mut attempt = 0u32;
+            let next_off = loop {
+                if let Err(e) = self.write_cmd(&chunk).await {
+                    self.op = CurrentOp::Idle;
+                    self.abort_firmware().await;
+                    self.emit(BleEvent::FlashError {
+                        msg: format!("FW_DATA write at {offset}: {e}"),
+                    });
+                    return;
+                }
+                match self.next_filedata(FW_DATA_TIMEOUT).await {
+                    Ok(Some(v)) if v.len() == 4 => {
+                        // 4-byte LE next-expected offset ACK.
+                        break u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as usize;
+                    }
+                    Ok(Some(v)) => {
+                        // 1-byte error (0xE7 bad-seq / 0xE5 flash-fail).
+                        let code = v.first().copied().unwrap_or(0);
+                        self.op = CurrentOp::Idle;
+                        self.abort_firmware().await;
+                        self.emit(BleEvent::FlashError { msg: fw_data_err(code) });
+                        return;
+                    }
+                    Ok(None) => {
+                        self.op = CurrentOp::Idle;
+                        self.emit(BleEvent::FlashError {
+                            msg: format!("link dropped during FW_DATA at {offset} B"),
+                        });
+                        return;
+                    }
+                    Err(()) => {
+                        // Missed ACK — resend the SAME offset (the box is
+                        // idempotent for offset < its write cursor).
+                        attempt += 1;
+                        if attempt >= FW_DATA_RETRIES {
+                            self.op = CurrentOp::Idle;
+                            self.abort_firmware().await;
+                            self.emit(BleEvent::FlashError {
+                                msg: format!(
+                                    "FW_DATA timed out at {offset} B after {attempt} retries"
+                                ),
+                            });
+                            return;
+                        }
+                        // loop → resend this chunk
+                    }
+                }
+            };
+            // The box drives the cursor: jump to whatever offset it
+            // reports next (normally offset + n; on a resent-after-ACK
+            // race it may already be ahead, which is fine).
+            offset = next_off.max(offset + n).min(image_len);
+            if let CurrentOp::Flashing { last_progress } = &mut self.op {
+                *last_progress = Instant::now();
+            }
+            self.emit(BleEvent::FlashProgress {
+                bytes_done: offset as u64,
+                total: image_len as u64,
+            });
+        }
+
+        // --- FW_COMMIT: verify hash, swap banks, RESET -----------------
+        if let Err(e) = self.write_cmd(&[OP_FW_COMMIT]).await {
+            self.op = CurrentOp::Idle;
+            self.emit(BleEvent::FlashError { msg: format!("FW_COMMIT write: {e}") });
+            return;
+        }
+        match self.next_filedata(FW_COMMIT_TIMEOUT).await {
+            // 0xA0 OK, or the link dropping right after COMMIT (the box
+            // resets ~200 ms after replying) — both mean success.
+            Ok(Some(v)) if v.first() == Some(&0xA0) => {
+                self.op = CurrentOp::Idle;
+                self.emit(BleEvent::FlashDone);
+            }
+            Ok(None) => {
+                self.op = CurrentOp::Idle;
+                self.emit(BleEvent::FlashDone);
+            }
+            Ok(Some(v)) => {
+                let code = v.first().copied().unwrap_or(0);
+                self.op = CurrentOp::Idle;
+                self.emit(BleEvent::FlashError { msg: fw_commit_err(code) });
+            }
+            Err(()) => {
+                // No reply — the box may have already reset (link still
+                // nominally up on the host side). Treat as success: the
+                // bank swap only happens on a verified image, so a silent
+                // COMMIT means the image was accepted and the box rebooted.
+                self.op = CurrentOp::Idle;
+                self.emit(BleEvent::FlashDone);
+            }
+        }
+    }
+
+    /// Best-effort FW_ABORT (one byte 0x00 reply, which we don't wait
+    /// for). Used on every fatal path so a half-open update session on
+    /// the box is closed cleanly rather than blocking the next attempt.
+    async fn abort_firmware(&self) {
+        let _ = self.write_cmd(&[OP_FW_ABORT]).await;
+    }
+
     // ---------------- Notification dispatch --------------------------------
 
     async fn handle_notification(&mut self, n: ValueNotification) {
@@ -1255,6 +1562,13 @@ impl WorkerState {
                 self.op = CurrentOp::Idle;
                 return;
             }
+            CurrentOp::Flashing { .. } => {
+                /* The flash drives the stream inline (see `flash_firmware`
+                   / `next_filedata`), so a FileData reply never reaches
+                   here while a flash is in flight. If one somehow did
+                   (stray late notify), ignore it and keep the op so the
+                   in-flight upload isn't disturbed. */
+            }
         }
 
         // If we didn't already replace `self.op` above (i.e. op didn't
@@ -1364,6 +1678,10 @@ impl WorkerState {
             CurrentOp::Reading  { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::Deleting { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingMode { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
+            // A flash is driven inline and never yields to the watchdog
+            // (its own per-step timeouts cover stalls), so it's never
+            // "stale" here.
+            CurrentOp::Flashing { .. } => false,
             CurrentOp::Idle => false,
         };
         if !stale { return false; }
@@ -1414,6 +1732,9 @@ impl WorkerState {
                 // reconnect — there's nothing wrong with the link.
                 false
             }
+            // Unreachable in practice (the flash never yields here), but
+            // matched for exhaustiveness — no reconnect.
+            CurrentOp::Flashing { .. } => false,
             CurrentOp::Idle => false,
         }
     }
@@ -1446,4 +1767,37 @@ fn parse_list_row(line: &[u8]) -> Option<(String, u64)> {
 
 fn is_status_byte(b: u8) -> bool {
     matches!(b, 0xB0 | 0xE1 | 0xE2 | 0xE3)
+}
+
+/// Map a FW_BEGIN error byte to a user-facing message.
+fn fw_begin_err(code: u8) -> String {
+    let why = match code {
+        0xB0 => "box busy (logging in progress — STOP_LOG / wait first)",
+        0xE6 => "image too big for the firmware bank",
+        0xE5 => "flash erase failed",
+        0xE3 => "bad request (firmware doesn't support OTA?)",
+        _    => "unknown error",
+    };
+    format!("FW_BEGIN rejected: {why} (0x{code:02X})")
+}
+
+/// Map a FW_DATA error byte to a user-facing message.
+fn fw_data_err(code: u8) -> String {
+    let why = match code {
+        0xE7 => "bad sequence/offset",
+        0xE5 => "flash write failed",
+        _    => "unknown error",
+    };
+    format!("FW_DATA rejected: {why} (0x{code:02X})")
+}
+
+/// Map a FW_COMMIT error byte to a user-facing message.
+fn fw_commit_err(code: u8) -> String {
+    let why = match code {
+        0xE4 => "image rejected (hash mismatch — re-download the .bin)",
+        0xE7 => "short image (fewer bytes received than declared)",
+        0xE5 => "flash finalize failed",
+        _    => "unknown error",
+    };
+    format!("FW_COMMIT rejected: {why} (0x{code:02X})")
 }
