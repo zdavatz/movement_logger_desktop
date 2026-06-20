@@ -544,6 +544,17 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
                     }
                 }
             }
+
+            // A log-mode change requested mid-LIST/READ was deferred so the
+            // firmware's SET_MODE OK-status byte couldn't corrupt the
+            // in-flight download (see `set_log_mode`). Apply it now that the
+            // worker is idle; the UI already shows the chosen mode.
+            if let Some(manual) = state.pending_set_mode {
+                if matches!(state.op, CurrentOp::Idle) && state.peripheral.is_some() {
+                    state.pending_set_mode = None;
+                    state.write_set_mode(manual).await;
+                }
+            }
         } else {
             // Not connected: only commands matter. arx.recv() returns
             // None when every BleBackend handle is dropped → process
@@ -629,6 +640,11 @@ struct WorkerState {
     last_id: Option<String>,
     /// "Keep synced" + abort flags, shared with the egui thread.
     shared: BleShared,
+    /// A log-mode change (SET_MODE) the user requested while the worker was
+    /// mid-LIST/READ. Deferred so the firmware's OK-status byte can't be
+    /// appended into the in-flight download; applied by the worker loop once
+    /// `op` returns to Idle.
+    pending_set_mode: Option<bool>,
 }
 
 impl WorkerState {
@@ -643,6 +659,7 @@ impl WorkerState {
             stream_capable: false,
             last_id: None,
             shared,
+            pending_set_mode: None,
         }
     }
 
@@ -727,8 +744,9 @@ impl WorkerState {
         }
         // 5-second window — long enough to see most peripherals on the
         // first advertising rotation; short enough that the user can
-        // re-scan without feeling stuck.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // re-scan without feeling stuck. Wake early on an abort (Disconnect
+        // / quit) so the command channel isn't stalled behind the scan.
+        self.sleep_or_abort(Duration::from_secs(5)).await;
         let _ = adapter.stop_scan().await;
 
         let peripherals = adapter.peripherals().await.unwrap_or_default();
@@ -1172,14 +1190,43 @@ impl WorkerState {
         )));
     }
 
-    /// SET_MODE (0x06) + 1-byte mode. Persisted on the box's SD card.
-    /// No FileData reply; we re-query with GET_MODE so the UI reflects
-    /// the box's actual persisted state rather than an optimistic guess.
+    /// SET_MODE (0x06) + 1-byte mode (0 = auto, 1 = manual), persisted to
+    /// LOGMODE.CFG on the box. The firmware honours it regardless of any
+    /// in-flight op and replies with a 1-byte OK status on FileData.
+    ///
+    /// We light the chosen Auto/Manual label *optimistically* (emit `LogMode`
+    /// at once) instead of reading the mode back here. The old code re-queried
+    /// with GET_MODE, but `get_log_mode` early-returns while the worker is busy
+    /// (`op != Idle`), so during a sync — exactly when a user wants Auto so the
+    /// box logs on power-on — no confirmation ever arrived and the label looked
+    /// dead (Peter's "kann den log mode im UX nicht auf auto umstellen"). The
+    /// box persists synchronously so the chosen value is authoritative; the
+    /// next connect's GET_MODE (`ListDone` reconcile) corrects the rare case
+    /// where the write was lost. Re-reading right after SET_MODE was also
+    /// unsafe: the OK-status byte (`0x00`) would be consumed by the
+    /// `GettingMode` arm as if it were the mode, so setting Manual read back as
+    /// Auto.
     async fn set_log_mode(&mut self, manual: bool) {
         if self.peripheral.is_none() {
             self.emit_err("not connected");
             return;
         }
+        self.emit(BleEvent::LogMode { manual });
+        if !matches!(self.op, CurrentOp::Idle) {
+            // Mid-LIST/READ: defer the 0x06 write so the firmware's OK-status
+            // byte can't land in the in-flight download stream. The worker
+            // loop applies it the instant `op` returns to Idle.
+            self.pending_set_mode = Some(manual);
+            return;
+        }
+        self.write_set_mode(manual).await;
+    }
+
+    /// Write SET_MODE (0x06) + mode byte. Fire-and-forget: no `CurrentOp`
+    /// slot (like `stop_log` / `set_time`), so the box's 1-byte OK status
+    /// lands harmlessly while `op == Idle` and never collides with a
+    /// GET_MODE read-back.
+    async fn write_set_mode(&mut self, manual: bool) {
         if let Err(e) = self.write_cmd(&[0x06, manual as u8]).await {
             self.emit_err(e);
             return;
@@ -1188,8 +1235,6 @@ impl WorkerState {
             "SET_MODE {} sent",
             if manual { "manual" } else { "auto" }
         )));
-        // Confirm by reading it back (GET_MODE → LogMode event).
-        self.get_log_mode().await;
     }
 
     /// GET_MODE (0x07). Box replies with one byte over FileData
@@ -1328,6 +1373,18 @@ impl WorkerState {
         // --- FW_DATA: offset-gated chunk loop --------------------------
         let mut offset = 0usize;
         while offset < image_len {
+            // Honour a Disconnect / quit promptly instead of running the whole
+            // upload to completion: the single-op worker can't service the
+            // command channel while this loop owns the stream, so without this
+            // a quit mid-OTA looked like a frozen UI until the image finished.
+            if self.abort_requested() {
+                self.op = CurrentOp::Idle;
+                self.abort_firmware().await;
+                self.emit(BleEvent::FlashError {
+                    msg: format!("firmware upload aborted at {offset} B"),
+                });
+                return;
+            }
             let n = FW_CHUNK.min(image_len - offset);
             let mut chunk = Vec::with_capacity(5 + n);
             chunk.push(OP_FW_DATA);

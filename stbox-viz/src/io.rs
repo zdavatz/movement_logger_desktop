@@ -126,16 +126,51 @@ pub fn load_sensor_csv(path: &Path) -> Result<Vec<SensorRow>> {
     let i_t_c = cols.idx_any(&["T ['C]", "t_C"])?;
 
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for (n, rec) in rdr.records().enumerate() {
-        let rec = rec.with_context(|| format!("row {}", n + 2))?;
-        out.push(SensorRow {
-            ticks: parse_f64(&rec[i_t])? / tick_div,
-            acc: [parse_f64(&rec[i_ax])?, parse_f64(&rec[i_ay])?, parse_f64(&rec[i_az])?],
-            gyro: [parse_f64(&rec[i_gx])?, parse_f64(&rec[i_gy])?, parse_f64(&rec[i_gz])?],
-            mag: [parse_f64(&rec[i_mx])?, parse_f64(&rec[i_my])?, parse_f64(&rec[i_mz])?],
-            pressure_hpa: parse_f64(&rec[i_p])?,
-            temperature_c: parse_f64(&rec[i_t_c])?,
-        });
+        // A torn write on the box — e.g. a power cut mid-row that leaves a
+        // stray fragment like a bare "5" — yields a short or non-numeric
+        // record. Skip it (with a warning) instead of failing the whole
+        // file's replay with `?`.
+        let row = (|| -> Option<SensorRow> {
+            let rec = rec.as_ref().ok()?;
+            Some(SensorRow {
+                ticks: parse_f64(rec.get(i_t)?).ok()? / tick_div,
+                acc: [
+                    parse_f64(rec.get(i_ax)?).ok()?,
+                    parse_f64(rec.get(i_ay)?).ok()?,
+                    parse_f64(rec.get(i_az)?).ok()?,
+                ],
+                gyro: [
+                    parse_f64(rec.get(i_gx)?).ok()?,
+                    parse_f64(rec.get(i_gy)?).ok()?,
+                    parse_f64(rec.get(i_gz)?).ok()?,
+                ],
+                mag: [
+                    parse_f64(rec.get(i_mx)?).ok()?,
+                    parse_f64(rec.get(i_my)?).ok()?,
+                    parse_f64(rec.get(i_mz)?).ok()?,
+                ],
+                pressure_hpa: parse_f64(rec.get(i_p)?).ok()?,
+                temperature_c: parse_f64(rec.get(i_t_c)?).ok()?,
+            })
+        })();
+        match row {
+            Some(r) => out.push(r),
+            None => {
+                skipped += 1;
+                if skipped <= 5 {
+                    eprintln!("io: {}: skipping malformed row {}", path.display(), n + 2);
+                }
+            }
+        }
+    }
+    if skipped > 0 {
+        eprintln!(
+            "io: {}: skipped {} malformed row(s) total",
+            path.display(),
+            skipped
+        );
     }
     Ok(out)
 }
@@ -162,20 +197,41 @@ pub fn load_gps_csv(path: &Path) -> Result<Vec<GpsRow>> {
     let i_hdp = cols.idx_any(&["HDOP", "hdop"])?;
 
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for (n, rec) in rdr.records().enumerate() {
-        let rec = rec.with_context(|| format!("row {}", n + 2))?;
-        out.push(GpsRow {
-            ticks: parse_f64(&rec[i_t])? / tick_div,
-            utc: rec[i_utc].to_string(),
-            lat: parse_f64(&rec[i_lat])?,
-            lon: parse_f64(&rec[i_lon])?,
-            alt_m: parse_f64(&rec[i_alt])?,
-            speed_kmh_module: parse_f64(&rec[i_spd])?,
-            course_deg: parse_f64(&rec[i_crs])?,
-            fix: parse_i32(&rec[i_fix])?,
-            num_sat: parse_i32(&rec[i_sat])?,
-            hdop: parse_f64(&rec[i_hdp])?,
-        });
+        // Skip torn/garbled rows (see load_sensor_csv) rather than failing
+        // the whole file's replay.
+        let row = (|| -> Option<GpsRow> {
+            let rec = rec.as_ref().ok()?;
+            Some(GpsRow {
+                ticks: parse_f64(rec.get(i_t)?).ok()? / tick_div,
+                utc: rec.get(i_utc)?.to_string(),
+                lat: parse_f64(rec.get(i_lat)?).ok()?,
+                lon: parse_f64(rec.get(i_lon)?).ok()?,
+                alt_m: parse_f64(rec.get(i_alt)?).ok()?,
+                speed_kmh_module: parse_f64(rec.get(i_spd)?).ok()?,
+                course_deg: parse_f64(rec.get(i_crs)?).ok()?,
+                fix: parse_i32(rec.get(i_fix)?).ok()?,
+                num_sat: parse_i32(rec.get(i_sat)?).ok()?,
+                hdop: parse_f64(rec.get(i_hdp)?).ok()?,
+            })
+        })();
+        match row {
+            Some(r) => out.push(r),
+            None => {
+                skipped += 1;
+                if skipped <= 5 {
+                    eprintln!("io: {}: skipping malformed row {}", path.display(), n + 2);
+                }
+            }
+        }
+    }
+    if skipped > 0 {
+        eprintln!(
+            "io: {}: skipped {} malformed row(s) total",
+            path.display(),
+            skipped
+        );
     }
     Ok(out)
 }
