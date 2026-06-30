@@ -35,6 +35,23 @@ On launch the GUI polls this repo's Releases API and, if a newer `vX.Y.Z` tag is
 
 > **Note for v0.0.1 users:** the in-app updater in v0.0.1 points at the wrong repository (a leftover from when this code lived inside `fp-sns-stbox1`). It will *not* find v0.0.2 automatically. Download v0.0.2 manually once; from that point on every future update is automatic.
 
+## Updating the box firmware (FOTA)
+
+MovementLogger can flash new SensorTile.box firmware **over BLE** — no cable, no STM32 programmer. The image is written to the box's *inactive* flash bank and only swapped in once it's fully verified, so the box stays bootable on its current firmware throughout and an interrupted upload is harmless.
+
+You can do it two ways:
+
+- **From the GUI** — connect to the box in the **Sync** tab, then use the firmware-upload button and pick the `.bin`.
+- **Headless from the command line:**
+
+  ```sh
+  MovementLogger --flash-firmware /path/to/firmware.bin
+  ```
+
+  No window opens. It connects to the box remembered in `~/.movementlogger/config.toml` (so the box must have been connected once from the GUI first — on macOS this is also what records the Bluetooth permission the headless run inherits), uploads the image, and prints progress to stderr. Exit code `0` = sent (box reboots into the new firmware), `1` = error/timeout, `2` = file missing.
+
+> **It's slow — that's normal.** BLE OTA is stop-and-wait (160-byte chunks, each waiting for the box to program it to flash and acknowledge before the next), so a ~100 kB image takes **roughly 20 minutes**. Leave it running; the box only switches to the new firmware after the whole image is uploaded and its SHA-256 checks out.
+
 ## Build from source
 
 ```sh

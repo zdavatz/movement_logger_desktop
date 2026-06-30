@@ -256,9 +256,15 @@ pub fn flash(path: &std::path::Path) -> i32 {
     let mut host = NoopHost;
     let mut last_scan = Instant::now();
     let started = Instant::now();
-    let deadline = Duration::from_secs(600); // generous: ~2 KB/s, big image
+    // Wall-clock ceiling for the whole pass (scan → connect → upload).
+    // Measured throughput on a slow link is ~90 B/s (≈1.7 s per 160 B
+    // chunk while each FW_DATA waits on its 4-byte ack), so a ~100 kB
+    // image needs ~20 min. 600 s timed out a real flash mid-stream;
+    // 2400 s leaves headroom for FW_DATA retries on a flaky link.
+    let deadline = Duration::from_secs(2400);
     let mut sent = false;
     let mut last_pct = u64::MAX;
+    let mut waiting_logged = false;
 
     eprintln!("[flash] uploading {} — scanning for box…", path.display());
 
@@ -316,8 +322,29 @@ pub fn flash(path: &std::path::Path) -> i32 {
                 eprintln!("[flash] {pct}% ({done}/{total} B)");
             }
         } else if sent {
-            // Upload finished (progress cleared on Done/Error). The
-            // message distinguishes success from failure.
+            // Progress cleared after we sent → terminal (FlashDone /
+            // FlashError) *or* a transient bounce. The shared Connected
+            // handler queues SET_TIME + LIST (and, after ListDone, a
+            // GET_MODE on a fresh connection) ahead of us; those hold the
+            // worker's single-op slot, so the first FlashFirmware can be
+            // rejected with "another op is in flight". That's transient —
+            // re-arm and retry until the connect-time ops drain (on a
+            // legacy box that never answers GET_MODE the slot self-frees
+            // after the worker's ~20 s op-idle watchdog). The 600 s
+            // deadline above bounds the retry loop.
+            if sc.ble_flash_msg.contains("another op is in flight") {
+                if !waiting_logged {
+                    eprintln!(
+                        "[flash] box busy with connect-time ops — waiting for the slot…"
+                    );
+                    waiting_logged = true;
+                }
+                sent = false; // let start_firmware_upload re-arm next pass
+                last_pct = u64::MAX;
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            // Upload finished. The message distinguishes success from failure.
             let ok = !(sc.ble_flash_msg.contains("failed")
                 || sc.ble_flash_msg.contains("Can't")
                 || sc.ble_flash_msg.contains("empty"));
