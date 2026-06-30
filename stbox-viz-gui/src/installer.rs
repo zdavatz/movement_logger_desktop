@@ -304,9 +304,6 @@ pub fn install_linux(url: &str, current_exe: &Path, tx: Sender<InstallEvent>) ->
     // the MovementLogger binary; stbox-viz lives next to it.
     let new_main = find_recursive(&extract_dir, "MovementLogger")
         .ok_or_else(|| "no MovementLogger binary in tarball".to_string())?;
-    let new_sidecar = new_main.parent().map(|d| d.join("stbox-viz"))
-        .filter(|p| p.is_file());
-
     let _ = tx.send(InstallEvent::Phase("Staging".into()));
     let pid = std::process::id();
     let parent = current_exe.parent().ok_or("no parent for current exe")?;
@@ -316,25 +313,25 @@ pub fn install_linux(url: &str, current_exe: &Path, tx: Sender<InstallEvent>) ->
     fs::copy(&new_main, &main_staging).map_err(|e| format!("stage main: {e}"))?;
     set_executable(&main_staging)?;
 
-    let sidecar_pair = if let Some(new_sc) = new_sidecar {
-        let cur_sc = parent.join("stbox-viz");
-        if cur_sc.is_file() {
-            let stage_sc = parent.join(format!(".stbox-viz.new.{pid}"));
-            let _ = fs::remove_file(&stage_sc);
-            fs::copy(&new_sc, &stage_sc).map_err(|e| format!("stage sidecar: {e}"))?;
-            set_executable(&stage_sc)?;
-            Some((cur_sc, stage_sc))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // Stage every sidecar CLI that ships next to MovementLogger and is
+    // present in both the new tarball and the current install.
+    let mut sidecar_pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for name in ["stbox-viz", "gps-debug"] {
+        let Some(new_sc) = new_main.parent().map(|d| d.join(name)).filter(|p| p.is_file())
+        else { continue };
+        let cur_sc = parent.join(name);
+        if !cur_sc.is_file() { continue; }
+        let stage_sc = parent.join(format!(".{name}.new.{pid}"));
+        let _ = fs::remove_file(&stage_sc);
+        fs::copy(&new_sc, &stage_sc).map_err(|e| format!("stage sidecar {name}: {e}"))?;
+        set_executable(&stage_sc)?;
+        sidecar_pairs.push((cur_sc, stage_sc));
+    }
 
     let _ = fs::remove_dir_all(&extract_dir);
 
     let _ = tx.send(InstallEvent::Phase("Scheduling install".into()));
-    spawn_linux_swap_helper(current_exe, &main_staging, sidecar_pair.as_ref())?;
+    spawn_linux_swap_helper(current_exe, &main_staging, &sidecar_pairs)?;
     let _ = tx.send(InstallEvent::Done);
     Ok(())
 }
@@ -343,7 +340,7 @@ pub fn install_linux(url: &str, current_exe: &Path, tx: Sender<InstallEvent>) ->
 fn spawn_linux_swap_helper(
     current_exe: &Path,
     main_staging: &Path,
-    sidecar: Option<&(PathBuf, PathBuf)>,
+    sidecars: &[(PathBuf, PathBuf)],
 ) -> Result<(), String> {
     stop_running_agent();
     let pid = std::process::id();
@@ -355,9 +352,11 @@ fn spawn_linux_swap_helper(
         pid
     ));
 
-    let sidecar_block = if let Some((cur_sc, stage_sc)) = sidecar {
-        let sc_bak = cur_sc.with_file_name(format!("stbox-viz.bak.{pid}"));
-        format!(
+    let mut sidecar_block = String::new();
+    for (cur_sc, stage_sc) in sidecars {
+        let fname = cur_sc.file_name().and_then(|s| s.to_str()).unwrap_or("sidecar");
+        let sc_bak = cur_sc.with_file_name(format!("{fname}.bak.{pid}"));
+        sidecar_block.push_str(&format!(
             "rm -f {sc_bak_q}\n\
              mv {cur_sc_q} {sc_bak_q} && mv {stage_sc_q} {cur_sc_q}\n\
              chmod +x {cur_sc_q} 2>/dev/null || true\n\
@@ -365,10 +364,8 @@ fn spawn_linux_swap_helper(
             sc_bak_q = shell_quote(&sc_bak),
             cur_sc_q = shell_quote(cur_sc),
             stage_sc_q = shell_quote(stage_sc),
-        )
-    } else {
-        String::new()
-    };
+        ));
+    }
 
     let script = format!(
         "#!/bin/bash\n\
@@ -450,9 +447,6 @@ pub fn install_windows(url: &str, current_exe: &Path, tx: Sender<InstallEvent>) 
 
     let new_main = find_recursive(&extract_dir, "MovementLogger.exe")
         .ok_or_else(|| "no MovementLogger.exe in zip".to_string())?;
-    let new_sidecar = new_main.parent().map(|d| d.join("stbox-viz.exe"))
-        .filter(|p| p.is_file());
-
     let _ = tx.send(InstallEvent::Phase("Staging".into()));
     let pid = std::process::id();
     let parent = current_exe.parent().ok_or("no parent for current exe")?;
@@ -461,24 +455,23 @@ pub fn install_windows(url: &str, current_exe: &Path, tx: Sender<InstallEvent>) 
     let _ = fs::remove_file(&main_staging);
     fs::copy(&new_main, &main_staging).map_err(|e| format!("stage main: {e}"))?;
 
-    let sidecar_pair = if let Some(new_sc) = new_sidecar {
-        let cur_sc = parent.join("stbox-viz.exe");
-        if cur_sc.is_file() {
-            let stage_sc = parent.join(format!("stbox-viz.exe.new.{pid}"));
-            let _ = fs::remove_file(&stage_sc);
-            fs::copy(&new_sc, &stage_sc).map_err(|e| format!("stage sidecar: {e}"))?;
-            Some((cur_sc, stage_sc))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // Stage every sidecar CLI present in both the new zip and the install.
+    let mut sidecar_pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for name in ["stbox-viz.exe", "gps-debug.exe"] {
+        let Some(new_sc) = new_main.parent().map(|d| d.join(name)).filter(|p| p.is_file())
+        else { continue };
+        let cur_sc = parent.join(name);
+        if !cur_sc.is_file() { continue; }
+        let stage_sc = parent.join(format!("{name}.new.{pid}"));
+        let _ = fs::remove_file(&stage_sc);
+        fs::copy(&new_sc, &stage_sc).map_err(|e| format!("stage sidecar {name}: {e}"))?;
+        sidecar_pairs.push((cur_sc, stage_sc));
+    }
 
     let _ = fs::remove_dir_all(&extract_dir);
 
     let _ = tx.send(InstallEvent::Phase("Scheduling install".into()));
-    spawn_windows_swap_helper(current_exe, &main_staging, sidecar_pair.as_ref())?;
+    spawn_windows_swap_helper(current_exe, &main_staging, &sidecar_pairs)?;
     let _ = tx.send(InstallEvent::Done);
     Ok(())
 }
@@ -487,15 +480,16 @@ pub fn install_windows(url: &str, current_exe: &Path, tx: Sender<InstallEvent>) 
 fn spawn_windows_swap_helper(
     current_exe: &Path,
     main_staging: &Path,
-    sidecar: Option<&(PathBuf, PathBuf)>,
+    sidecars: &[(PathBuf, PathBuf)],
 ) -> Result<(), String> {
     stop_running_agent();
     let pid = std::process::id();
     let helper = std::env::temp_dir().join(format!("movement_logger_install_{}.ps1", pid));
     let log = std::env::temp_dir().join(format!("movement_logger_install_{}.log", pid));
 
-    let sidecar_block = if let Some((cur_sc, stage_sc)) = sidecar {
-        format!(
+    let mut sidecar_block = String::new();
+    for (cur_sc, stage_sc) in sidecars {
+        sidecar_block.push_str(&format!(
             "$scOld = '{}.old'\n\
              if (Test-Path $scOld) {{ Remove-Item -LiteralPath $scOld -Force -ErrorAction SilentlyContinue }}\n\
              Move-Item -LiteralPath '{}' -Destination $scOld -Force\n\
@@ -505,10 +499,8 @@ fn spawn_windows_swap_helper(
             cur_sc.display(),
             stage_sc.display(),
             cur_sc.display(),
-        )
-    } else {
-        String::new()
-    };
+        ));
+    }
 
     // Windows lets you rename a running .exe (the open handle keeps the
     // old name's inode alive), but not delete it. So: rename current →

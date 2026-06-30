@@ -84,7 +84,7 @@ jobs:
           sudo apt-get install -y libxkbcommon-dev libfontconfig1-dev libgl1-mesa-dev libdbus-1-dev
 
       - name: cargo build --release
-        run: cargo build --release --target ${{ matrix.target }} -p stbox-viz -p movement-logger
+        run: cargo build --release --target ${{ matrix.target }} -p stbox-viz -p gps-debug -p movement-logger
 
       - name: resolve tag / version
         id: vars
@@ -106,6 +106,7 @@ jobs:
           stem="${{ steps.vars.outputs.stem }}"
           mkdir -p "dist/$stem"
           cp "target/${{ matrix.target }}/release/stbox-viz${{ matrix.binary-suffix }}"      "dist/$stem/"
+          cp "target/${{ matrix.target }}/release/gps-debug${{ matrix.binary-suffix }}"      "dist/$stem/"
           cp "target/${{ matrix.target }}/release/MovementLogger${{ matrix.binary-suffix }}" "dist/$stem/"
           cp README.md LICENSE "dist/$stem/" 2>/dev/null || true
 
@@ -124,9 +125,9 @@ jobs:
 
       # macOS .app bundle — wraps the GUI so Finder, Dock and Spotlight
       # pick up the icon and bundle metadata. Generates the .icns from
-      # the source PNG via the native iconutil tool. stbox-viz CLI is
-      # bundled into Contents/MacOS so MovementLogger's current_exe()-
-      # relative lookup finds it.
+      # the source PNG via the native iconutil tool. The stbox-viz +
+      # gps-debug CLIs are bundled into Contents/MacOS so MovementLogger's
+      # current_exe()-relative lookup finds them.
       - name: build macOS .app bundle
         if: contains(matrix.target, 'apple-darwin')
         shell: bash
@@ -150,8 +151,10 @@ jobs:
 
           mv "dist/${stem}/MovementLogger" "${app}/Contents/MacOS/MovementLogger"
           cp "dist/${stem}/stbox-viz"      "${app}/Contents/MacOS/stbox-viz"
+          cp "dist/${stem}/gps-debug"      "${app}/Contents/MacOS/gps-debug"
           chmod +x "${app}/Contents/MacOS/MovementLogger" \
-                   "${app}/Contents/MacOS/stbox-viz"
+                   "${app}/Contents/MacOS/stbox-viz" \
+                   "${app}/Contents/MacOS/gps-debug"
 
           sed "s/__VERSION__/${version}/g" stbox-viz-gui/assets/Info.plist.template \
             > "${app}/Contents/Info.plist"
@@ -209,6 +212,9 @@ jobs:
           codesign --force --options runtime --sign "$identity" \
             --entitlements stbox-viz-gui/entitlements.plist \
             "$app/Contents/MacOS/stbox-viz"
+          codesign --force --options runtime --sign "$identity" \
+            --entitlements stbox-viz-gui/entitlements.plist \
+            "$app/Contents/MacOS/gps-debug"
           codesign --force --options runtime --sign "$identity" \
             --entitlements stbox-viz-gui/entitlements.plist \
             --deep "$app"

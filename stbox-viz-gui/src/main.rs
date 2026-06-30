@@ -59,6 +59,7 @@ enum Tab {
     Live,
     Sync,
     Replay,
+    Gps,
 }
 
 impl Default for Tab {
@@ -137,6 +138,23 @@ struct AppState {
     running: Arc<AtomicBool>,
     /// Last subprocess exit status, displayed in the status bar.
     last_status: Option<RunStatus>,
+
+    // ----- GPS Debug tab (gps-debug sidecar) ---------------------------
+    /// Serial port of the u-blox under test (e.g. /dev/cu.usbserial-XXXX).
+    gps_dbg_port: String,
+    /// Baud as a string so the field is free-typed; parsed on Start
+    /// (fallback 38400, the box's MAX-M10S rate).
+    gps_dbg_baud: String,
+    /// Run label — into the CSV filenames + a column, for A/B antenna runs.
+    gps_dbg_label: String,
+    /// Live stdout/stderr from the `gps-debug` child. Separate `Arc` from
+    /// `self.log` so the antenna readout never interleaves with the
+    /// animate/BLE log.
+    gps_dbg_log: Arc<Mutex<Vec<String>>>,
+    /// Stop flag — flipped by the Stop button, polled by the reaper thread.
+    gps_dbg_cancel: Arc<AtomicBool>,
+    /// True while a `gps-debug` child is alive.
+    gps_dbg_running: Arc<AtomicBool>,
 
     /// Cached GPU texture for the top-right logo. Lazily uploaded on
     /// first frame so the egui context is available.
@@ -307,6 +325,22 @@ fn stbox_viz_path() -> PathBuf {
     // works if the binary is in the user's PATH — fine for `cargo run`
     // during development if cargo bin is on PATH, otherwise the user
     // sees the spawn failure in the log.
+    PathBuf::from(exe_name)
+}
+
+/// Locate the bundled `gps-debug` sidecar (next to MovementLogger), same
+/// strategy as `stbox_viz_path`: prefer the binary sitting beside us, fall
+/// back to a PATH lookup (works under `cargo run` when target/debug is on PATH).
+fn gps_debug_path() -> PathBuf {
+    let exe_name = if cfg!(windows) { "gps-debug.exe" } else { "gps-debug" };
+    if let Ok(my_exe) = std::env::current_exe() {
+        if let Some(dir) = my_exe.parent() {
+            let candidate = dir.join(exe_name);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
     PathBuf::from(exe_name)
 }
 
@@ -608,6 +642,8 @@ impl AppState {
                 ..Default::default()
             },
             log,
+            gps_dbg_baud: "38400".to_string(),
+            gps_dbg_label: "antenna".to_string(),
             update_rx: Some(spawn_update_check()),
             update_checking: true,
             ..Self::default()
@@ -1696,6 +1732,239 @@ impl AppState {
     /// and per-device buttons that don't fit nicely above a 6-row
     /// readout). The 0.5 Hz cadence is fixed in firmware, so this
     /// panel updates exactly twice a second.
+    /// "GPS Debug" tab: drive the bundled `gps-debug` sidecar against a
+    /// u-blox on a serial port and stream its live readout into a panel.
+    /// For antenna selection + mounting evaluation — fix quality,
+    /// per-signal C/N0, RF/antenna health. CSVs land in a `gps-debug`
+    /// subfolder of the configured save dir.
+    fn ui_gps_debug_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("GPS Debug");
+        ui.label(
+            egui::RichText::new(
+                "Live u-blox UBX diagnostics for antenna selection + mounting: fix \
+                 quality (DOP, accuracy), per-signal C/N0, and RF/antenna health \
+                 (antStatus, AGC, jamming). Polls the receiver once a second and \
+                 writes CSVs. Read-only — it never reconfigures the receiver.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(180)),
+        );
+        ui.add_space(6.0);
+
+        let running = self.gps_dbg_running.load(Ordering::SeqCst);
+
+        egui::Grid::new("gps_dbg_form")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Serial port");
+                ui.add_enabled(
+                    !running,
+                    egui::TextEdit::singleline(&mut self.gps_dbg_port)
+                        .hint_text("/dev/cu.usbserial-XXXX  ·  /dev/ttyACM0  ·  COM3")
+                        .desired_width(340.0),
+                );
+                ui.end_row();
+                ui.label("Baud");
+                ui.add_enabled(
+                    !running,
+                    egui::TextEdit::singleline(&mut self.gps_dbg_baud).desired_width(100.0),
+                );
+                ui.end_row();
+                ui.label("Label");
+                ui.add_enabled(
+                    !running,
+                    egui::TextEdit::singleline(&mut self.gps_dbg_label)
+                        .hint_text("antenna-A")
+                        .desired_width(200.0),
+                );
+                ui.end_row();
+            });
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("▶ Start"))
+                .clicked()
+            {
+                self.start_gps_debug();
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("■ Stop"))
+                .clicked()
+            {
+                self.gps_dbg_cancel.store(true, Ordering::SeqCst);
+            }
+            if running {
+                ui.spinner();
+                ui.colored_label(egui::Color32::LIGHT_GREEN, "polling…");
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!running, egui::Button::new("Clear log"))
+                    .clicked()
+                {
+                    if let Ok(mut v) = self.gps_dbg_log.lock() {
+                        v.clear();
+                    }
+                }
+            });
+        });
+
+        ui.label(
+            egui::RichText::new(
+                "Find the port:  ls /dev/cu.*  (macOS)   ·   ls /dev/ttyACM* /dev/ttyUSB*  \
+                 (Linux).   Baud 38400 matches the box's MAX-M10S; a bare module is often 9600.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(150)),
+        );
+
+        ui.separator();
+
+        // ----- live output panel (monospace, auto-scroll) ------------
+        let row_h = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
+        let avail_h = ui.available_height().max(row_h * 4.0);
+        let rows = (avail_h / row_h) as usize;
+        egui::ScrollArea::vertical()
+            .max_height(avail_h)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                let lines = self
+                    .gps_dbg_log
+                    .lock()
+                    .map(|v| v.clone())
+                    .unwrap_or_default();
+                let mut owned = lines.join("\n");
+                ui.add(
+                    egui::TextEdit::multiline(&mut owned)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(rows.max(4))
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
+
+        // Keep the UI ticking while the child streams so new lines render
+        // without waiting on a mouse/keyboard event.
+        if running {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Spawn the `gps-debug` sidecar with the current form values and pump
+    /// its stdout/stderr into `gps_dbg_log`. Mirrors the animate-run worker:
+    /// two pipe-reader threads → mpsc → log, plus a reaper that honours the
+    /// Stop flag (`gps_dbg_cancel`) and clears `gps_dbg_running` on exit.
+    fn start_gps_debug(&mut self) {
+        if self.gps_dbg_running.load(Ordering::SeqCst) {
+            return;
+        }
+        let port = self.gps_dbg_port.trim().to_string();
+        if port.is_empty() {
+            push_log(
+                &self.gps_dbg_log,
+                "error: enter a serial port first \
+                 (e.g. /dev/cu.usbserial-XXXX, /dev/ttyACM0, COM3)."
+                    .into(),
+            );
+            return;
+        }
+        let baud: u32 = self.gps_dbg_baud.trim().parse().unwrap_or(38400);
+        let label = {
+            let l = self.gps_dbg_label.trim();
+            if l.is_empty() { "antenna".to_string() } else { l.to_string() }
+        };
+        // CSVs go into a `gps-debug` subfolder of the configured save dir.
+        let out_dir = match resolve_save_dir(&self.sync.ble_out_dir) {
+            Ok(abs) => abs.join("gps-debug"),
+            Err(_) => self.sync.ble_out_dir.join("gps-debug"),
+        };
+        let _ = std::fs::create_dir_all(&out_dir);
+
+        let exe = gps_debug_path();
+        let mut cmd = Command::new(&exe);
+        cmd.arg("--port").arg(&port)
+            .arg("--baud").arg(baud.to_string())
+            .arg("--label").arg(&label)
+            .arg("--output").arg(&out_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        push_log(
+            &self.gps_dbg_log,
+            format!(
+                "$ {} --port {} --baud {} --label {} --output {}",
+                exe.display(), port, baud, label, out_dir.display()
+            ),
+        );
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                push_log(
+                    &self.gps_dbg_log,
+                    format!(
+                        "error: failed to spawn gps-debug: {e}. \
+                         Make sure it sits next to MovementLogger or is on PATH."
+                    ),
+                );
+                return;
+            }
+        };
+
+        self.gps_dbg_cancel.store(false, Ordering::SeqCst);
+        self.gps_dbg_running.store(true, Ordering::SeqCst);
+        let log = self.gps_dbg_log.clone();
+        let cancel = self.gps_dbg_cancel.clone();
+        let running = self.gps_dbg_running.clone();
+
+        let (tx, rx) = mpsc::channel::<String>();
+        if let Some(out) = child.stdout.take() {
+            let tx = tx.clone();
+            thread::spawn(move || pump_pipe(out, tx));
+        }
+        if let Some(err) = child.stderr.take() {
+            let tx = tx.clone();
+            thread::spawn(move || pump_pipe(err, tx));
+        }
+        drop(tx);
+
+        thread::spawn(move || {
+            for line in rx {
+                push_log(&log, line);
+            }
+            let mut cancelled = false;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let msg = if cancelled {
+                            "--- stopped ---".to_string()
+                        } else if status.success() {
+                            "--- done ---".to_string()
+                        } else {
+                            format!("--- exited with {status} ---")
+                        };
+                        push_log(&log, msg);
+                        break;
+                    }
+                    Ok(None) => {
+                        if cancel.load(Ordering::SeqCst) && !cancelled {
+                            let _ = child.kill();
+                            cancelled = true;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        push_log(&log, format!("error: try_wait failed: {e}"));
+                        break;
+                    }
+                }
+            }
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
     fn ui_live_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Live");
         ui.label(
@@ -2093,6 +2362,7 @@ impl eframe::App for AppState {
                     (Tab::Live,   "Live"),
                     (Tab::Sync,   "Sync"),
                     (Tab::Replay, "Replay"),
+                    (Tab::Gps,    "GPS Debug"),
                 ] {
                     let selected = self.current_tab == tab;
                     // SelectableLabel gives us the standard egui
@@ -2117,6 +2387,7 @@ impl eframe::App for AppState {
             match self.current_tab {
                 Tab::Live   => { self.ui_live_tab(ui);   return; }
                 Tab::Sync   => { self.ui_sync_tab(ui);   return; }
+                Tab::Gps    => { self.ui_gps_debug_tab(ui); return; }
                 Tab::Replay => { /* fall through to original layout */ }
             }
 

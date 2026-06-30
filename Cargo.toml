@@ -4,6 +4,7 @@ members = [
     "stbox-viz",
     "stbox-viz-gui",
     "usb-console",
+    "gps-debug",
 ]
 exclude = [
     # Vendored, patched winit fork pulled in via [patch.crates-io] from

@@ -1,0 +1,18 @@
+[package]
+name = "gps-debug"
+version = "0.0.32"
+edition = "2021"
+description = "Live UBX diagnostics readout from a u-blox receiver — antenna + mounting evaluation for the MovementLogger box. Ships next to MovementLogger as a sidecar."
+
+[[bin]]
+name = "gps-debug"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+# serialport with default-features off drops the Linux `libudev` system dep
+# (we open the port by an explicit --port path, no enumeration needed).
+serialport = { version = "4", default-features = false }
+ctrlc = "3"
