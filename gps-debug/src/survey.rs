@@ -257,22 +257,10 @@ fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
+/// Serial-transport entry point (the `gps-debug` CLI and the GUI's USB mode).
+/// Opens the named serial port, installs a Ctrl-C stop, and drives the
+/// transport-agnostic [`run_core`] with stdout as the status sink.
 pub fn run(args: &SurveyArgs) -> Result<()> {
-    std::fs::create_dir_all(args.out_dir)
-        .with_context(|| format!("mkdir {}", args.out_dir.display()))?;
-    let safe_label: String = args.label.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    let epoch_path: PathBuf = args.out_dir.join(format!("{safe_label}_gnss_epoch.csv"));
-    let sig_path: PathBuf = args.out_dir.join(format!("{safe_label}_gnss_signals.csv"));
-
-    let mut epoch_w = BufWriter::new(std::fs::File::create(&epoch_path)
-        .with_context(|| format!("create {}", epoch_path.display()))?);
-    let mut sig_w = BufWriter::new(std::fs::File::create(&sig_path)
-        .with_context(|| format!("create {}", sig_path.display()))?);
-    writeln!(epoch_w, "label,host_iso,iTOW_ms,utc_date,utc_time,timeValid,fixType,gnssFixOK,numSV_used,lat_deg,lon_deg,height_m,hMSL_m,hAcc_m,vAcc_m,sAcc_mps,pDOP,hDOP,vDOP,antStatus,antPower,noisePerMS,agcCnt,cwSuppression_jamInd,jammingState")?;
-    writeln!(sig_w, "label,host_iso,iTOW_ms,gnssId,gnss,svId,sigId,sig,cno_dbhz,elev_deg,azim_deg,qualityInd,svUsed,prUsed,prRes_m")?;
-
     let mut port = serialport::new(args.port, args.baud)
         .timeout(Duration::from_millis(50))
         .open()
@@ -288,9 +276,45 @@ pub fn run(args: &SurveyArgs) -> Result<()> {
     }
 
     println!("gnss-survey: polling {} @ {} baud — label '{}'", args.port, args.baud, args.label);
-    println!("  epoch  -> {}", epoch_path.display());
-    println!("  signals-> {}", sig_path.display());
-    println!("  Ctrl-C to stop.\n");
+    run_core(&mut port, args.out_dir, args.label, args.duration_s, stop,
+             &mut |line| println!("{line}"))
+}
+
+/// Transport-agnostic survey loop. `transport` is anything that reads UBX
+/// bytes and accepts UBX poll writes — a `serialport` handle over USB, or a
+/// BLE bridge that tunnels the same bytes through the box (see the GUI's
+/// `BleTransport`). Writes the two CSVs into `out_dir` and emits one live
+/// summary line per epoch through `on_status` (stdout for the CLI, the log
+/// panel for the GUI). Runs until `stop` is set or `duration_s` elapses.
+///
+/// The `transport` read contract matches `serialport`: return `Ok(0)` or a
+/// `TimedOut` error when no bytes are ready within a short (~50 ms) window so
+/// the collect loop can re-check `stop` instead of blocking indefinitely.
+pub fn run_core<T: Read + Write>(
+    transport: &mut T,
+    out_dir: &Path,
+    label: &str,
+    duration_s: Option<f64>,
+    stop: Arc<AtomicBool>,
+    on_status: &mut dyn FnMut(String),
+) -> Result<()> {
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("mkdir {}", out_dir.display()))?;
+    let safe_label: String = label.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let epoch_path: PathBuf = out_dir.join(format!("{safe_label}_gnss_epoch.csv"));
+    let sig_path: PathBuf = out_dir.join(format!("{safe_label}_gnss_signals.csv"));
+
+    let mut epoch_w = BufWriter::new(std::fs::File::create(&epoch_path)
+        .with_context(|| format!("create {}", epoch_path.display()))?);
+    let mut sig_w = BufWriter::new(std::fs::File::create(&sig_path)
+        .with_context(|| format!("create {}", sig_path.display()))?);
+    writeln!(epoch_w, "label,host_iso,iTOW_ms,utc_date,utc_time,timeValid,fixType,gnssFixOK,numSV_used,lat_deg,lon_deg,height_m,hMSL_m,hAcc_m,vAcc_m,sAcc_mps,pDOP,hDOP,vDOP,antStatus,antPower,noisePerMS,agcCnt,cwSuppression_jamInd,jammingState")?;
+    writeln!(sig_w, "label,host_iso,iTOW_ms,gnssId,gnss,svId,sigId,sig,cno_dbhz,elev_deg,azim_deg,qualityInd,svUsed,prUsed,prRes_m")?;
+
+    on_status(format!("epoch  -> {}", epoch_path.display()));
+    on_status(format!("signals-> {}", sig_path.display()));
 
     let polls = [NAV_PVT, NAV_DOP, NAV_SAT, NAV_SIG, MON_RF];
     let mut parser = UbxParser::default();
@@ -299,28 +323,28 @@ pub fn run(args: &SurveyArgs) -> Result<()> {
     let mut n_epochs: u64 = 0;
 
     while !stop.load(Ordering::SeqCst) {
-        if let Some(d) = args.duration_s {
+        if let Some(d) = duration_s {
             if start.elapsed().as_secs_f64() >= d { break; }
         }
 
         // Fire all polls for this second.
         for &m in &polls {
-            if let Err(e) = port.write_all(&poll_frame(m)) {
-                return Err(anyhow!("serial write failed: {e}"));
+            if let Err(e) = transport.write_all(&poll_frame(m)) {
+                return Err(anyhow!("transport write failed: {e}"));
             }
         }
-        let _ = port.flush();
+        let _ = transport.flush();
 
         // Collect replies for ~900 ms; keep the latest of each type.
         let mut ep = Epoch::default();
         let mut frames: Vec<(u8, u8, Vec<u8>)> = Vec::new();
         let window = Instant::now() + Duration::from_millis(900);
         while Instant::now() < window {
-            match port.read(&mut buf) {
+            match transport.read(&mut buf) {
                 Ok(0) => {}
                 Ok(n) => for &byte in &buf[..n] { parser.push(byte, &mut frames); },
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => return Err(anyhow!("serial read failed: {e}")),
+                Err(e) => return Err(anyhow!("transport read failed: {e}")),
             }
             for (cls, id, pl) in frames.drain(..) {
                 match (cls, id) {
@@ -335,16 +359,14 @@ pub fn run(args: &SurveyArgs) -> Result<()> {
             if stop.load(Ordering::SeqCst) { break; }
         }
 
-        write_epoch(&mut epoch_w, &mut sig_w, args.label, &ep)?;
+        write_epoch(&mut epoch_w, &mut sig_w, label, &ep)?;
         epoch_w.flush()?;
         sig_w.flush()?;
         n_epochs += 1;
-        print_live(&ep);
+        on_status(live_summary(&ep));
     }
 
-    println!("\ngnss-survey: stopped after {} epoch(s).", n_epochs);
-    println!("  {}", epoch_path.display());
-    println!("  {}", sig_path.display());
+    on_status(format!("stopped after {n_epochs} epoch(s)."));
     Ok(())
 }
 
@@ -409,7 +431,9 @@ fn write_epoch(
     Ok(())
 }
 
-fn print_live(ep: &Epoch) {
+/// One-line human-readable summary of an epoch — fed to `on_status` so the
+/// CLI can print it and the GUI can append it to the live log panel.
+fn live_summary(ep: &Epoch) -> String {
     let max_cno = ep.sigs.iter().map(|s| s.cno).chain(ep.sats.iter().map(|s| s.cno)).max().unwrap_or(0);
     let used = ep.sigs.iter().filter(|s| s.pr_used).count()
         .max(ep.sats.iter().filter(|s| s.sv_used).count());
@@ -418,14 +442,53 @@ fn print_live(ep: &Epoch) {
             let (astat, apow, jam) = rf.as_ref()
                 .map(|r| (ant_status_name(r.ant_status), ant_power_name(r.ant_power), jamming_name(r.jamming_state)))
                 .unwrap_or(("?", "?", "?"));
-            println!(
+            format!(
                 "{:02}:{:02}:{:02} fix={} ok={} sv={:2} used={:2} maxCN0={:2} hAcc={:.1}m pDOP={:.1} | ant={}/{} jam={}",
                 p.hour, p.min, p.sec, p.fix_type, p.gnss_fix_ok as u8,
                 p.num_sv, used, max_cno, p.hacc_m, p.pdop, astat, apow, jam,
-            );
+            )
         }
-        (None, _) => println!("(no NAV-PVT reply — check port/baud; receiver may be NMEA-only or wrong device)"),
+        (None, _) => "(no NAV-PVT reply — check port/baud; receiver may be NMEA-only or wrong device)".to_string(),
     }
+}
+
+/// Enumerate likely u-blox serial ports for the host, best-guess and
+/// non-invasive (no port is opened). macOS exposes USB-CDC/USB-serial
+/// adapters as `/dev/cu.usbserial-*` / `/dev/cu.usbmodem-*` (plus the common
+/// SiLabs/CH34x vendor names); Linux as `/dev/ttyACM*` / `/dev/ttyUSB*`.
+/// Windows enumeration needs the registry and isn't done here — the user
+/// types `COMx` (rare to have more than one). Returned paths are sorted and
+/// ready to pass straight to `--port`.
+pub fn detect_ports() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    let (dir, matches): (&str, fn(&str) -> bool) = ("/dev", |n| {
+        n.starts_with("cu.usbserial")
+            || n.starts_with("cu.usbmodem")
+            || n.starts_with("cu.SLAB_USBtoUART")
+            || n.starts_with("cu.wchusbserial")
+    });
+    #[cfg(target_os = "linux")]
+    let (dir, matches): (&str, fn(&str) -> bool) = ("/dev", |n| {
+        n.starts_with("ttyACM") || n.starts_with("ttyUSB")
+    });
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let (dir, matches): (&str, fn(&str) -> bool) = ("", |_| false);
+
+    if !dir.is_empty() {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for ent in rd.flatten() {
+                if let Some(name) = ent.file_name().to_str() {
+                    if matches(name) {
+                        out.push(format!("{dir}/{name}"));
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 #[cfg(test)]

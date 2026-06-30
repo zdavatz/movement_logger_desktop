@@ -9,10 +9,9 @@
 //! summary to stdout. Read-only: it only *polls*, never reconfigures the
 //! receiver. See `survey.rs` for the field list + wire details.
 
-mod survey;
-
 use anyhow::Result;
 use clap::Parser;
+use gps_debug::survey;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -23,9 +22,13 @@ use std::path::PathBuf;
 )]
 struct Cli {
     /// Serial port of the u-blox: e.g. /dev/cu.usbserial-XXXX (macOS),
-    /// /dev/ttyACM0 or /dev/ttyUSB0 (Linux), COM3 (Windows).
+    /// /dev/ttyACM0 or /dev/ttyUSB0 (Linux), COM3 (Windows). Omit to
+    /// auto-detect — works when exactly one candidate port is present.
     #[arg(long)]
-    port: String,
+    port: Option<String>,
+    /// List the auto-detected candidate serial ports and exit.
+    #[arg(long)]
+    list_ports: bool,
     /// Serial baud rate. The box configures the MAX-M10S at 38400; a bare
     /// module defaults to 9600. Ignored over native USB-CDC.
     #[arg(long, default_value_t = 38400)]
@@ -44,8 +47,43 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    let detected = survey::detect_ports();
+    if cli.list_ports {
+        if detected.is_empty() {
+            println!("no candidate serial ports found");
+            println!("  hint: ls /dev/cu.* (macOS)  ·  ls /dev/ttyACM* /dev/ttyUSB* (Linux)");
+        } else {
+            for p in &detected {
+                println!("{p}");
+            }
+        }
+        return Ok(());
+    }
+
+    // Explicit --port wins; otherwise auto-detect, which only succeeds when
+    // there's exactly one candidate (zero or many is ambiguous → ask).
+    let port = match cli.port {
+        Some(p) => p,
+        None => match detected.as_slice() {
+            [one] => {
+                eprintln!("gps-debug: auto-detected serial port {one}");
+                one.clone()
+            }
+            [] => anyhow::bail!(
+                "no --port given and no serial port auto-detected\n\
+                 hint: ls /dev/cu.* (macOS)  ·  ls /dev/ttyACM* /dev/ttyUSB* (Linux)"
+            ),
+            many => anyhow::bail!(
+                "no --port given and {} candidate ports found — pass one of:\n  {}",
+                many.len(),
+                many.join("\n  ")
+            ),
+        },
+    };
+
     survey::run(&survey::SurveyArgs {
-        port: &cli.port,
+        port: &port,
         baud: cli.baud,
         out_dir: &cli.output,
         label: &cli.label,

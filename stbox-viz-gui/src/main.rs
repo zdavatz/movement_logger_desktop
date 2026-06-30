@@ -66,6 +66,18 @@ impl Default for Tab {
     fn default() -> Self { Tab::Live }
 }
 
+/// Transport for the GPS Debug survey. **USB** spawns the `gps-debug`
+/// sidecar against a serial port (the long-standing path). **BLE** runs the
+/// same UBX survey in-process, tunnelling the u-blox UART through the box's
+/// existing BLE link (firmware GPS-bridge opcode) — no cable, no opening the
+/// box. Defaults to USB so the proven path is the landing default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum GpsTransport {
+    #[default]
+    Usb,
+    Ble,
+}
+
 /// Number of recent SensorStream samples held for the Live tab's
 /// running time-series chart. At the 0.5 Hz spec cadence this is the
 /// last ~4 minutes; plenty to spot drift / oscillation without holding
@@ -140,6 +152,12 @@ struct AppState {
     last_status: Option<RunStatus>,
 
     // ----- GPS Debug tab (gps-debug sidecar) ---------------------------
+    /// USB serial port vs BLE bridge. See [`GpsTransport`].
+    gps_dbg_transport: GpsTransport,
+    /// Last serial-port auto-detect scan (macOS `/dev/cu.usb*`, Linux
+    /// `/dev/ttyACM*` etc.). Filled by the Detect button; drives the port
+    /// dropdown so the user rarely has to type `/dev/cu.usbserial-XXXX`.
+    gps_dbg_detected_ports: Vec<String>,
     /// Serial port of the u-blox under test (e.g. /dev/cu.usbserial-XXXX).
     gps_dbg_port: String,
     /// Baud as a string so the field is free-typed; parsed on Start
@@ -550,6 +568,53 @@ fn pump_pipe<R: std::io::Read + Send + 'static>(r: R, tx: mpsc::Sender<String>) 
     }
 }
 
+/// `Read + Write` adapter that lets `gps_debug::run_core` drive a GPS survey
+/// over the box's BLE link instead of a serial port. Writes are forwarded as
+/// `BleCmd::GpsTx` (UBX poll frames → box → u-blox UART); reads drain the raw
+/// bridged UBX bytes the worker forwards from FileData notifies. `read`
+/// blocks up to ~50 ms then returns `Ok(0)`, matching the serial transport's
+/// timeout contract so the survey's collect loop stays responsive to its stop
+/// flag. A notify can exceed the caller's buffer only in theory (BLE MTU ≪ 2
+/// kB), but `leftover` keeps the adapter correct regardless.
+struct BleTransport {
+    cmd: mpsc::Sender<BleCmd>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    leftover: Vec<u8>,
+}
+
+impl BleTransport {
+    fn new(cmd: mpsc::Sender<BleCmd>, rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self { cmd, rx, leftover: Vec::new() }
+    }
+}
+
+impl std::io::Read for BleTransport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.leftover.is_empty() {
+            match self.rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(bytes) => self.leftover = bytes,
+                // Timeout → "no data this window" (Ok(0), like serial);
+                // Disconnected → the worker dropped the sink (bridge off).
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.leftover.len());
+        buf[..n].copy_from_slice(&self.leftover[..n]);
+        self.leftover.drain(..n);
+        Ok(n)
+    }
+}
+
+impl std::io::Write for BleTransport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.cmd
+            .send(BleCmd::GpsTx { bytes: buf.to_vec() })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
 // ---------------------------------------------------------------------------
 //  egui app
 // ---------------------------------------------------------------------------
@@ -644,6 +709,14 @@ impl AppState {
             log,
             gps_dbg_baud: "38400".to_string(),
             gps_dbg_label: "antenna".to_string(),
+            // Pre-fill the serial port from a one-shot scan so the common
+            // single-adapter case needs no typing; the Detect button
+            // re-scans on demand.
+            gps_dbg_port: {
+                let ports = gps_debug::detect_ports();
+                ports.first().cloned().unwrap_or_default()
+            },
+            gps_dbg_detected_ports: gps_debug::detect_ports(),
             update_rx: Some(spawn_update_check()),
             update_checking: true,
             ..Self::default()
@@ -1753,24 +1826,86 @@ impl AppState {
 
         let running = self.gps_dbg_running.load(Ordering::SeqCst);
 
+        // Transport: USB serial cable vs the box's BLE link.
+        ui.horizontal(|ui| {
+            ui.label("Transport");
+            ui.add_enabled_ui(!running, |ui| {
+                ui.selectable_value(&mut self.gps_dbg_transport, GpsTransport::Usb, "USB serial");
+                ui.selectable_value(&mut self.gps_dbg_transport, GpsTransport::Ble, "BLE (box bridge)");
+            });
+        });
+        ui.add_space(4.0);
+
         egui::Grid::new("gps_dbg_form")
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("Serial port");
-                ui.add_enabled(
-                    !running,
-                    egui::TextEdit::singleline(&mut self.gps_dbg_port)
-                        .hint_text("/dev/cu.usbserial-XXXX  ·  /dev/ttyACM0  ·  COM3")
-                        .desired_width(340.0),
-                );
-                ui.end_row();
-                ui.label("Baud");
-                ui.add_enabled(
-                    !running,
-                    egui::TextEdit::singleline(&mut self.gps_dbg_baud).desired_width(100.0),
-                );
-                ui.end_row();
+                if self.gps_dbg_transport == GpsTransport::Usb {
+                    ui.label("Serial port");
+                    ui.horizontal(|ui| {
+                        // Dropdown of auto-detected ports; falls back to free
+                        // text when none are found or the user wants another.
+                        let current = if self.gps_dbg_port.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            self.gps_dbg_port.clone()
+                        };
+                        ui.add_enabled_ui(!running, |ui| {
+                            egui::ComboBox::from_id_salt("gps_dbg_port_combo")
+                                .selected_text(current)
+                                .width(300.0)
+                                .show_ui(ui, |ui| {
+                                    for p in &self.gps_dbg_detected_ports {
+                                        ui.selectable_value(&mut self.gps_dbg_port, p.clone(), p);
+                                    }
+                                });
+                            if ui.button("🔄 Detect").on_hover_text(
+                                "Re-scan for u-blox serial ports (macOS /dev/cu.usb*, Linux ttyACM*/ttyUSB*)",
+                            ).clicked() {
+                                self.gps_dbg_detected_ports = gps_debug::detect_ports();
+                                match self.gps_dbg_detected_ports.as_slice() {
+                                    [] => push_log(&self.gps_dbg_log,
+                                        "detect: no serial ports found (is the cable plugged in?)".into()),
+                                    [one] => {
+                                        self.gps_dbg_port = one.clone();
+                                        push_log(&self.gps_dbg_log, format!("detect: {one}"));
+                                    }
+                                    many => {
+                                        if self.gps_dbg_port.is_empty() {
+                                            self.gps_dbg_port = many[0].clone();
+                                        }
+                                        push_log(&self.gps_dbg_log,
+                                            format!("detect: {} ports — {}", many.len(), many.join(", ")));
+                                    }
+                                }
+                            }
+                        });
+                    });
+                    ui.end_row();
+                    ui.label("");
+                    ui.add_enabled(
+                        !running,
+                        egui::TextEdit::singleline(&mut self.gps_dbg_port)
+                            .hint_text("…or type: /dev/cu.usbserial-XXXX · /dev/ttyACM0 · COM3")
+                            .desired_width(340.0),
+                    );
+                    ui.end_row();
+                    ui.label("Baud");
+                    ui.add_enabled(
+                        !running,
+                        egui::TextEdit::singleline(&mut self.gps_dbg_baud).desired_width(100.0),
+                    );
+                    ui.end_row();
+                } else {
+                    ui.label("Source");
+                    ui.label(
+                        egui::RichText::new(
+                            "the connected box (no cable — bridges the u-blox over BLE)",
+                        )
+                        .color(egui::Color32::from_gray(180)),
+                    );
+                    ui.end_row();
+                }
                 ui.label("Label");
                 ui.add_enabled(
                     !running,
@@ -1811,13 +1946,19 @@ impl AppState {
             });
         });
 
+        let hint = match self.gps_dbg_transport {
+            GpsTransport::Usb =>
+                "USB: 🔄 Detect auto-fills the port (macOS /dev/cu.usb*, Linux ttyACM*/ttyUSB*) \
+                 or type it. Baud 38400 matches the box's MAX-M10S; a bare module is often 9600.",
+            GpsTransport::Ble =>
+                "BLE: connect to the box in the Sync tab first, then Start — the survey tunnels \
+                 the u-blox over the box's link (no cable). Needs box firmware with the GPS-bridge \
+                 opcode; on older firmware you'll just see \"no NAV-PVT reply\".",
+        };
         ui.label(
-            egui::RichText::new(
-                "Find the port:  ls /dev/cu.*  (macOS)   ·   ls /dev/ttyACM* /dev/ttyUSB*  \
-                 (Linux).   Baud 38400 matches the box's MAX-M10S; a bare module is often 9600.",
-            )
-            .small()
-            .color(egui::Color32::from_gray(150)),
+            egui::RichText::new(hint)
+                .small()
+                .color(egui::Color32::from_gray(150)),
         );
 
         ui.separator();
@@ -1858,6 +1999,10 @@ impl AppState {
     /// Stop flag (`gps_dbg_cancel`) and clears `gps_dbg_running` on exit.
     fn start_gps_debug(&mut self) {
         if self.gps_dbg_running.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.gps_dbg_transport == GpsTransport::Ble {
+            self.start_gps_debug_ble();
             return;
         }
         let port = self.gps_dbg_port.trim().to_string();
@@ -1961,6 +2106,77 @@ impl AppState {
                     }
                 }
             }
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// BLE-transport GPS survey: runs the same `gps_debug::run_core` UBX
+    /// poll/parse loop in-process, but tunnels the u-blox UART through the
+    /// connected box's BLE link (firmware GPS-bridge opcode `0x0D`/`0x0E`) —
+    /// no cable, no opening the box. The box keeps logging NMEA to its SD
+    /// card; only UBX poll replies ride the bridge. Requires box firmware
+    /// with the bridge opcode; legacy firmware silently ignores it, so the
+    /// survey simply shows "no NAV-PVT reply".
+    fn start_gps_debug_ble(&mut self) {
+        if !matches!(self.sync.ble_state, BleState::Connected) {
+            push_log(
+                &self.gps_dbg_log,
+                "error: connect to the box in the Sync tab first — the BLE \
+                 survey tunnels the u-blox over the box's link."
+                    .into(),
+            );
+            return;
+        }
+        let label = {
+            let l = self.gps_dbg_label.trim();
+            if l.is_empty() { "antenna".to_string() } else { l.to_string() }
+        };
+        let out_dir = match resolve_save_dir(&self.sync.ble_out_dir) {
+            Ok(abs) => abs.join("gps-debug"),
+            Err(_) => self.sync.ble_out_dir.join("gps-debug"),
+        };
+        let _ = std::fs::create_dir_all(&out_dir);
+
+        let Some(ble) = self.sync.ble.as_ref() else {
+            push_log(&self.gps_dbg_log, "error: BLE backend not running.".into());
+            return;
+        };
+        // Point the worker's GPS-bridge sink at this survey, then turn the
+        // bridge on. `cmd` drives the survey's UBX poll writes; `cmd_off`
+        // tears the bridge down when the loop ends (the worker then drops
+        // the sink).
+        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>();
+        ble.set_gps_data_sink(Some(data_tx));
+        ble.send(BleCmd::GpsBridge { on: true });
+        let cmd = ble.cmd_sender();
+        let cmd_off = ble.cmd_sender();
+
+        push_log(
+            &self.gps_dbg_log,
+            format!(
+                "BLE GPS survey — bridging the u-blox over the box · label {label} · output {}",
+                out_dir.display()
+            ),
+        );
+
+        self.gps_dbg_cancel.store(false, Ordering::SeqCst);
+        self.gps_dbg_running.store(true, Ordering::SeqCst);
+        let log = self.gps_dbg_log.clone();
+        let stop = self.gps_dbg_cancel.clone();
+        let running = self.gps_dbg_running.clone();
+
+        thread::spawn(move || {
+            let mut transport = BleTransport::new(cmd, data_rx);
+            let res = gps_debug::run_core(
+                &mut transport, &out_dir, &label, None, stop,
+                &mut |line| push_log(&log, line),
+            );
+            if let Err(e) = res {
+                push_log(&log, format!("error: {e}"));
+            }
+            // Turn the bridge off — the worker drops the data sink.
+            let _ = cmd_off.send(BleCmd::GpsBridge { on: false });
+            push_log(&log, "--- stopped ---".into());
             running.store(false, Ordering::SeqCst);
         });
     }

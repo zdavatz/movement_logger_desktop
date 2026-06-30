@@ -1,6 +1,6 @@
 [package]
 name = "movement-logger"
-version = "0.0.32"
+version = "0.0.33"
 edition = "2021"
 description = "MovementLogger — drag-and-drop GUI front-end for stbox-viz animate. SensorTile.box pumpfoil session video generator."
 license = "GPL-3.0-only"
@@ -73,6 +73,12 @@ ctrlc = { version = "3", features = ["termination"] }
 # libsqlite dependency — keeps the build self-contained the same way
 # rustls-tls does for TLS.
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# The GPS-debug survey engine as a library: the GUI's "GPS Debug" tab runs
+# the same UBX poll/parse loop the standalone `gps-debug` sidecar uses, but
+# in-process over a BLE transport (the box bridges the u-blox UART over its
+# existing link). Also supplies serial-port auto-detect for the USB mode.
+gps-debug = { path = "../gps-debug" }
 
 # Build-time icon embedding for Windows .exe (so explorer / taskbar
 # show the MovementLogger icon without an MSIX wrapper). No-op on other

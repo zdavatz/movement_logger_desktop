@@ -225,6 +225,17 @@ pub enum BleCmd {
     /// ops while it runs). On success the box swaps banks + reboots —
     /// the link drops and the user reconnects into the new firmware.
     FlashFirmware { bytes: Arc<Vec<u8>> },
+    /// GPS bridge on/off (`0x0D` `<u8>` 1=on/0=off) for the GPS Debug tab's
+    /// BLE transport. While ON the box relays raw u-blox UBX frames over
+    /// FileData notifies (NMEA stays on the SD logger, undisturbed); the
+    /// worker routes those notifies to the GPS data sink instead of the
+    /// FileSync FSM. Fire-and-forget like `StopLog`/`SetTime` — no op slot,
+    /// no FileData reply (legacy firmware silently ignores 0x0D).
+    GpsBridge { on: bool },
+    /// Forward raw bytes to the u-blox over the bridge (`0x0E` + bytes).
+    /// The survey loop sends UBX poll frames this way; the box writes them
+    /// straight to the GPS UART. No-op unless a bridge is active.
+    GpsTx { bytes: Vec<u8> },
 }
 
 #[derive(Clone, Debug)]
@@ -379,6 +390,16 @@ impl LiveSample {
 struct BleShared {
     persist_reconnect: Arc<AtomicBool>,
     abort_reconnect:   Arc<AtomicBool>,
+    /// GPS-bridge mode (GPS Debug tab over BLE). While set, the box is
+    /// relaying raw u-blox UBX frames over FileData notifies, so the worker
+    /// routes those notifies to `gps_data_tx` instead of the FileSync FSM.
+    /// Kept here (not a `CurrentOp`) because the survey is a long-lived
+    /// unsolicited-notify stream, like SensorStream — not a single op.
+    gps_bridge:        Arc<AtomicBool>,
+    /// Where raw GPS-bridge bytes go while `gps_bridge` is set. The GUI
+    /// installs a sender when a BLE survey starts (`set_gps_data_sink`);
+    /// the worker clears it when the bridge is turned off.
+    gps_data_tx:       Arc<std::sync::Mutex<Option<Sender<Vec<u8>>>>>,
 }
 
 pub struct BleBackend {
@@ -404,6 +425,20 @@ impl BleBackend {
 
     pub fn send(&self, cmd: BleCmd) {
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// A clonable command sender, so the in-process BLE GPS survey thread can
+    /// push `GpsTx` poll frames without borrowing the whole backend.
+    pub fn cmd_sender(&self) -> Sender<BleCmd> {
+        self.cmd_tx.clone()
+    }
+
+    /// Install (or clear, with `None`) the sink that receives raw GPS-bridge
+    /// bytes while `BleCmd::GpsBridge { on: true }` is active. The GUI sets
+    /// this when a BLE survey starts; the worker also clears it when the
+    /// bridge is turned off.
+    pub fn set_gps_data_sink(&self, tx: Option<Sender<Vec<u8>>>) {
+        if let Ok(mut g) = self.shared.gps_data_tx.lock() { *g = tx; }
     }
 
     /// Mirror the GUI's "Keep synced" checkbox into the worker. Called
@@ -732,6 +767,8 @@ impl WorkerState {
             BleCmd::GetLogMode => self.get_log_mode().await,
             BleCmd::SetTime { epoch_ms } => self.set_time(epoch_ms).await,
             BleCmd::FlashFirmware { bytes } => self.flash_firmware(bytes).await,
+            BleCmd::GpsBridge { on } => self.gps_bridge(on).await,
+            BleCmd::GpsTx { bytes } => self.gps_tx(bytes).await,
         }
     }
 
@@ -1046,6 +1083,38 @@ impl WorkerState {
         p.write(&cmd_char, payload, WriteType::WithoutResponse)
             .await
             .map_err(|e| format!("write FileCmd: {e}"))
+    }
+
+    /// GPS bridge on/off (`0x0D <u8>`). Fire-and-forget (no op slot): the
+    /// box starts/stops relaying raw u-blox UBX frames over FileData. We
+    /// flip `shared.gps_bridge` so `handle_notification` routes those frames
+    /// to the GPS data sink, and drop the sink when turning the bridge off.
+    async fn gps_bridge(&mut self, on: bool) {
+        if self.peripheral.is_none() {
+            self.emit_err("not connected");
+            return;
+        }
+        if let Err(e) = self.write_cmd(&[0x0D, on as u8]).await {
+            self.emit_err(format!("GPS bridge {}: {e}", if on { "on" } else { "off" }));
+            return;
+        }
+        self.shared.gps_bridge.store(on, Ordering::SeqCst);
+        if !on {
+            if let Ok(mut g) = self.shared.gps_data_tx.lock() { *g = None; }
+        }
+    }
+
+    /// Forward raw bytes to the u-blox over the bridge (`0x0E` + bytes) — the
+    /// survey loop's UBX poll frames. No reply; the answers arrive as
+    /// bridged FileData notifies.
+    async fn gps_tx(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() { return; }
+        let mut payload = Vec::with_capacity(1 + bytes.len());
+        payload.push(0x0E);
+        payload.extend_from_slice(&bytes);
+        if let Err(e) = self.write_cmd(&payload).await {
+            self.emit_err(format!("GPS tx: {e}"));
+        }
     }
 
     async fn list(&mut self) {
@@ -1499,6 +1568,16 @@ impl WorkerState {
         // them on their own path before touching `op`.
         if n.uuid == STREAM_UUID {
             self.handle_stream_notification(&n.value);
+            return;
+        }
+        // GPS-bridge mode: FileData notifies carry raw u-blox UBX frames,
+        // not FileSync payloads. Hand them straight to the survey sink and
+        // never touch `op`. (The survey assumes you're not also syncing —
+        // both would land on FileData and corrupt each other.)
+        if n.uuid == FILEDATA_UUID && self.shared.gps_bridge.load(Ordering::SeqCst) {
+            if let Ok(g) = self.shared.gps_data_tx.lock() {
+                if let Some(tx) = g.as_ref() { let _ = tx.send(n.value.clone()); }
+            }
             return;
         }
         if n.uuid != FILEDATA_UUID { return; }
