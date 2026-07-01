@@ -2360,6 +2360,25 @@ impl AppState {
                 ));
                 ui.end_row();
 
+                ui.label(egui::RichText::new("GPS C/N0").strong());
+                if s.cn0_max > 0 {
+                    ui.label(format!("{} dB-Hz max", s.cn0_max));
+                    let (txt, col) = if s.cn0_max >= 40 {
+                        ("good antenna", egui::Color32::LIGHT_GREEN)
+                    } else if s.cn0_max >= 30 {
+                        ("ok", egui::Color32::LIGHT_YELLOW)
+                    } else {
+                        ("weak signal", egui::Color32::LIGHT_RED)
+                    };
+                    ui.colored_label(col, txt);
+                    ui.label("");
+                } else {
+                    ui.colored_label(egui::Color32::LIGHT_YELLOW, "no GSV / no data");
+                    ui.label("");
+                    ui.label("");
+                }
+                ui.end_row();
+
                 ui.label(egui::RichText::new("Flags").strong());
                 let flag_col = |on: bool| {
                     if on { egui::Color32::LIGHT_GREEN }
