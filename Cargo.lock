@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "gps-debug"
-version = "0.0.36"
+version = "0.0.37"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "movement-logger"
-version = "0.0.36"
+version = "0.0.37"
 dependencies = [
  "anyhow",
  "btleplug",
@@ -4023,7 +4023,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stbox-viz"
-version = "0.0.36"
+version = "0.0.37"
 dependencies = [
  "anyhow",
  "chrono",

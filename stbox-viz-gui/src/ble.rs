@@ -169,6 +169,38 @@ const RETRIEVE_MAX_FAILS: u32 = 3;
 /// genuinely dead link. (iOS documents this exact footgun.)
 const LINK_OP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Reconnect-scoped pending-connect hold (v0.0.37). CoreBluetooth's
+/// `connect()` has **no** intrinsic timeout — the reply resolves only when
+/// the box becomes connectable — so on the reconnect path we let ONE pending
+/// connect *ride* the box's fragile post-big-drop self-heal window instead of
+/// self-cancelling every `LINK_OP_TIMEOUT` and churning. Cancelling a pending
+/// connect while the box isn't advertising is a Mac-side no-op the box never
+/// sees, so the old 20 s-cancel-and-retry loop just went scan-blind after 3
+/// rounds and never caught the box when it *did* come back. Manual mode holds
+/// this long then voluntarily re-issues (Android holds 60 s); Auto mode holds
+/// unbounded (`None`) — exits only on connect success, user abort, or
+/// Keep-synced turned off. DISTINCT from `LINK_OP_TIMEOUT`, which still bounds
+/// discover/subscribe/notifications and the snappy manual first-connect.
+const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How `connect_core` issues the CoreBluetooth connect.
+#[derive(Clone, Copy)]
+enum ConnectMode {
+    /// First user-initiated connect: snappy — bound at `LINK_OP_TIMEOUT`,
+    /// cancel on our own timeout for fast UI feedback. Byte-identical to the
+    /// pre-v0.0.37 behaviour.
+    Manual,
+    /// Auto-reconnect: hold ONE pending connect. `budget: None` = unbounded
+    /// (Keep synced on); `Some(d)` = hold `d` then voluntarily re-issue.
+    /// Cancel only on a real abort or a Keep-synced-off demotion — never on
+    /// our own timeout.
+    Reconnect { budget: Option<Duration> },
+}
+
+/// Why a held reconnect connect stopped waiting.
+#[derive(PartialEq)]
+enum ConnectWait { Aborted, Demoted, Budget }
+
 // ---------------------------------------------------------------------------
 //  Firmware-update (OTA) tuning
 // ---------------------------------------------------------------------------
@@ -364,6 +396,8 @@ pub struct LiveSample {
     pub gps_fix_q: u8,
     /// Number of satellites used in the current fix.
     pub gps_nsat: u8,
+    /// Strongest satellite C/N0 in dB-Hz (from GSV); 0 = no data.
+    pub cn0_max: u8,
     /// True when the most-recent GPS fix is fresh (≤ 5 s old).
     pub gps_valid: bool,
     /// True when the firmware is also writing this snapshot to SD.
@@ -401,6 +435,7 @@ impl LiveSample {
             gps_course_cdeg: i16_at(40),
             gps_fix_q:       bytes[42],
             gps_nsat:        bytes[43],
+            cn0_max:         bytes[45],
             gps_valid:       flags & 0x01 != 0,
             low_battery:     flags & 0x02 != 0,
             logging_active:  flags & 0x04 != 0,
@@ -801,6 +836,36 @@ impl WorkerState {
         self.abort_requested()
     }
 
+    /// Runs concurrently with a held `p.connect()` on the reconnect path
+    /// (see `ConnectMode::Reconnect`). Returns the moment a user abort is
+    /// requested, Keep-synced is un-ticked during an unbounded hold, or the
+    /// budget elapses. `budget: None` waits forever (for abort/demote only).
+    /// 250 ms slices keep Disconnect/quit responsive even though the worker
+    /// can't service its command channel while inside `auto_reconnect`.
+    async fn connect_wait(&self, budget: Option<Duration>) -> ConnectWait {
+        let slice = Duration::from_millis(250);
+        let mut left = budget;
+        loop {
+            if self.abort_requested() { return ConnectWait::Aborted; }
+            // Keep-synced un-ticked mid-hold demotes an unbounded hold back to
+            // the bounded budget — the checkbox only mirrors the atomic (it
+            // does NOT call request_abort), so this poll is the only signal.
+            // auto_reconnect re-reads persist_reconnect at its loop top.
+            if budget.is_none() && !self.persist_reconnect() {
+                return ConnectWait::Demoted;
+            }
+            match &mut left {
+                Some(rem) if rem.is_zero() => return ConnectWait::Budget,
+                Some(rem) => {
+                    let step = (*rem).min(slice);
+                    tokio::time::sleep(step).await;
+                    *rem -= step;
+                }
+                None => tokio::time::sleep(slice).await,
+            }
+        }
+    }
+
     fn emit(&self, e: BleEvent) {
         let _ = self.evt_tx.send(e);
     }
@@ -902,7 +967,7 @@ impl WorkerState {
             self.emit_err("already connected — disconnect first");
             return;
         }
-        match self.connect_core(&id).await {
+        match self.connect_core(&id, ConnectMode::Manual).await {
             Ok(()) => {
                 self.last_id = Some(id);
                 // Hold the OS awake for the whole session (kept across any
@@ -920,7 +985,7 @@ impl WorkerState {
     /// presence). Returns Err(reason) instead of emitting an error, so
     /// the caller decides whether a failed attempt is fatal (manual
     /// Connect) or just one retry (auto-reconnect).
-    async fn connect_core(&mut self, id: &str) -> Result<(), String> {
+    async fn connect_core(&mut self, id: &str, mode: ConnectMode) -> Result<(), String> {
         let Some(adapter) = self.ensure_adapter().await else {
             return Err("no BLE adapter".into());
         };
@@ -932,18 +997,47 @@ impl WorkerState {
             .into_iter()
             .find(|x| x.id().to_string() == id)
             .ok_or_else(|| "peripheral gone — rescan".to_string())?;
-        // Bounded — see LINK_OP_TIMEOUT. On a connect timeout there may
-        // be a pending CoreBluetooth connect; drop_link cancels it so
-        // the next reconnect attempt doesn't fight a half-open link.
-        match tokio::time::timeout(LINK_OP_TIMEOUT, p.connect()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                drop_link(&p).await;
-                return Err(format!("connect: {e}"));
+        // The connect step. Manual = bounded + cancel-on-timeout (snappy UI).
+        // Reconnect = hold ONE pending CoreBluetooth connect and let it ride
+        // the box's post-drop self-heal; cancel (via drop_link →
+        // cancelPeripheralConnection) ONLY on abort/demote/budget, never on
+        // our own timeout. Everything after (discover/subscribe/notifications)
+        // stays bounded at LINK_OP_TIMEOUT regardless of mode.
+        match mode {
+            ConnectMode::Manual => {
+                match tokio::time::timeout(LINK_OP_TIMEOUT, p.connect()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        drop_link(&p).await;
+                        return Err(format!("connect: {e}"));
+                    }
+                    Err(_) => {
+                        drop_link(&p).await;
+                        return Err("connect: timed out".into());
+                    }
+                }
             }
-            Err(_) => {
-                drop_link(&p).await;
-                return Err("connect: timed out".into());
+            ConnectMode::Reconnect { budget } => {
+                // Disjoint borrows: p.connect() borrows the local p,
+                // connect_wait borrows &self. Resolves the instant the box
+                // becomes connectable — no self-cancel churn.
+                tokio::select! {
+                    r = p.connect() => match r {
+                        Ok(()) => {}
+                        Err(e) => {
+                            drop_link(&p).await;
+                            return Err(format!("connect: {e}"));
+                        }
+                    },
+                    w = self.connect_wait(budget) => {
+                        drop_link(&p).await; // the ONLY cancel path in reconnect mode
+                        return Err(match w {
+                            ConnectWait::Aborted => "connect: aborted".into(),
+                            ConnectWait::Demoted => "connect: keep-synced off".into(),
+                            ConnectWait::Budget  => "connect: budget".into(),
+                        });
+                    }
+                }
             }
         }
         match tokio::time::timeout(LINK_OP_TIMEOUT, p.discover_services()).await {
@@ -1075,7 +1169,12 @@ impl WorkerState {
     /// `p.connect()` with `LINK_OP_TIMEOUT`, which is our per-round
     /// pending-connect budget.
     #[cfg(target_os = "macos")]
-    async fn try_retrieve_connect(&mut self, adapter: &Adapter, id: &str) -> Result<(), String> {
+    async fn try_retrieve_connect(
+        &mut self,
+        adapter: &Adapter,
+        id: &str,
+        mode: ConnectMode,
+    ) -> Result<(), String> {
         let uuid = Uuid::parse_str(id).map_err(|e| format!("bad box id: {e}"))?;
         let pid: btleplug::platform::PeripheralId = uuid.into();
         adapter
@@ -1086,7 +1185,7 @@ impl WorkerState {
             "reconnect: retrieved box by id (no scan) — pending connect…".into(),
         ));
         eprintln!("[reconnect] retrieve-by-id OK for {id}; scan not required");
-        self.connect_core(id).await
+        self.connect_core(id, mode).await
     }
 
     async fn auto_reconnect(&mut self, id: String) -> bool {
@@ -1102,6 +1201,13 @@ impl WorkerState {
         loop {
             attempt += 1;
             let persist = self.persist_reconnect();
+            // Connect budget for this round: Auto (Keep synced on) holds one
+            // pending connect unbounded; Manual holds it RECONNECT_CONNECT_TIMEOUT
+            // then voluntarily re-issues. Rides the box's post-drop self-heal
+            // instead of self-cancelling every LINK_OP_TIMEOUT.
+            let mode = ConnectMode::Reconnect {
+                budget: if persist { None } else { Some(RECONNECT_CONNECT_TIMEOUT) },
+            };
             // Manual mode (or Keep-synced just turned off mid-loop):
             // honour the bounded budget and fall back to manual.
             if !persist && attempt > RECONNECT_ATTEMPTS {
@@ -1150,7 +1256,7 @@ impl WorkerState {
                         ps.len(), present
                     );
                 }
-                match self.try_retrieve_connect(&adapter, &id).await {
+                match self.try_retrieve_connect(&adapter, &id, mode).await {
                     Ok(()) => {
                         self.last_id = Some(id.clone());
                         self.hold_power();
@@ -1202,7 +1308,7 @@ impl WorkerState {
                 continue;
             }
             // Re-discovered → connect (scan still running), then stop.
-            let result = self.connect_core(&id).await;
+            let result = self.connect_core(&id, mode).await;
             let _ = adapter.stop_scan().await;
             match result {
                 Ok(()) => {
