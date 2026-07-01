@@ -96,27 +96,39 @@ const LIST_INACTIVITY_DONE: Duration = Duration::from_millis(500);
 /// chosen at runtime by `BleShared::persist_reconnect` (mirrors the
 /// GUI's "Keep synced" checkbox):
 ///
-/// - **Auto Mode (Keep synced on):** *unbounded* retries with
-///   exponential backoff (`RECONNECT_INTERVAL` → ×2 each round, capped
-///   at `RECONNECT_BACKOFF_CAP`). The firmware now self-heals and stays
-///   discoverable across many recovery cycles (movement_logger_firmware
-///   #3 builds #57–#65: HCI-disconnect + local re-adv, NRST chip-reset,
-///   stale-conn detect), so the old "give up after a few tries" cap was
-///   the *only* thing stopping a multi-hour sync from finishing. The
-///   user can leave the GUI running and the file is complete at the end
-///   even across 20–30 chip-reset cycles. The original bounded policy's
-///   premise (box went invisible until power-cycle) no longer holds.
+/// - **Auto Mode (Keep synced on):** *unbounded* — keep scanning until
+///   the box reappears and reconnect the instant it does.
 /// - **Manual mode (Keep synced off):** bounded — `RECONNECT_ATTEMPTS`
-///   tries, then give up → `Disconnected` → manual reconnect banner
-///   (still lossless: the live mirror holds the resume offset).
+///   scan windows, then give up → `Disconnected` → manual reconnect
+///   banner (still lossless: the live mirror holds the resume offset).
 ///
-/// Both regimes poll `BleShared::abort_reconnect` between every attempt
-/// and during every backoff sleep, so a user Disconnect / app-quit /
-/// un-ticking "Keep synced" breaks the loop promptly even though the
-/// worker can't service its command channel while inside this function.
+/// **Continuous-scan model (v0.0.35).** The earlier design slept an
+/// *exponential backoff* (2 s → ×2, capped 60 s) and then fired a single
+/// 3 s scan per round. That was the actual cause of the "box is BT-visible
+/// but the Mac never reconnects, have to power-cycle" symptom that iOS /
+/// Android don't have: btleplug 0.11.8 on macOS has **no**
+/// `retrievePeripherals`/pending-connect, and it *purges* the peripheral
+/// from its table on disconnect (`internal.rs` `on_peripheral_disconnect`
+/// → `peripherals.remove`; `connect_peripheral` then silently no-ops for
+/// an unknown id). So the ONLY way to reconnect is to **re-discover the
+/// box in a fresh scan** — and with up to 60 s of *not scanning* between
+/// 3 s windows, an advertising box was routinely missed for minutes.
+/// iOS/Android hand the OS a pending connect to the retained handle;
+/// btleplug can't, so we approximate it by scanning continuously and
+/// connecting the moment `peripherals()` shows the id (see
+/// `wait_for_peripheral`). No exponential backoff — a short
+/// `RECONNECT_INTERVAL` gap between scan windows keeps it responsive
+/// without hammering `connect()`.
+///
+/// Both regimes poll `BleShared::abort_reconnect` between every window
+/// and during every sleep, so a user Disconnect / app-quit / un-ticking
+/// "Keep synced" breaks the loop promptly even though the worker can't
+/// service its command channel while inside this function.
 const RECONNECT_ATTEMPTS: u32 = 10;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
-const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(60);
+/// How long to keep an active scan running each attempt, polling for the
+/// box to re-advertise, before pausing `RECONNECT_INTERVAL` and looping.
+const RECONNECT_SCAN_WINDOW: Duration = Duration::from_secs(20);
 
 /// Upper bound on every individual GATT step inside `connect_core`
 /// (connect / discover / subscribe / notifications). Same rationale as
@@ -1036,7 +1048,6 @@ impl WorkerState {
         // A stale abort from a *previous* link must not kill this fresh
         // recovery — the user pressing Disconnect now is what sets it.
         self.clear_abort();
-        let mut backoff = RECONNECT_INTERVAL;
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -1051,32 +1062,55 @@ impl WorkerState {
                 return false;
             }
             let label = if persist {
-                format!("link lost — auto-reconnecting (attempt {attempt}, Auto Mode)…")
+                format!("link lost — scanning for box (attempt {attempt}, Auto Mode)…")
             } else {
                 format!(
-                    "link lost — auto-reconnecting (attempt {attempt}/{RECONNECT_ATTEMPTS})…"
+                    "link lost — scanning for box (attempt {attempt}/{RECONNECT_ATTEMPTS})…"
                 )
             };
             self.emit(BleEvent::Status(label));
 
-            if self.sleep_or_abort(backoff).await {
+            let Some(adapter) = self.ensure_adapter().await else {
+                // No adapter yet — brief pause, try again.
+                if self.sleep_or_abort(RECONNECT_INTERVAL).await {
+                    self.clear_abort();
+                    return false;
+                }
+                continue;
+            };
+
+            // btleplug 0.11.8 purges the peripheral from its tables on
+            // disconnect and has no retrievePeripherals / pending-connect,
+            // so the ONLY way back is to *re-discover* the box in a live
+            // scan (see the RECONNECT_* doc block). Start a scan and leave
+            // it running while we wait for the id to reappear, then connect
+            // the instant it does — don't stop the scan first (connecting
+            // while scanning is fine on CoreBluetooth and avoids a
+            // stop→snapshot race). This replaces the old "one 3 s scan then
+            // give up for up to 60 s" that missed the advertising box.
+            let _ = adapter.start_scan(ScanFilter::default()).await;
+            let found = self
+                .wait_for_peripheral(&adapter, &id, RECONNECT_SCAN_WINDOW)
+                .await;
+            if self.abort_requested() {
+                let _ = adapter.stop_scan().await;
                 self.clear_abort();
                 return false;
             }
-            // Kick a short scan so CoreBluetooth/BlueZ refreshes its
-            // peripheral cache; ignore the Discovered/ScanStopped spam
-            // by not routing through scan() (which emits them).
-            if let Some(adapter) = self.ensure_adapter().await {
-                if adapter.start_scan(ScanFilter::default()).await.is_ok() {
-                    if self.sleep_or_abort(Duration::from_secs(3)).await {
-                        let _ = adapter.stop_scan().await;
-                        self.clear_abort();
-                        return false;
-                    }
-                    let _ = adapter.stop_scan().await;
+            if !found {
+                // Box didn't re-advertise within this window — pause and
+                // loop (a fresh scan starts next round).
+                let _ = adapter.stop_scan().await;
+                if self.sleep_or_abort(RECONNECT_INTERVAL).await {
+                    self.clear_abort();
+                    return false;
                 }
+                continue;
             }
-            match self.connect_core(&id).await {
+            // Re-discovered → connect (scan still running), then stop.
+            let result = self.connect_core(&id).await;
+            let _ = adapter.stop_scan().await;
+            match result {
                 Ok(()) => {
                     self.last_id = Some(id);
                     // Assertion is normally still held from the original
@@ -1093,11 +1127,39 @@ impl WorkerState {
                     self.emit(BleEvent::Status(format!(
                         "reconnect attempt {attempt} failed: {e}"
                     )));
-                    // Exponential backoff (Auto Mode could otherwise
-                    // hammer the adapter for hours). Bounded mode never
-                    // gets far enough up the curve to matter.
-                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_CAP);
+                    if self.sleep_or_abort(RECONNECT_INTERVAL).await {
+                        self.clear_abort();
+                        return false;
+                    }
                 }
+            }
+        }
+    }
+
+    /// With a scan running on `adapter`, poll btleplug's discovered set
+    /// until the target `id` reappears (box re-advertised) or `window`
+    /// elapses / an abort is requested. Returns `true` if found.
+    ///
+    /// This is the reconnect crux (v0.0.35): btleplug on macOS can only
+    /// (re)connect to a peripheral it has re-discovered in a scan — it
+    /// purges the peripheral on disconnect and offers no pending-connect —
+    /// so we keep looking (≈3×/s) rather than firing one short scan and
+    /// giving up. btleplug scans with AllowDuplicates set, so a still-
+    /// advertising box re-reports promptly; the id (CoreBluetooth UUID) is
+    /// stable across re-advertising, so the match is reliable.
+    async fn wait_for_peripheral(&self, adapter: &Adapter, id: &str, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
+        loop {
+            if let Ok(ps) = adapter.peripherals().await {
+                if ps.iter().any(|p| p.id().to_string() == id) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if self.sleep_or_abort(Duration::from_millis(300)).await {
+                return false;
             }
         }
     }
