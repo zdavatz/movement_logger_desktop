@@ -1071,20 +1071,11 @@ fn render_file_group(
         let f = &mut files[i];
         ui.horizontal(|ui| {
             ui.checkbox(&mut f.selected, "");
-            ui.label(format!("{:>10} B  {}", f.size, f.name));
-            if f.downloaded {
-                /* Clear "downloaded" badge. Earlier code used `✓` U+2713,
-                   which is missing from egui's default proportional font
-                   and rendered as an empty tofu box. Use ✅ U+2705 (the
-                   emoji form) which egui can rasterise from its emoji
-                   fallback font — same path as the 🗑 trash button. The
-                   plain-text "done" suffix is the guaranteed-readable
-                   backup if the user's font config drops emoji entirely. */
-                ui.colored_label(
-                    egui::Color32::from_rgb(0, 170, 0),
-                    egui::RichText::new("✅ downloaded").strong(),
-                );
-            }
+            // Monospace size so the digits right-align cleanly into a column;
+            // the name follows, then the trash button + status sit right next
+            // to the name (not pinned to the far right).
+            ui.label(egui::RichText::new(format!("{:>10} B", f.size)).monospace());
+            ui.label(&f.name);
             let busy = f.bytes_done > 0 && !f.downloaded;
             match delete_unsupported(&f.name) {
                 Some(reason) => {
@@ -1104,6 +1095,19 @@ fn render_file_group(
                     }
                 }
             }
+            if f.downloaded {
+                /* Clear "downloaded" badge. Earlier code used `✓` U+2713,
+                   which is missing from egui's default proportional font
+                   and rendered as an empty tofu box. Use ✅ U+2705 (the
+                   emoji form) which egui can rasterise from its emoji
+                   fallback font — same path as the 🗑 trash button. The
+                   plain-text "done" suffix is the guaranteed-readable
+                   backup if the user's font config drops emoji entirely. */
+                ui.colored_label(
+                    egui::Color32::from_rgb(0, 170, 0),
+                    egui::RichText::new("✅ downloaded").strong(),
+                );
+            }
         });
         if !f.downloaded && f.bytes_done > 0 && f.size > 0 {
             let frac = (f.bytes_done as f32 / f.size as f32).clamp(0.0, 1.0);
@@ -1114,11 +1118,9 @@ fn render_file_group(
             } else {
                 format!("{} / {} B", f.bytes_done, f.size)
             };
-            ui.add(
-                egui::ProgressBar::new(frac)
-                    .desired_width(360.0)
-                    .text(bytes_str),
-            );
+            // Full-width progress bar (adapts to the window; no fixed 360 px
+            // that would overflow a narrow window).
+            ui.add(egui::ProgressBar::new(frac).text(bytes_str));
         }
     }
 }
@@ -1732,8 +1734,17 @@ impl AppState {
                         sensor_idx.sort_by(by_recency_desc);
                         debug_idx.sort_by(by_recency_desc);
 
+                        // Fill the remaining vertical space with the file
+                        // list, reserving ~40 px for the "Download selected"
+                        // button below. Adapts to window height; a floor keeps
+                        // it usable when the window is very short.
+                        let list_height = (ui.available_height() - 40.0).max(120.0);
                         egui::ScrollArea::vertical()
-                            .max_height(220.0)
+                            .max_height(list_height)
+                            // Use the full window width for the list (don't
+                            // shrink to content, which left-hugged it); still
+                            // shrink height to content up to max_height.
+                            .auto_shrink([false, true])
                             .id_salt("ble-file-list")
                             .show(ui, |ui| {
                                 render_file_group(
