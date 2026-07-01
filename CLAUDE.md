@@ -8,12 +8,13 @@ Cross-platform desktop build of **MovementLogger** — a drag-and-drop GUI for S
 
 ## Workspace layout
 
-Cargo workspace at the repo root with three members and one excluded vendored fork:
+Cargo workspace at the repo root with three members and two excluded vendored forks:
 
 - `stbox-viz/` — CLI session visualiser (plotters, rustfft, gif). The GUI shells out to its `animate` subcommand to render side-by-side MOVs.
 - `stbox-viz-gui/` — the GUI itself (binary name `MovementLogger`, package name `movement-logger`). Built on `eframe`/`egui`, BLE FileSync via `btleplug` on a tokio worker thread, GitHub-Releases-based in-app updater.
 - `usb-console/` — minimal `rusb` debug console for the SensorTile.box PRO USB CDC firmware. Independent; not shipped in the GUI release archive.
 - `winit-patched/` — vendored fork of `winit` 0.30.13 with the private `_CGSSetWindowBackgroundBlurRadius` call removed from `Window::set_blur`. Required for Mac App Store binary scanning. Applied workspace-wide via `[patch.crates-io] winit = { path = "winit-patched" }` and **excluded** from the workspace members list (it ships its own workspace, must not nest).
+- `btleplug-patched/` — vendored fork of `btleplug` 0.11.8 adding a macOS CoreBluetooth **retrieve-by-identifier + pending-connect** path (`Central::add_peripheral` → a new `RetrievePeripheral` message → `retrievePeripheralsWithIdentifiers:` → `on_discovered_peripheral`). Stock btleplug reconnects *only* by scan re-discovery, but macOS CoreBluetooth stops returning a recently-connected peripheral in scan results — so the desktop (unlike iOS/Android) got stuck and needed a box power-cycle. The fork lets `ble.rs::auto_reconnect` reconnect by id without a scan, like iOS `retrievePeripherals(withIdentifiers:)`. Applied via `[patch.crates-io] btleplug = { path = "btleplug-patched" }` and **excluded** from members. **Version must stay pinned to whatever the graph resolves (0.11.8)** — if a dep bump moves btleplug to a new minor, the `[patch]` silently no-ops and reconnect regresses to scan-only with no compile error. See *BLE auto-reconnect* below.
 
 ## Build / run
 
@@ -31,6 +32,15 @@ nm target/release/MovementLogger | grep CGSSetWindowBackgroundBlur   # must be e
 ```
 
 If the symbol returns, the `[patch.crates-io]` substitution didn't apply — usually because `eframe` was bumped to a version that pulls in a different `winit` major than the fork covers.
+
+Also verify the **`btleplug-patched`** substitution is live (no `nm`-style check applies — check the lockfile + tree instead):
+
+```sh
+cargo tree -p btleplug | head -1        # must show the local path fork, not a registry version
+grep -A3 'name = "btleplug"' Cargo.lock # must have NO `source`/`checksum` lines
+```
+
+If those show a registry source, the patch no-oped (usually a dep bump moved btleplug off 0.11.8) and macOS reconnect silently regresses to scan-only — the "must power-cycle the box" bug returns. See *BLE auto-reconnect* below.
 
 ## Runtime topology
 

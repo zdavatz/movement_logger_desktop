@@ -11,6 +11,14 @@ exclude = [
     # stbox-viz-gui — it ships its own workspace which we must not nest
     # under this one.
     "winit-patched",
+    # Vendored, patched btleplug fork pulled in via [patch.crates-io].
+    # Adds a macOS CoreBluetooth retrieve-by-identifier + pending-connect
+    # path (Central::add_peripheral / RetrievePeripheral) so the desktop
+    # reconnects like iOS/Android without a scan — upstream btleplug only
+    # reconnects via scan re-discovery, which macOS CoreBluetooth blocks for
+    # a recently-connected peripheral (the "must power-cycle the box" bug).
+    # Excluded so Cargo doesn't adopt it as a first-class member.
+    "btleplug-patched",
 ]
 
 # Apply the App-Store-safe winit patch globally so any workspace member
@@ -20,6 +28,11 @@ exclude = [
 # accept Mac App Store uploads. See workspace CLAUDE.md.
 [patch.crates-io]
 winit = { path = "winit-patched" }
+# Vendored btleplug fork: macOS retrieve-by-identifier + pending connect for
+# scan-less reconnect (see btleplug-patched/ and the exclude comment above).
+# MUST stay pinned to the same version the graph resolves (0.11.8) or this
+# [patch] silently no-ops and reconnect regresses to scan-only.
+btleplug = { path = "btleplug-patched" }
 
 # Workspace-level release profile. Cargo silently ignores member-level
 # `[profile.*]` blocks in a workspace, so any tuning lives here.

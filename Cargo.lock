@@ -472,8 +472,6 @@ dependencies = [
 [[package]]
 name = "btleplug"
 version = "0.11.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9a11621cb2c8c024e444734292482b1ad86fb50ded066cf46252e46643c8748"
 dependencies = [
  "async-trait",
  "bitflags 2.11.1",
@@ -1721,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "gps-debug"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2514,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "movement-logger"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "anyhow",
  "btleplug",
@@ -4025,7 +4023,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stbox-viz"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "anyhow",
  "chrono",

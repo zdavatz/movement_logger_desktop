@@ -104,21 +104,27 @@ const LIST_INACTIVITY_DONE: Duration = Duration::from_millis(500);
 ///
 /// **Continuous-scan model (v0.0.35).** The earlier design slept an
 /// *exponential backoff* (2 s → ×2, capped 60 s) and then fired a single
-/// 3 s scan per round. That was the actual cause of the "box is BT-visible
-/// but the Mac never reconnects, have to power-cycle" symptom that iOS /
-/// Android don't have: btleplug 0.11.8 on macOS has **no**
-/// `retrievePeripherals`/pending-connect, and it *purges* the peripheral
-/// from its table on disconnect (`internal.rs` `on_peripheral_disconnect`
-/// → `peripherals.remove`; `connect_peripheral` then silently no-ops for
-/// an unknown id). So the ONLY way to reconnect is to **re-discover the
-/// box in a fresh scan** — and with up to 60 s of *not scanning* between
-/// 3 s windows, an advertising box was routinely missed for minutes.
-/// iOS/Android hand the OS a pending connect to the retained handle;
-/// btleplug can't, so we approximate it by scanning continuously and
-/// connecting the moment `peripherals()` shows the id (see
-/// `wait_for_peripheral`). No exponential backoff — a short
-/// `RECONNECT_INTERVAL` gap between scan windows keeps it responsive
-/// without hammering `connect()`.
+/// 3 s scan per round, which routinely missed the advertising box.
+///
+/// **Retrieve-first model (v0.0.36).** The real root cause of the "box is
+/// BT-visible but the Mac never reconnects, have to power-cycle" symptom
+/// (which iOS/Android don't have) is that stock btleplug 0.11.8 *purges*
+/// the peripheral from its tables on disconnect (`internal.rs`
+/// `on_peripheral_disconnect` → `peripherals.remove`) and can only refill
+/// them by a fresh **scan** — but macOS CoreBluetooth routinely STOPS
+/// returning a recently-connected peripheral in scan results, so the scan
+/// finds nothing and reconnect never fires. iOS uses
+/// `retrievePeripherals(withIdentifiers:)` + a pending `connect()` (no
+/// scan); Android connects by MAC. Stock btleplug exposes neither, so we
+/// vendored `btleplug-patched` to add exactly that (`Central::add_peripheral`
+/// → `RetrievePeripheral`). `auto_reconnect` now tries **retrieve-by-id
+/// first** (macOS) and only falls back to the continuous scan below when
+/// retrieve fails (or the box is genuinely silent — see `RETRIEVE_MAX_FAILS`).
+///
+/// The scan fallback keeps a scan running and connects the moment
+/// `peripherals()` shows the id (see `wait_for_peripheral`). No exponential
+/// backoff — a short `RECONNECT_INTERVAL` gap between windows keeps it
+/// responsive without hammering `connect()`.
 ///
 /// Both regimes poll `BleShared::abort_reconnect` between every window
 /// and during every sleep, so a user Disconnect / app-quit / un-ticking
@@ -129,6 +135,16 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 /// How long to keep an active scan running each attempt, polling for the
 /// box to re-advertise, before pausing `RECONNECT_INTERVAL` and looping.
 const RECONNECT_SCAN_WINDOW: Duration = Duration::from_secs(20);
+
+/// macOS retrieve-by-id (the `btleplug-patched` fast path): after this many
+/// consecutive retrieve→connect failures within one `auto_reconnect`
+/// invocation, stop attempting the retrieve path and fall back to scan-only
+/// for the rest of this invocation. Prevents a genuinely-silent box from
+/// paying an extra ~20 s dead pending-connect on top of the scan window
+/// every round. A retrieve *success* resets nothing — we only stop after
+/// this many failures in a row.
+#[cfg(target_os = "macos")]
+const RETRIEVE_MAX_FAILS: u32 = 3;
 
 /// Upper bound on every individual GATT step inside `connect_core`
 /// (connect / discover / subscribe / notifications). Same rationale as
@@ -1044,11 +1060,45 @@ impl WorkerState {
     ///
     /// Either way an abort (Disconnect / quit / "Keep synced" un-ticked
     /// dropping us back to the bounded budget) breaks the loop promptly.
+    /// macOS fast path: retrieve the box by identifier (no scan) and connect,
+    /// mirroring iOS `retrievePeripherals(withIdentifiers:)` + a pending
+    /// `connect()`. `add_peripheral` (the vendored `btleplug-patched`
+    /// addition) repopulates btleplug's maps — purged on disconnect and NOT
+    /// refillable by scan when CoreBluetooth has stopped returning the box in
+    /// scan results — so `connect_core`'s Map lookup then succeeds without a
+    /// scan hit. Returns `Ok(())` only on a full connect+subscribe; any error
+    /// → the caller falls back to the scan loop.
+    ///
+    /// NOTE: retrieve success proves only that CoreBluetooth still *knows* the
+    /// id, NOT that the box is reachable — reachability is proven solely by
+    /// `connect_core` (a fulfilled pending connect). `connect_core` bounds
+    /// `p.connect()` with `LINK_OP_TIMEOUT`, which is our per-round
+    /// pending-connect budget.
+    #[cfg(target_os = "macos")]
+    async fn try_retrieve_connect(&mut self, adapter: &Adapter, id: &str) -> Result<(), String> {
+        let uuid = Uuid::parse_str(id).map_err(|e| format!("bad box id: {e}"))?;
+        let pid: btleplug::platform::PeripheralId = uuid.into();
+        adapter
+            .add_peripheral(&pid)
+            .await
+            .map_err(|e| format!("retrieve-by-id: {e}"))?;
+        self.emit(BleEvent::Status(
+            "reconnect: retrieved box by id (no scan) — pending connect…".into(),
+        ));
+        eprintln!("[reconnect] retrieve-by-id OK for {id}; scan not required");
+        self.connect_core(id).await
+    }
+
     async fn auto_reconnect(&mut self, id: String) -> bool {
         // A stale abort from a *previous* link must not kill this fresh
         // recovery — the user pressing Disconnect now is what sets it.
         self.clear_abort();
         let mut attempt: u32 = 0;
+        // macOS retrieve-by-id fast path: give up on it after this many
+        // consecutive failures this invocation (box is genuinely silent, not
+        // just scan-invisible) and let the scan fallback carry the rest.
+        #[cfg(target_os = "macos")]
+        let mut retrieve_fails: u32 = 0;
         loop {
             attempt += 1;
             let persist = self.persist_reconnect();
@@ -1079,15 +1129,59 @@ impl WorkerState {
                 continue;
             };
 
-            // btleplug 0.11.8 purges the peripheral from its tables on
-            // disconnect and has no retrievePeripherals / pending-connect,
-            // so the ONLY way back is to *re-discover* the box in a live
-            // scan (see the RECONNECT_* doc block). Start a scan and leave
-            // it running while we wait for the id to reappear, then connect
-            // the instant it does — don't stop the scan first (connecting
-            // while scanning is fine on CoreBluetooth and avoids a
-            // stop→snapshot race). This replaces the old "one 3 s scan then
-            // give up for up to 60 s" that missed the advertising box.
+            // ---- macOS retrieve-by-id fast path (no scan) --------------------
+            // Make the box connectable WITHOUT a scan (fixes the CoreBluetooth
+            // "recently-connected box no longer appears in scan results" case,
+            // which is what makes the desktop — unlike iOS/Android — need a
+            // box power-cycle). Skip once we've failed RETRIEVE_MAX_FAILS times
+            // in a row this invocation — that indicates the box is genuinely
+            // silent, not merely scan-invisible, so stop paying the extra
+            // ~20 s pending-connect per round and let the scan fallback run.
+            #[cfg(target_os = "macos")]
+            if retrieve_fails < RETRIEVE_MAX_FAILS && !self.abort_requested() {
+                // Diagnostic discriminator: is the box in the scan set right
+                // now? "target_present=false" immediately followed by a
+                // successful retrieve-connect proves scan-staleness (the bug
+                // this fixes) vs. a genuinely silent box.
+                if let Ok(ps) = adapter.peripherals().await {
+                    let present = ps.iter().any(|p| p.id().to_string() == id);
+                    eprintln!(
+                        "[reconnect] pre-retrieve scan snapshot: {} peripheral(s), target_present={}",
+                        ps.len(), present
+                    );
+                }
+                match self.try_retrieve_connect(&adapter, &id).await {
+                    Ok(()) => {
+                        self.last_id = Some(id.clone());
+                        self.hold_power();
+                        self.emit(BleEvent::Status(
+                            "auto-reconnected (retrieve-by-id) — resuming transfer".into(),
+                        ));
+                        eprintln!("[reconnect] connected via retrieve-by-id — scan was NOT used");
+                        self.emit(BleEvent::Connected);
+                        return true;
+                    }
+                    Err(e) => {
+                        retrieve_fails += 1;
+                        eprintln!(
+                            "[reconnect] retrieve path failed ({e}) [{retrieve_fails}/{RETRIEVE_MAX_FAILS}] — falling back to scan"
+                        );
+                    }
+                }
+                if self.abort_requested() {
+                    self.clear_abort();
+                    return false;
+                }
+            }
+
+            // ---- scan fallback ---------------------------------------------
+            // If retrieve-by-id didn't connect (non-macOS, retrieve failure, or
+            // the box is genuinely silent), fall back to re-discovering it in a
+            // live scan. Start a scan and leave it running while we wait for the
+            // id to reappear, then connect the instant it does — don't stop the
+            // scan first (connecting while scanning is fine on CoreBluetooth and
+            // avoids a stop→snapshot race). This replaces the old "one 3 s scan
+            // then give up for up to 60 s" that missed the advertising box.
             let _ = adapter.start_scan(ScanFilter::default()).await;
             let found = self
                 .wait_for_peripheral(&adapter, &id, RECONNECT_SCAN_WINDOW)
