@@ -130,7 +130,16 @@ const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// for a healthy connect+discover; past that the attempt fails and the
 /// reconnect loop moves on (or falls back to manual). Never drop these
 /// timeouts — it's the connect-side twin of the `drop_link` fix.
-const LINK_OP_TIMEOUT: Duration = Duration::from_secs(12);
+///
+/// Raised 12 → 20 s to match the mobile clients' connect budgets (iOS
+/// holds a pending connect 18 s, Android 60 s). The desktop's 12 s was
+/// the shortest of the three and, on a flaky link where the box is slow
+/// to re-advertise, it false-timed-out perfectly good pending
+/// CoreBluetooth connects — the reconnect then looked like "dropped
+/// again" even though the link was about to come up. 20 s still sits
+/// above a healthy connect+discover and only costs extra patience on a
+/// genuinely dead link. (iOS documents this exact footgun.)
+const LINK_OP_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ---------------------------------------------------------------------------
 //  Firmware-update (OTA) tuning
@@ -512,8 +521,8 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
             let watchdog = tokio::time::sleep(Duration::from_millis(200));
             tokio::pin!(watchdog);
 
-            let Some(stream) = state.notif_stream.as_mut() else {
-                state.emit_err("internal: stream missing while connected");
+            let Some(notif_rx) = state.notif_rx.as_mut() else {
+                state.emit_err("internal: notify channel missing while connected");
                 state.disconnect_inner().await;
                 continue;
             };
@@ -527,7 +536,7 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
                         None    => break,
                     }
                 }
-                notif = stream.next() => {
+                notif = notif_rx.recv() => {
                     match notif {
                         Some(n) => state.handle_notification(n).await,
                         None    => {
@@ -552,7 +561,10 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
                                 // Bounded retries exhausted (or no id):
                                 // hand control back to the user. main
                                 // shows the manual-reconnect banner; the
-                                // .part keeps the resume lossless.
+                                // .part keeps the resume lossless. We've
+                                // stopped trying to hold the link, so let
+                                // the machine sleep / App-Nap us again.
+                                state.release_power();
                                 state.emit(BleEvent::Disconnected);
                             }
                         }
@@ -575,6 +587,7 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
                                 continue;
                             }
                         }
+                        state.release_power();
                         state.emit(BleEvent::Disconnected);
                     }
                 }
@@ -660,7 +673,18 @@ struct WorkerState {
     evt_tx:       Sender<BleEvent>,
     adapter:      Option<Adapter>,
     peripheral:   Option<Peripheral>,
-    notif_stream: Option<NotifStream>,
+    /// Notifications arrive here via a dedicated pump task (`notif_pump`)
+    /// that does nothing but `stream.next()` → this *unbounded* channel.
+    /// The worker loop / flash reader consume from `notif_rx`. This
+    /// decouples draining btleplug's **bounded** internal notify buffer
+    /// from the worker's own blocking awaits (`write_cmd`, the SET_TIME /
+    /// START_LOG settle sleeps, `drop_link`, `auto_reconnect`): while the
+    /// worker is parked in any of those, the pump task keeps draining so
+    /// btleplug can't silently drop notifies and stall a READ (→ 20 s
+    /// watchdog → needless reconnect). Mirrors iOS's CoreBluetooth-callback
+    /// → unbounded-AsyncStream hand-off, which structurally can't back up.
+    notif_rx:     Option<tokio_mpsc::UnboundedReceiver<ValueNotification>>,
+    notif_pump:   Option<tokio::task::JoinHandle<()>>,
     op:           CurrentOp,
     /// SensorStream chunked-mode reassembly buffer.
     stream_asm:   StreamAsm,
@@ -680,6 +704,14 @@ struct WorkerState {
     /// appended into the in-flight download; applied by the worker loop once
     /// `op` returns to Idle.
     pending_set_mode: Option<bool>,
+    /// OS "stay awake / no App Nap" assertion, held for the whole connected
+    /// session **including** auto-reconnect windows (mirrors iOS's
+    /// background-task assertion / Android's foreground service). `Some`
+    /// while we have intent to be connected; taken on connect, released
+    /// only on an explicit Disconnect / abort / final give-up — never in
+    /// `disconnect_inner`, or the Mac could sleep during a reconnect gap.
+    /// See `power.rs`.
+    power: Option<crate::power::PowerGuard>,
 }
 
 impl WorkerState {
@@ -688,14 +720,32 @@ impl WorkerState {
             evt_tx,
             adapter: None,
             peripheral: None,
-            notif_stream: None,
+            notif_rx: None,
+            notif_pump: None,
             op: CurrentOp::Idle,
             stream_asm: StreamAsm::default(),
             stream_capable: false,
             last_id: None,
             shared,
             pending_set_mode: None,
+            power: None,
         }
+    }
+
+    /// Take the OS stay-awake / no-App-Nap assertion if we don't already
+    /// hold it. Idempotent and cheap — safe to call on every connect /
+    /// reconnect success.
+    fn hold_power(&mut self) {
+        if self.power.is_none() {
+            self.power = Some(crate::power::PowerGuard::acquire());
+        }
+    }
+
+    /// Drop the OS assertion (lets the Mac sleep / App-Nap us again). Called
+    /// only when we truly stop trying to hold a link — Disconnect, abort, or
+    /// a bounded reconnect giving up.
+    fn release_power(&mut self) {
+        self.power = None;
     }
 
     fn persist_reconnect(&self) -> bool {
@@ -756,6 +806,7 @@ impl WorkerState {
             BleCmd::Connect(id) => self.connect(id).await,
             BleCmd::Disconnect  => {
                 self.disconnect_inner().await;
+                self.release_power();
                 self.emit(BleEvent::Disconnected);
             }
             BleCmd::List        => self.list().await,
@@ -826,6 +877,9 @@ impl WorkerState {
         match self.connect_core(&id).await {
             Ok(()) => {
                 self.last_id = Some(id);
+                // Hold the OS awake for the whole session (kept across any
+                // later auto-reconnect windows; released on Disconnect).
+                self.hold_power();
                 self.emit(BleEvent::Connected);
             }
             Err(e) => self.emit_err(e),
@@ -833,7 +887,7 @@ impl WorkerState {
     }
 
     /// The connect work, factored out so the bounded auto-reconnect
-    /// loop can reuse it. Sets `peripheral` / `notif_stream` / `op` on
+    /// loop can reuse it. Sets `peripheral` / `notif_rx` (+ pump) / `op` on
     /// success; emits only informational Status lines (SensorStream
     /// presence). Returns Err(reason) instead of emitting an error, so
     /// the caller decides whether a failed attempt is fatal (manual
@@ -940,9 +994,25 @@ impl WorkerState {
                 return Err("notifications: timed out".into());
             }
         };
-        self.peripheral   = Some(p);
-        self.notif_stream = Some(stream);
-        self.op           = CurrentOp::Idle;
+        // Hand the raw btleplug stream to a dedicated pump task that only
+        // forwards into an unbounded channel, so notifications keep
+        // draining while the worker is blocked elsewhere (see `notif_rx`).
+        let (ntx, nrx) = tokio_mpsc::unbounded_channel::<ValueNotification>();
+        let pump = tokio::spawn(async move {
+            let mut stream = stream;
+            while let Some(n) = stream.next().await {
+                if ntx.send(n).is_err() {
+                    break; // consumer gone (disconnect) — stop pumping.
+                }
+            }
+            // stream.next() → None means the peripheral closed the stream;
+            // dropping `ntx` here makes the consumer's `recv()` return None,
+            // which the worker loop treats as a remote disconnect.
+        });
+        self.peripheral  = Some(p);
+        self.notif_rx    = Some(nrx);
+        self.notif_pump  = Some(pump);
+        self.op          = CurrentOp::Idle;
         Ok(())
     }
 
@@ -1009,6 +1079,10 @@ impl WorkerState {
             match self.connect_core(&id).await {
                 Ok(()) => {
                     self.last_id = Some(id);
+                    // Assertion is normally still held from the original
+                    // connect (we don't drop it in disconnect_inner), but
+                    // re-take defensively in case a give-up path released it.
+                    self.hold_power();
                     self.emit(BleEvent::Status(
                         "auto-reconnected — resuming transfer".into(),
                     ));
@@ -1062,7 +1136,12 @@ impl WorkerState {
             }
             CurrentOp::Idle => {}
         }
-        self.notif_stream   = None;
+        // Stop the notify pump (drops its stream) before tearing the link
+        // down, then clear the receiver.
+        if let Some(pump) = self.notif_pump.take() {
+            pump.abort();
+        }
+        self.notif_rx       = None;
         self.stream_asm     = StreamAsm::default();
         self.stream_capable = false;
         if let Some(p) = self.peripheral.take() {
@@ -1342,10 +1421,10 @@ impl WorkerState {
             if remaining.is_zero() {
                 return Err(());
             }
-            let Some(stream) = self.notif_stream.as_mut() else {
+            let Some(notif_rx) = self.notif_rx.as_mut() else {
                 return Ok(None);
             };
-            match tokio::time::timeout(remaining, stream.next()).await {
+            match tokio::time::timeout(remaining, notif_rx.recv()).await {
                 Ok(Some(n)) => {
                     if n.uuid == FILEDATA_UUID {
                         return Ok(Some(n.value));

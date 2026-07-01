@@ -20,6 +20,7 @@ mod autostart;
 mod ble;
 mod coord;
 mod installer;
+mod power;
 mod sync_core;
 mod sync_db;
 mod update;
