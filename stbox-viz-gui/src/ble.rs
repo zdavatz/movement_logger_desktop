@@ -82,6 +82,19 @@ const STREAM_UUID:   Uuid = Uuid::from_u128(0x00000100_0010_11e1_ac36_0002a5d5c5
 /// left staring at "running…" forever (e.g. after a drop-out the box
 /// reconnects but our subscription went stale).
 const OP_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// READ-specific stall tolerance. A file READ streams thousands of notifies
+/// over minutes; macOS CoreBluetooth legitimately *pauses* delivery for many
+/// seconds under sustained load (BT power-nap, the app briefly backpressured
+/// while flushing the growing mirror to disk). The old shared 20 s tore the
+/// link down mid-pause — the box saw `reason=0x13` (WE disconnected), the
+/// transfer churned, and large files never converged (evidence: firmware
+/// errlog `SENS012.CSV aborted why=stall` at varying offsets, `disconnected
+/// reason=0x13`). Ride the pause out instead: 45 s matches the firmware's own
+/// READ-stall deadline (FSM_READ_STALL_DEADLINE_MS), so a transient pause
+/// resumes on the SAME link while a genuinely dead peer is still caught (box
+/// 90 s peer-gone watchdog + the chip LL supervision timeout). LIST keeps the
+/// tighter 20 s (OP_IDLE_TIMEOUT) — its stall handling is tuned separately.
+const READ_STALL_TIMEOUT: Duration = Duration::from_secs(45);
 /* If LIST has produced at least one entry and no new bytes have arrived for
    this long, treat LIST as complete and go back to Idle. Defensive: the
    firmware's terminator notify can be missed/merged on flaky BLE links and
@@ -2152,7 +2165,7 @@ impl WorkerState {
 
         let stale = match &self.op {
             CurrentOp::Listing  { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
-            CurrentOp::Reading  { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
+            CurrentOp::Reading  { last_progress, .. } => now.duration_since(*last_progress) > READ_STALL_TIMEOUT,
             CurrentOp::Deleting { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingMode { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             // A flash is driven inline and never yields to the watchdog
@@ -2195,7 +2208,7 @@ impl WorkerState {
                     base,
                 });
                 self.emit_err(format!(
-                    "READ {name} timed out at {got}/{expected} B — no notifies for 20 s"
+                    "READ {name} timed out at {got}/{expected} B — no notifies for 45 s"
                 ));
                 true // stalled READ → caller reconnects + resumes
             }

@@ -2573,7 +2573,7 @@ impl eframe::App for AppState {
                     // main()); don't repeat them in the in-app header.
                     ui.hyperlink_to(
                         "SensorTile.box pumpfoil session video generator",
-                        "https://github.com/zdavatz/fp-sns-stbox1",
+                        "https://github.com/zdavatz/movement_logger_firmware",
                     );
                 });
                 // Right-anchor the logo so it sits in the top-right
