@@ -1060,6 +1060,9 @@ fn render_file_group(
         ui.add(egui::Label::new(
             egui::RichText::new(title).strong().size(13.0)
         ));
+        ui.label(egui::RichText::new(format!("({})", indices.len()))
+            .small()
+            .color(egui::Color32::from_gray(140)));
         let label = if all_on { "Untick all" }
                     else if none_on { "Tick all" }
                     else { "Tick all" };
@@ -1067,9 +1070,6 @@ fn render_file_group(
             let new_val = !all_on;
             for &i in indices { files[i].selected = new_val; }
         }
-        ui.label(egui::RichText::new(format!("({})", indices.len()))
-            .small()
-            .color(egui::Color32::from_gray(140)));
     });
     for &i in indices {
         let f = &mut files[i];
