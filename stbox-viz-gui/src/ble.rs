@@ -1836,6 +1836,24 @@ impl WorkerState {
            processes commands sequentially, so this sleep delays the next
            command — same trick `start_log` uses above. */
         tokio::time::sleep(Duration::from_millis(500)).await;
+        /* Discard the box's 1-byte OK reply NOW, while op is still Idle.
+           The biased select processes queued commands before queued
+           notifies, so without this drain the 0x00 reply is handled only
+           AFTER the follow-up LIST has set op = Listing — and the byte
+           then glues onto the first LIST row's name ("\0ERRLOG.LOG").
+           That name is invisible in the UI but every READ of it gets
+           BAD_REQUEST from the box (the embedded NUL truncates the name
+           to zero length), so the first-listed file silently refused to
+           download (Peter: "errorlog will nicht über ble runterladen"). */
+        if let Some(rx) = self.notif_rx.as_mut() {
+            let mut drained = 0u32;
+            while let Ok(n) = rx.try_recv() {
+                if n.uuid == FILEDATA_UUID { drained += 1; }
+            }
+            if drained > 0 {
+                eprintln!("[set_time] drained {drained} stale FileData notif(s) (SET_TIME reply)");
+            }
+        }
         self.emit(BleEvent::Status("SET_TIME sent — box clock anchored to host".into()));
     }
 
@@ -2579,7 +2597,22 @@ async fn polite_drop_link(p: &Peripheral) {
 fn parse_list_row(line: &[u8]) -> Option<(String, u64)> {
     let s = std::str::from_utf8(line).ok()?;
     let comma = s.rfind(',')?;
-    let name = s[..comma].to_string();
+    // Strip control bytes / stray whitespace from the name. A 1-byte status
+    // reply from a preceding op (SET_TIME OK = 0x00, GET_MODE = 0x00/0x01)
+    // that reaches the demux after `op` flipped to Listing glues itself onto
+    // the first row — the polluted name renders invisibly in the UI but the
+    // box rejects every READ of it (embedded NUL → zero-length name →
+    // BAD_REQUEST). Filenames are plain 8.3 ASCII, so dropping controls and
+    // trimming whitespace can never mangle a legitimate name.
+    let name: String = s[..comma]
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
     let size = s[comma + 1..].parse::<u64>().ok()?;
     Some((name, size))
 }

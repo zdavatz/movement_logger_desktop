@@ -19,6 +19,9 @@ use crate::sync_db;
 /// panel; the headless agent drains the same buffer to stdout/file).
 /// Capped so a long-running session can't exhaust RAM.
 pub fn push_log(log: &Arc<Mutex<Vec<String>>>, line: String) {
+    // Mirror every panel line to stderr so a `MovementLogger 2>log` run is
+    // diagnosable from outside the GUI (the in-app panel can't be scraped).
+    eprintln!("[log] {line}");
     if let Ok(mut v) = log.lock() {
         const CAP: usize = 10_000;
         if v.len() >= CAP {
