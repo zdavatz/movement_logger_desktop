@@ -51,7 +51,8 @@
 //!   Status bytes: 0x00 OK, 0xB0 BUSY, 0xE1 NOT_FOUND, 0xE2 IO_ERROR, 0xE3 BAD_REQ.
 
 use btleplug::api::{
-    Central, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
+    Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
+    ScanFilter, ValueNotification, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::{Stream, StreamExt};
@@ -76,6 +77,10 @@ use uuid::Uuid;
 /// silently dropped the box. See issue #1.
 const BOX_NAMES: &[&str] = &["PumpTsueri", "STBoxFs"];
 
+/// FileSync GATT service (firmware `BLE_SVC_UUID`). Needed to synthesize a
+/// Characteristic for the polite-teardown 0x0F write when the app-side char
+/// cache is empty (raced pending connect) — see `polite_drop_link`.
+const FSYNC_SVC_UUID: Uuid = Uuid::from_u128(0x00000000_0001_11e1_9ab4_0002a5d5c51b);
 const FILECMD_UUID:  Uuid = Uuid::from_u128(0x00000080_0010_11e1_ac36_0002a5d5c51b);
 const FILEDATA_UUID: Uuid = Uuid::from_u128(0x00000040_0010_11e1_ac36_0002a5d5c51b);
 /// SensorStream — 0.5 Hz packed 46-byte all-sensor snapshot. New in
@@ -95,11 +100,18 @@ const OP_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// link down mid-pause — the box saw `reason=0x13` (WE disconnected), the
 /// transfer churned, and large files never converged (evidence: firmware
 /// errlog `SENS012.CSV aborted why=stall` at varying offsets, `disconnected
-/// reason=0x13`). Ride the pause out instead: 45 s matches the firmware's own
-/// READ-stall deadline (FSM_READ_STALL_DEADLINE_MS), so a transient pause
-/// resumes on the SAME link while a genuinely dead peer is still caught (box
-/// 90 s peer-gone watchdog + the chip LL supervision timeout). LIST keeps the
-/// tighter 20 s (OP_IDLE_TIMEOUT) — its stall handling is tuned separately.
+/// reason=0x13` — recorded with retrieve-by-id + byte-resume ALREADY shipped,
+/// so "fast lossless reconnect" does not make 20 s safe; a briefly-tried
+/// 20 s revert on 2026-07-02 was rolled back for exactly that history).
+/// Ride the pause out instead: 45 s matches the firmware's own READ-stall
+/// deadline (`FSM_READ_STALL_DEADLINE_MS` = 45 000 — NOT the 15 s
+/// `FSM_STALL_DEADLINE_MS`, which applies only to FW_RECV), so a transient
+/// pause resumes on the SAME link while a genuinely dead peer is still
+/// caught. A real *remote* disconnect no longer waits this long at all: the
+/// CentralEvent::DeviceDisconnected sweep fires within ~200 ms of macOS
+/// reporting it (see `central_rx`) — this timeout only covers the silent
+/// both-sides-think-connected stall. LIST keeps the tighter 20 s
+/// (OP_IDLE_TIMEOUT); its stall handling is tuned separately.
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(45);
 /* If LIST has produced at least one entry and no new bytes have arrived for
    this long, treat LIST as complete and go back to Idle. Defensive: the
@@ -620,6 +632,33 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
             let watchdog = tokio::time::sleep(Duration::from_millis(200));
             tokio::pin!(watchdog);
 
+            let central_dead = {
+                // Non-blocking sweep of the DeviceDisconnected pump: did
+                // CoreBluetooth report OUR peripheral gone? This is the only
+                // remote-disconnect signal on macOS (see `central_rx` doc).
+                // Drained here (not a select arm) to keep the borrow set
+                // simple; the 200 ms watchdog tick bounds the latency.
+                let our_id = state
+                    .peripheral
+                    .as_ref()
+                    .map(|p| p.id().to_string());
+                let mut hit = false;
+                if let (Some(rx), Some(our)) = (state.central_rx.as_mut(), our_id) {
+                    while let Ok(gone) = rx.try_recv() {
+                        if gone == our {
+                            hit = true;
+                        }
+                    }
+                }
+                hit
+            };
+            if central_dead {
+                state
+                    .lost_link_recover("link lost (CoreBluetooth disconnect event)")
+                    .await;
+                continue;
+            }
+
             let Some(notif_rx) = state.notif_rx.as_mut() else {
                 state.emit_err("internal: notify channel missing while connected");
                 state.disconnect_inner().await;
@@ -639,33 +678,16 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
                     match notif {
                         Some(n) => state.handle_notification(n).await,
                         None    => {
-                            // The peripheral dropped the stream — treat
-                            // as a remote-side disconnect.
-                            let was_transfer =
-                                matches!(state.op, CurrentOp::Reading { .. });
-                            state.emit_err("notification stream closed");
-                            // disconnect_inner emits ReadAborted with the
-                            // partial bytes (→ appended to .part) and
-                            // tears the connection down.
-                            state.disconnect_inner().await;
-                            if was_transfer {
-                                if let Some(id) = state.last_id.clone() {
-                                    if state.auto_reconnect(id).await {
-                                        // Reconnected: Connected emitted,
-                                        // main re-lists + resumes from the
-                                        // .part offset. Stay in the loop.
-                                        continue;
-                                    }
-                                }
-                                // Bounded retries exhausted (or no id):
-                                // hand control back to the user. main
-                                // shows the manual-reconnect banner; the
-                                // .part keeps the resume lossless. We've
-                                // stopped trying to hold the link, so let
-                                // the machine sleep / App-Nap us again.
-                                state.release_power();
-                                state.emit(BleEvent::Disconnected);
-                            }
+                            // The peripheral dropped the stream — remote-side
+                            // disconnect (Linux/Windows signal; on macOS the
+                            // stream never closes and the central_dead sweep
+                            // above is the signal instead). ALWAYS recover —
+                            // transfer or idle: the old `if was_transfer`
+                            // guard made an idle-time close (gap between
+                            // queued files) fall through with NO reconnect
+                            // and NO Disconnected event — GUI stuck showing
+                            // Connected, box stranded (2026-07-02 deadlock).
+                            state.lost_link_recover("notification stream closed").await;
                         }
                     }
                 }
@@ -673,21 +695,13 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
                     if state.tick_watchdog() {
                         // A READ stalled but CoreBluetooth still thinks
                         // it's connected (no stream close). Tear the
-                        // half-dead link down ourselves and auto-
-                        // reconnect so the .part resume can continue —
-                        // this is the case Peter hit where the box
-                        // never saw a formal disconnect. tick_watchdog
-                        // already emitted ReadAborted (partial saved)
-                        // + the timeout error and set op = Idle.
-                        let id = state.last_id.clone();
-                        state.disconnect_inner().await;
-                        if let Some(id) = id {
-                            if state.auto_reconnect(id).await {
-                                continue;
-                            }
-                        }
-                        state.release_power();
-                        state.emit(BleEvent::Disconnected);
+                        // half-dead link down ourselves (0x0F best-effort
+                        // frees the box if the ACL is only app-dead) and
+                        // auto-reconnect so the mirror resume continues —
+                        // the box never saw a formal disconnect here.
+                        // tick_watchdog already emitted ReadAborted
+                        // (partial saved) + the timeout error, op = Idle.
+                        state.lost_link_recover("READ stalled — reconnecting").await;
                     }
                 }
             }
@@ -784,6 +798,18 @@ struct WorkerState {
     /// → unbounded-AsyncStream hand-off, which structurally can't back up.
     notif_rx:     Option<tokio_mpsc::UnboundedReceiver<ValueNotification>>,
     notif_pump:   Option<tokio::task::JoinHandle<()>>,
+    /// CentralEvent::DeviceDisconnected ids, pumped from `adapter.events()`.
+    /// THE remote-disconnect signal on macOS: the vendored fork's per-
+    /// peripheral notification stream NEVER closes on a CoreBluetooth
+    /// disconnect (PeripheralEventInternal::Disconnected is ignored and the
+    /// worker's own Peripheral clone keeps the broadcast sender alive), so
+    /// the notif-None arm is unreachable there and an idle-time drop (gap
+    /// between queued files, post-pass) previously went completely
+    /// undetected — no reconnect, no Disconnected event, GUI stuck showing
+    /// Connected, box stranded in a zombie ACL. The pump filters to
+    /// DeviceDisconnected only (discovery spam never queues up).
+    central_rx:   Option<tokio_mpsc::UnboundedReceiver<String>>,
+    central_pump: Option<tokio::task::JoinHandle<()>>,
     op:           CurrentOp,
     /// SensorStream chunked-mode reassembly buffer.
     stream_asm:   StreamAsm,
@@ -821,6 +847,8 @@ impl WorkerState {
             peripheral: None,
             notif_rx: None,
             notif_pump: None,
+            central_rx: None,
+            central_pump: None,
             op: CurrentOp::Idle,
             stream_asm: StreamAsm::default(),
             stream_capable: false,
@@ -909,6 +937,28 @@ impl WorkerState {
         self.emit(BleEvent::Error(msg.into()));
     }
 
+    /// Shared link-lost recovery: teardown (0x0F best-effort inside
+    /// disconnect_inner) → auto-reconnect → on give-up release power and
+    /// emit Disconnected so the GUI leaves the Connected state. Used by both
+    /// drop signals — the notif-stream close (Linux/Windows) and the
+    /// CentralEvent::DeviceDisconnected pump (macOS).
+    async fn lost_link_recover(&mut self, why: &str) {
+        self.emit_err(why.to_string());
+        self.disconnect_inner().await;
+        if let Some(id) = self.last_id.clone() {
+            if self.auto_reconnect(id).await {
+                // Reconnected — Connected emitted; main re-lists and the
+                // size-diff resumes any unfinished file from the mirror.
+                return;
+            }
+        }
+        // Bounded retries exhausted / abort / no id: hand control back to
+        // the user. The mirror keeps the resume lossless; let the machine
+        // sleep again.
+        self.release_power();
+        self.emit(BleEvent::Disconnected);
+    }
+
     async fn ensure_adapter(&mut self) -> Option<Adapter> {
         if let Some(a) = self.adapter.clone() { return Some(a); }
         let manager = match Manager::new().await {
@@ -924,6 +974,30 @@ impl WorkerState {
             return None;
         };
         self.adapter = Some(adapter.clone());
+        // Central-event pump: forward DeviceDisconnected ids into a channel
+        // the worker loop can select on. See the `central_rx` field doc —
+        // this is the only remote-disconnect signal macOS delivers.
+        match adapter.events().await {
+            Ok(mut events) => {
+                let (ctx, crx) = tokio_mpsc::unbounded_channel::<String>();
+                let pump = tokio::spawn(async move {
+                    while let Some(ev) = events.next().await {
+                        if let CentralEvent::DeviceDisconnected(pid) = ev {
+                            if ctx.send(pid.to_string()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                self.central_rx = Some(crx);
+                self.central_pump = Some(pump);
+            }
+            Err(e) => {
+                // Non-fatal: Linux/Windows still have the stream-close arm;
+                // macOS degrades to the pre-fix behaviour.
+                eprintln!("[ble] adapter.events() failed ({e}) — idle-drop detection disabled");
+            }
+        }
         Some(adapter)
     }
 
@@ -934,34 +1008,20 @@ impl WorkerState {
             BleCmd::Scan        => self.scan().await,
             BleCmd::Connect(id) => self.connect(id).await,
             BleCmd::Disconnect  => {
-                // macOS: ask the box to terminate the link from its side
-                // *before* we cancel locally, so it actually sees a
-                // LL_TERMINATE and re-advertises connectably (see
-                // OP_DISCONNECT). Best-effort — a write failure just means
-                // we fall back to the plain local cancel below. Only on this
-                // intentional-disconnect path: the drop-recovery callers of
-                // disconnect_inner face an already-dead link with nothing to
-                // tell, and must not eat this settle delay before reconnect.
-                let had_link = self.peripheral.is_some();
-                eprintln!("[disconnect] BleCmd::Disconnect — had_link={had_link}");
-                if had_link {
-                    // WithResponse (ACK-confirmed) — a write-without-response
-                    // would be dropped by CoreBluetooth when we cancel below
-                    // before it ever hit the air. See write_cmd_confirmed.
-                    match self.write_cmd_confirmed(&[OP_DISCONNECT]).await {
-                        Ok(())  => {
-                            eprintln!("[disconnect] 0x0F confirmed — box should re-advertise");
-                            self.emit(BleEvent::Status(
-                                "sent host-disconnect (0x0F) — box will re-advertise".into()));
-                        }
-                        Err(e)  => {
-                            eprintln!("[disconnect] 0x0F NOT confirmed: {e}");
-                            self.emit_err(format!("host-disconnect (0x0F) not confirmed: {e}"));
-                        }
-                    }
-                }
+                // disconnect_inner sends the 0x0F host-disconnect (ACK-
+                // confirmed, bounded) before the local cancel — see there.
+                eprintln!("[disconnect] BleCmd::Disconnect — had_link={}", self.peripheral.is_some());
                 self.disconnect_inner().await;
                 self.release_power();
+                // Every request_abort() caller (Disconnect button, START_LOG
+                // teardown, on_exit, agent stop) queues this command right
+                // after setting the flag — so THIS is where the abort is
+                // consumed. Leaving it set poisoned every later Scan
+                // (sleep_or_abort returned instantly → 0-ms scan window →
+                // "scan saw N, 0 matched" forever) and let auto_reconnect's
+                // old entry-clear swallow a user abort that landed during a
+                // teardown. Do not clear it anywhere else on entry paths.
+                self.clear_abort();
                 eprintln!("[disconnect] teardown complete — worker idle, box released");
                 self.emit(BleEvent::Disconnected);
             }
@@ -1113,7 +1173,21 @@ impl WorkerState {
                         return Err(format!("connect: {e}"));
                     }
                     Err(_) => {
-                        drop_link(&p).await;
+                        // The pending connect may have completed at the
+                        // CoreBluetooth level right at the timeout boundary;
+                        // a bare cancel would then strand the box in a
+                        // zombie ACL (see polite_drop_link). Check and tear
+                        // down politely if so. The check itself MUST be
+                        // bounded: the vendored fork's is_connected never
+                        // resolves when a late didDisconnect purged the
+                        // peripheral map (internal.rs sets no reply on a
+                        // map miss) — unbounded, it froze the whole worker.
+                        if link_probably_connected(&p).await {
+                            eprintln!("[connect] timeout raced a completed connect — polite teardown");
+                            polite_drop_link(&p).await;
+                        } else {
+                            drop_link(&p).await;
+                        }
                         return Err("connect: timed out".into());
                     }
                 }
@@ -1131,7 +1205,19 @@ impl WorkerState {
                         }
                     },
                     w = self.connect_wait(budget) => {
-                        drop_link(&p).await; // the ONLY cancel path in reconnect mode
+                        // The ONLY cancel path in reconnect mode. The pending
+                        // connect may have JUST completed (race with the
+                        // user's Disconnect click / budget expiry) — a bare
+                        // cancel would strand the box in a zombie ACL no
+                        // central can reach (Peter's iPhone+Mac total block,
+                        // 2026-07-02). Tear down politely (0x0F) if so.
+                        // Bounded probe — see link_probably_connected.
+                        if link_probably_connected(&p).await {
+                            eprintln!("[reconnect] abort raced a completed connect — polite teardown");
+                            polite_drop_link(&p).await;
+                        } else {
+                            drop_link(&p).await;
+                        }
                         return Err(match w {
                             ConnectWait::Aborted => "connect: aborted".into(),
                             ConnectWait::Demoted => "connect: keep-synced off".into(),
@@ -1141,14 +1227,17 @@ impl WorkerState {
                 }
             }
         }
+        // From here on the link IS established — every failure teardown must
+        // be polite (0x0F first) or the box is left in the macOS zombie-ACL
+        // limbo (see polite_drop_link).
         match tokio::time::timeout(LINK_OP_TIMEOUT, p.discover_services()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                drop_link(&p).await;
+                polite_drop_link(&p).await;
                 return Err(format!("discover_services: {e}"));
             }
             Err(_) => {
-                drop_link(&p).await;
+                polite_drop_link(&p).await;
                 return Err("discover_services: timed out".into());
             }
         }
@@ -1167,11 +1256,11 @@ impl WorkerState {
         match tokio::time::timeout(LINK_OP_TIMEOUT, p.subscribe(&data_char)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                drop_link(&p).await;
+                polite_drop_link(&p).await;
                 return Err(format!("subscribe FileData: {e}"));
             }
             Err(_) => {
-                drop_link(&p).await;
+                polite_drop_link(&p).await;
                 return Err("subscribe FileData: timed out".into());
             }
         }
@@ -1209,11 +1298,11 @@ impl WorkerState {
         ).await {
             Ok(Ok(s)) => Box::pin(s),
             Ok(Err(e)) => {
-                drop_link(&p).await;
+                polite_drop_link(&p).await;
                 return Err(format!("notifications: {e}"));
             }
             Err(_) => {
-                drop_link(&p).await;
+                polite_drop_link(&p).await;
                 return Err("notifications: timed out".into());
             }
         };
@@ -1232,6 +1321,13 @@ impl WorkerState {
             // dropping `ntx` here makes the consumer's `recv()` return None,
             // which the worker loop treats as a remote disconnect.
         });
+        // Drop any DeviceDisconnected events queued for the PREVIOUS link of
+        // this same box: without this drain, a late didDisconnect from the
+        // drop we just recovered from would match our id on the next sweep
+        // and instantly tear the fresh link down again.
+        if let Some(rx) = self.central_rx.as_mut() {
+            while rx.try_recv().is_ok() {}
+        }
         self.peripheral  = Some(p);
         self.notif_rx    = Some(nrx);
         self.notif_pump  = Some(pump);
@@ -1290,9 +1386,13 @@ impl WorkerState {
     }
 
     async fn auto_reconnect(&mut self, id: String) -> bool {
-        // A stale abort from a *previous* link must not kill this fresh
-        // recovery — the user pressing Disconnect now is what sets it.
-        self.clear_abort();
+        // NOTE: no clear_abort() here. Every request_abort() is paired with
+        // a queued BleCmd::Disconnect whose handler consumes the flag, so a
+        // "stale" abort cannot exist at entry — but a FRESH abort can: the
+        // user clicks Disconnect while we're still inside the teardown that
+        // precedes this call. The old entry-clear silently swallowed exactly
+        // that click and looped an unbounded Auto-Mode reconnect against the
+        // user's will (the queued Disconnect starving behind it).
         let mut attempt: u32 = 0;
         // macOS retrieve-by-id fast path: give up on it after this many
         // consecutive failures this invocation (box is genuinely silent, not
@@ -1499,6 +1599,32 @@ impl WorkerState {
             }
             CurrentOp::Idle => {}
         }
+        // macOS: ask the box to terminate the link from ITS side (0x0F →
+        // ble_recover_lost_peer → real HCI_Disconnect + re-advertise) before
+        // we cancel locally. cancelPeripheralConnection only detaches the
+        // app's view; bluetoothd can keep the ACL alive with LL keepalives,
+        // leaving the box connected-in-limbo and invisible to EVERY central
+        // (iPhone and Mac) until its 90 s peer-gone watchdog fires. This runs
+        // on ALL teardown paths now, not just the Disconnect button: on the
+        // drop-recovery paths the link is often only *app-dead* (silent macOS
+        // delivery stop) while the ACL still stands — exactly the zombie case
+        // where the write still reaches the box and frees it. On a truly dead
+        // link the write fails fast / times out (bounded 3 s) — cheap.
+        // ACK-confirmed WithResponse: a write-without-response is resolved
+        // instantly by btleplug and CoreBluetooth drops the still-queued
+        // frame on cancel (see write_cmd_confirmed).
+        if self.peripheral.is_some() {
+            match self.write_cmd_confirmed(&[OP_DISCONNECT]).await {
+                Ok(()) => {
+                    eprintln!("[teardown] 0x0F confirmed — box tears down + re-advertises");
+                    self.emit(BleEvent::Status(
+                        "sent host-disconnect (0x0F) — box will re-advertise".into()));
+                }
+                Err(e) => {
+                    eprintln!("[teardown] 0x0F not delivered ({e}) — local cancel only");
+                }
+            }
+        }
         // Stop the notify pump (drops its stream) before tearing the link
         // down, then clear the receiver.
         if let Some(pump) = self.notif_pump.take() {
@@ -1521,10 +1647,20 @@ impl WorkerState {
             .cloned()
             .ok_or_else(|| "FileCmd not discovered".to_string())?;
         // Write-without-response — the box doesn't ack opcodes; replies
-        // come back over FileData.
-        p.write(&cmd_char, payload, WriteType::WithoutResponse)
-            .await
-            .map_err(|e| format!("write FileCmd: {e}"))
+        // come back over FileData. Bounded: on a peripheral that a late
+        // didDisconnect purged from the vendored fork's CB-thread map, the
+        // write's reply future is never resolved (write_value silently sets
+        // no reply on a map miss) — unbounded, one LIST/SET_TIME issued in
+        // that window froze the worker forever.
+        match tokio::time::timeout(
+            LINK_OP_TIMEOUT,
+            p.write(&cmd_char, payload, WriteType::WithoutResponse),
+        )
+        .await
+        {
+            Ok(r)  => r.map_err(|e| format!("write FileCmd: {e}")),
+            Err(_) => Err("write FileCmd: timed out (link dead?)".into()),
+        }
     }
 
     /// Write a FileCmd opcode with an ATT **write-response** and wait for the
@@ -2362,6 +2498,75 @@ impl WorkerState {
 /// which is enough to free our state and let reconnect proceed.
 async fn drop_link(p: &Peripheral) {
     let _ = tokio::time::timeout(Duration::from_secs(3), p.disconnect()).await;
+}
+
+/// Bounded "is this link (still/now) established?" probe. NEVER call the
+/// vendored fork's `is_connected` unbounded: on a map-purged peripheral (a
+/// late `didDisconnectPeripheral` removed it from the CB-thread map) the
+/// fork silently sets no reply and the future pends forever — on our single
+/// worker thread that froze the entire BLE backend until app restart.
+/// Timeout/err ⇒ treat as "not connected" and fall through to the plain
+/// bounded cancel.
+async fn link_probably_connected(p: &Peripheral) -> bool {
+    matches!(
+        tokio::time::timeout(Duration::from_secs(3), p.is_connected()).await,
+        Ok(Ok(true))
+    )
+}
+
+/// Tear down a link that IS (or may just have become) established, politely:
+/// best-effort 0x0F host-disconnect first, then the local cancel. Needed on
+/// every path that abandons a *connected* peripheral outside the normal
+/// `disconnect_inner` flow — most critically the pending-connect abort race:
+/// the user clicks Disconnect (or a budget/demote fires) while `p.connect()`
+/// is pending, and the connect completes at the CoreBluetooth level a beat
+/// before we cancel. A bare `drop_link` then only detaches the app's view;
+/// bluetoothd keeps the fresh ACL alive and the box is stranded connected-in-
+/// limbo with no app owning it — invisible to iPhone AND Mac until its 90 s
+/// peer-gone watchdog (or a Mac BT toggle / box power-cycle).
+///
+/// On the raced-connect path the app-side characteristics cache is EMPTY:
+/// it is populated only by `Peripheral::connect()` consuming its
+/// `Connected(services)` reply, and that future was dropped/timed out
+/// (`discover_services` is a no-op on the CoreBluetooth backend, so calling
+/// it here cannot help). The CB-thread map, however, IS populated by the
+/// delegate's auto-discovery on didConnect — and `write` looks the target up
+/// by (service_uuid, char_uuid) in THAT map. So when the cache misses we
+/// write through a synthetic Characteristic instead. The write is retried
+/// briefly: delegate discovery may still be in flight right after the raced
+/// connect. Every step bounded; only these rare abort/failure paths pay it.
+async fn polite_drop_link(p: &Peripheral) {
+    let cmd_char = p
+        .characteristics()
+        .iter()
+        .find(|c| c.uuid == FILECMD_UUID)
+        .cloned()
+        .unwrap_or_else(|| Characteristic {
+            uuid: FILECMD_UUID,
+            service_uuid: FSYNC_SVC_UUID,
+            properties: CharPropFlags::WRITE,
+            descriptors: Default::default(),
+        });
+    let mut sent = false;
+    for attempt in 0..2u8 {
+        match tokio::time::timeout(
+            HOST_DISCONNECT_ACK_TIMEOUT,
+            p.write(&cmd_char, &[OP_DISCONNECT], WriteType::WithResponse),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                eprintln!("[teardown] polite 0x0F confirmed — box re-advertises");
+                sent = true;
+                break;
+            }
+            other => eprintln!("[teardown] polite 0x0F attempt {attempt} failed ({other:?})"),
+        }
+    }
+    if !sent {
+        eprintln!("[teardown] polite 0x0F undeliverable — plain cancel (box may need its own watchdog)");
+    }
+    drop_link(p).await;
 }
 
 fn parse_list_row(line: &[u8]) -> Option<(String, u64)> {
