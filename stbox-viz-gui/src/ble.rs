@@ -41,6 +41,12 @@
 //!                               OK (link drops ~200 ms later) / 0xE4 hash-
 //!                               mismatch / 0xE7 short-image / 0xE5 flash-fail.
 //!   0x0C FW_ABORT  — cancel the session. Reply: 1 byte 0x00.
+//!   0x0D GPS_BRIDGE <u8>      — relay u-blox UBX over BLE (GPS Debug tab)
+//!   0x0E GPS_TX <bytes…>      — forward host UBX poll frames to the u-blox
+//!   0x0F DISCONNECT           — box HCI-terminates the link + re-advertises.
+//!                               No reply. macOS fix: cancelPeripheralConnection
+//!                               leaves the ACL alive controller-side, so we ask
+//!                               the box to drop it (firmware v0.0.22+).
 //!
 //!   Status bytes: 0x00 OK, 0xB0 BUSY, 0xE1 NOT_FOUND, 0xE2 IO_ERROR, 0xE3 BAD_REQ.
 
@@ -226,6 +232,23 @@ const OP_FW_BEGIN:  u8 = 0x09;
 const OP_FW_DATA:   u8 = 0x0A;
 const OP_FW_COMMIT: u8 = 0x0B;
 const OP_FW_ABORT:  u8 = 0x0C;
+
+/// Host-requested disconnect (macOS fix, firmware v0.0.22+). On macOS
+/// `cancelPeripheralConnection` tears down only the *app's* view of the link;
+/// bluetoothd keeps the ACL alive with LL keepalives, so the box never sees
+/// LL_TERMINATE, its supervision timer never fires, and it stays connected-in-
+/// limbo advertising non-connectably — the next central (e.g. the iPhone) then
+/// can't connect until a box power-cycle. iOS tears the link down for real, so
+/// it doesn't hit this. We send this fire-and-forget opcode right before
+/// `drop_link` so the box terminates the link from ITS side (real LL_TERMINATE)
+/// and re-advertises. Legacy firmware silently ignores it (unknown opcode).
+const OP_DISCONNECT: u8 = 0x0F;
+
+/// How long to let the `0x0F` ATT write reach the box before we cancel the
+/// connection locally. Write-without-response returns immediately, so without
+/// this pause `drop_link` could cancel before the frame is on air and the box
+/// would never get the chance to tear down its side.
+const HOST_DISCONNECT_SETTLE: Duration = Duration::from_millis(400);
 
 /// Bytes of image per FW_DATA chunk (the write is `1 + 4 + FW_CHUNK` =
 /// 165 B, safely under any negotiated MTU — btleplug doesn't expose the
@@ -911,6 +934,18 @@ impl WorkerState {
             BleCmd::Scan        => self.scan().await,
             BleCmd::Connect(id) => self.connect(id).await,
             BleCmd::Disconnect  => {
+                // macOS: ask the box to terminate the link from its side
+                // *before* we cancel locally, so it actually sees a
+                // LL_TERMINATE and re-advertises connectably (see
+                // OP_DISCONNECT). Best-effort — a write failure just means
+                // we fall back to the plain local cancel below. Only on this
+                // intentional-disconnect path: the drop-recovery callers of
+                // disconnect_inner face an already-dead link with nothing to
+                // tell, and must not eat this settle delay before reconnect.
+                if self.peripheral.is_some() {
+                    let _ = self.write_cmd(&[OP_DISCONNECT]).await;
+                    tokio::time::sleep(HOST_DISCONNECT_SETTLE).await;
+                }
                 self.disconnect_inner().await;
                 self.release_power();
                 self.emit(BleEvent::Disconnected);
