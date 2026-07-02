@@ -1049,27 +1049,27 @@ fn render_file_group(
     delete_target: &mut Option<String>,
 ) {
     if indices.is_empty() { return; }
-    /* Header strip with a "Select all" toggle on the right. The
-       toggle reads the common state of the group (all on / all off /
-       mixed) so the user can flip the whole section in one click. */
+    /* Header strip with a "Select all" toggle right next to the title —
+       left-packed like the file rows, not pinned to the window's far right
+       (where it sat a full window-width away from the list it acts on). The
+       toggle reads the common state of the group (all on / all off / mixed)
+       so the user can flip the whole section in one click. */
     let all_on  = indices.iter().all(|&i| files[i].selected);
     let none_on = indices.iter().all(|&i| !files[i].selected);
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(
             egui::RichText::new(title).strong().size(13.0)
         ));
+        let label = if all_on { "Untick all" }
+                    else if none_on { "Tick all" }
+                    else { "Tick all" };
+        if ui.small_button(label).clicked() {
+            let new_val = !all_on;
+            for &i in indices { files[i].selected = new_val; }
+        }
         ui.label(egui::RichText::new(format!("({})", indices.len()))
             .small()
             .color(egui::Color32::from_gray(140)));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let label = if all_on { "Untick all" }
-                        else if none_on { "Tick all" }
-                        else { "Tick all" };
-            if ui.small_button(label).clicked() {
-                let new_val = !all_on;
-                for &i in indices { files[i].selected = new_val; }
-            }
-        });
     });
     for &i in indices {
         let f = &mut files[i];
