@@ -704,6 +704,10 @@ impl AppState {
             sync: SyncCore {
                 ble_out_dir,
                 ble_session_duration_s: 1800, // 30-min default
+                // Seed the last-box id from the persisted config so the
+                // "Reconnect (last box)" button works right after launch,
+                // before any connect this session.
+                ble_last_box_id: agent_config::AgentConfig::load().box_id,
                 log: log.clone(),
                 ..Default::default()
             },
@@ -1267,6 +1271,31 @@ impl AppState {
                         let b = self.ensure_ble();
                         b.send(BleCmd::Scan);
                     }
+                    // Reconnect straight to the last box by id — no scan. On
+                    // macOS CoreBluetooth suppresses a recently-disconnected
+                    // peripheral from scan results, so after Disconnect the box
+                    // never reappears in the "Discovered" list and there's no
+                    // Connect button to click (the iPhone, a different central,
+                    // sees it fine — the classic Mac-only reconnect gap). This
+                    // sends Connect(last_id) directly; connect_core's retrieve-
+                    // by-id fallback pulls the box in without needing a scan hit.
+                    if let Some(last_id) = self.sync.ble_last_box_id.clone() {
+                        if ui
+                            .add_enabled(!scanning && !connected, egui::Button::new("Reconnect (last box)"))
+                            .on_hover_text(
+                                "Reconnect to the last box by id without scanning. Use this on \
+                                 macOS after Disconnect, when the box doesn't reappear under \
+                                 Discovered (CoreBluetooth hides a just-disconnected device).",
+                            )
+                            .clicked()
+                        {
+                            self.sync.ble_state = BleState::Connecting;
+                            self.sync.ble_status = "reconnecting to last box…".into();
+                            self.sync.ble_connected_id = Some(last_id.clone());
+                            let b = self.ensure_ble();
+                            b.send(BleCmd::Connect(last_id));
+                        }
+                    }
                     // Disable while ANY worker op is in flight — a big
                     // keep-synced READ holds the BLE worker busy for
                     // minutes, and tap-while-busy would pile a second
@@ -1540,6 +1569,10 @@ impl AppState {
                                    can key per-box; the worker's Connected
                                    event doesn't echo the id back. */
                                 self.sync.ble_connected_id = Some(d.id.clone());
+                                // Remember it across disconnect too, so the
+                                // "Reconnect (last box)" button can retrieve it
+                                // by id when CoreBluetooth scan-suppresses it.
+                                self.sync.ble_last_box_id = Some(d.id.clone());
                                 // Persist the box id so the headless
                                 // agent reconnects to this same box.
                                 self.sync.persist_config();

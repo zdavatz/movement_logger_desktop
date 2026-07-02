@@ -129,6 +129,13 @@ pub struct SyncCore {
     /// time. Used as the per-box key in the sync DB so two different
     /// boxes don't share sync history. Cleared on disconnect.
     pub ble_connected_id: Option<String>,
+    /// Last box id we connected to, **kept across disconnect** (unlike
+    /// `ble_connected_id`). Backs the Sync-tab "Reconnect (last box)" button so
+    /// a Mac→Mac reconnect works even when CoreBluetooth scan-suppresses the
+    /// recently-connected box (the manual connect then goes through the
+    /// retrieve-by-id fallback in `ble.rs::connect_core`). Seeded from the
+    /// persisted `config.toml` box_id on startup so it survives an app restart.
+    pub ble_last_box_id: Option<String>,
     /// Lazily-opened local sync-state DB (`~/.movementlogger/sync.db`).
     /// `None` until the first sync; stays `None` (sync disabled, msg
     /// set) if the DB can't be opened.

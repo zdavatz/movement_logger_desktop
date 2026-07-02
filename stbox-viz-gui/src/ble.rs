@@ -244,11 +244,11 @@ const OP_FW_ABORT:  u8 = 0x0C;
 /// and re-advertises. Legacy firmware silently ignores it (unknown opcode).
 const OP_DISCONNECT: u8 = 0x0F;
 
-/// How long to let the `0x0F` ATT write reach the box before we cancel the
-/// connection locally. Write-without-response returns immediately, so without
-/// this pause `drop_link` could cancel before the frame is on air and the box
-/// would never get the chance to tear down its side.
-const HOST_DISCONNECT_SETTLE: Duration = Duration::from_millis(400);
+/// How long to wait for the `0x0F` ATT write-response before we give up and
+/// cancel the connection locally anyway. The box sends the ATT ACK before it
+/// acts on the opcode, so this normally resolves in well under a second; the
+/// bound just stops a flaky link from hanging the disconnect.
+const HOST_DISCONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bytes of image per FW_DATA chunk (the write is `1 + 4 + FW_CHUNK` =
 /// 165 B, safely under any negotiated MTU — btleplug doesn't expose the
@@ -942,12 +942,27 @@ impl WorkerState {
                 // intentional-disconnect path: the drop-recovery callers of
                 // disconnect_inner face an already-dead link with nothing to
                 // tell, and must not eat this settle delay before reconnect.
-                if self.peripheral.is_some() {
-                    let _ = self.write_cmd(&[OP_DISCONNECT]).await;
-                    tokio::time::sleep(HOST_DISCONNECT_SETTLE).await;
+                let had_link = self.peripheral.is_some();
+                eprintln!("[disconnect] BleCmd::Disconnect — had_link={had_link}");
+                if had_link {
+                    // WithResponse (ACK-confirmed) — a write-without-response
+                    // would be dropped by CoreBluetooth when we cancel below
+                    // before it ever hit the air. See write_cmd_confirmed.
+                    match self.write_cmd_confirmed(&[OP_DISCONNECT]).await {
+                        Ok(())  => {
+                            eprintln!("[disconnect] 0x0F confirmed — box should re-advertise");
+                            self.emit(BleEvent::Status(
+                                "sent host-disconnect (0x0F) — box will re-advertise".into()));
+                        }
+                        Err(e)  => {
+                            eprintln!("[disconnect] 0x0F NOT confirmed: {e}");
+                            self.emit_err(format!("host-disconnect (0x0F) not confirmed: {e}"));
+                        }
+                    }
                 }
                 self.disconnect_inner().await;
                 self.release_power();
+                eprintln!("[disconnect] teardown complete — worker idle, box released");
                 self.emit(BleEvent::Disconnected);
             }
             BleCmd::List        => self.list().await,
@@ -1015,15 +1030,20 @@ impl WorkerState {
             self.emit_err("already connected — disconnect first");
             return;
         }
+        eprintln!("[connect] manual Connect requested for {id}");
         match self.connect_core(&id, ConnectMode::Manual).await {
             Ok(()) => {
+                eprintln!("[connect] manual Connect OK for {id}");
                 self.last_id = Some(id);
                 // Hold the OS awake for the whole session (kept across any
                 // later auto-reconnect windows; released on Disconnect).
                 self.hold_power();
                 self.emit(BleEvent::Connected);
             }
-            Err(e) => self.emit_err(e),
+            Err(e) => {
+                eprintln!("[connect] manual Connect FAILED: {e}");
+                self.emit_err(e);
+            }
         }
     }
 
@@ -1041,10 +1061,43 @@ impl WorkerState {
             .peripherals()
             .await
             .map_err(|e| format!("peripherals: {e}"))?;
-        let p = peripherals
-            .into_iter()
-            .find(|x| x.id().to_string() == id)
-            .ok_or_else(|| "peripheral gone — rescan".to_string())?;
+        let p = match peripherals.into_iter().find(|x| x.id().to_string() == id) {
+            Some(p) => p,
+            None => {
+                // macOS: after a disconnect CoreBluetooth stops returning the
+                // recently-connected box in scan results, so `peripherals()`
+                // (fed by scan) won't list it — a plain manual Connect / Mac→Mac
+                // reconnect then fails with "peripheral gone" even though the box
+                // is re-advertising and the iPhone can see it. Retrieve it by id
+                // (btleplug-patched `add_peripheral` → retrievePeripherals-
+                // withIdentifiers) to repopulate btleplug's map, then look again.
+                // Same scan-suppression fix `auto_reconnect` already uses, now on
+                // the manual path too. No-op on Linux/Windows (scan works there).
+                #[cfg(target_os = "macos")]
+                {
+                    let uuid = Uuid::parse_str(id).map_err(|e| format!("bad box id: {e}"))?;
+                    let pid: btleplug::platform::PeripheralId = uuid.into();
+                    adapter
+                        .add_peripheral(&pid)
+                        .await
+                        .map_err(|e| format!("retrieve-by-id: {e}"))?;
+                    self.emit(BleEvent::Status(
+                        "connect: box scan-suppressed — retrieved by id (no scan)".into(),
+                    ));
+                    adapter
+                        .peripherals()
+                        .await
+                        .map_err(|e| format!("peripherals: {e}"))?
+                        .into_iter()
+                        .find(|x| x.id().to_string() == id)
+                        .ok_or_else(|| "peripheral gone — rescan".to_string())?
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err("peripheral gone — rescan".into());
+                }
+            }
+        };
         // The connect step. Manual = bounded + cancel-on-timeout (snappy UI).
         // Reconnect = hold ONE pending CoreBluetooth connect and let it ride
         // the box's post-drop self-heal; cancel (via drop_link →
@@ -1472,6 +1525,35 @@ impl WorkerState {
         p.write(&cmd_char, payload, WriteType::WithoutResponse)
             .await
             .map_err(|e| format!("write FileCmd: {e}"))
+    }
+
+    /// Write a FileCmd opcode with an ATT **write-response** and wait for the
+    /// ACK. Needed for OP_DISCONNECT: a write-without-response is queued by
+    /// CoreBluetooth and resolved instantly by btleplug (it never waits for
+    /// peripheralIsReadyToSendWriteWithoutResponse), so a `cancelPeripheral-
+    /// Connection` fired shortly after can drop the still-untransmitted frame
+    /// and the box never sees the opcode. WithResponse resolves only on the
+    /// ATT ACK, guaranteeing the box received it before we tear the link down.
+    /// Bounded by a short timeout: the firmware sends the ATT response before
+    /// it acts on the opcode, but if the link is already flaky we don't want to
+    /// hang the disconnect — we cancel locally either way.
+    async fn write_cmd_confirmed(&self, payload: &[u8]) -> Result<(), String> {
+        let Some(p) = self.peripheral.as_ref() else {
+            return Err("not connected".into());
+        };
+        let chars = p.characteristics();
+        let cmd_char = chars.iter().find(|c| c.uuid == FILECMD_UUID)
+            .cloned()
+            .ok_or_else(|| "FileCmd not discovered".to_string())?;
+        match tokio::time::timeout(
+            HOST_DISCONNECT_ACK_TIMEOUT,
+            p.write(&cmd_char, payload, WriteType::WithResponse),
+        )
+        .await
+        {
+            Ok(r)  => r.map_err(|e| format!("write FileCmd (confirmed): {e}")),
+            Err(_) => Err("write FileCmd (confirmed): ATT ACK timed out".into()),
+        }
     }
 
     /// GPS bridge on/off (`0x0D <u8>`). Fire-and-forget (no op slot): the
