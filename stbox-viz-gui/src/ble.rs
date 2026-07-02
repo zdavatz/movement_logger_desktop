@@ -1754,15 +1754,22 @@ impl WorkerState {
             self.emit_err("not connected");
             return;
         }
-        // Opcode payload: 0x02 + name + NUL + 4-byte LE start offset.
-        // The firmware (ble.c READ handler) seeks to `offset` before
-        // streaming, so a resumed transfer continues mid-file. offset
-        // is u32 on the wire — SD files are well under 4 GiB.
-        let mut payload = Vec::with_capacity(name.len() + 6);
+        // Opcode payload: 0x02 + name + NUL + 4-byte LE start offset +
+        // 4-byte LE stream-length cap (firmware v0.0.24+). The firmware
+        // seeks to `offset` and streams EXACTLY `size - offset` bytes.
+        // Without the cap it streamed to EOF-at-read-time — but the ACTIVE
+        // session file keeps growing, so the box over-delivered past our
+        // LIST-size expectation and the excess bytes bled into the NEXT
+        // queued download's content (GPS057/BAT057 full of SENS rows,
+        // 02.07.2026). Legacy firmware ignores the extra 4 bytes (it only
+        // parses name + offset) and falls back to stream-to-EOF.
+        // offset/len are u32 on the wire — SD files are well under 4 GiB.
+        let mut payload = Vec::with_capacity(name.len() + 10);
         payload.push(0x02);
         payload.extend_from_slice(name.as_bytes());
         payload.push(0x00);
         payload.extend_from_slice(&(offset as u32).to_le_bytes());
+        payload.extend_from_slice(&(size.saturating_sub(offset) as u32).to_le_bytes());
         if let Err(e) = self.write_cmd(&payload).await {
             self.emit_err(e);
             return;

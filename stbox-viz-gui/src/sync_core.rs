@@ -812,33 +812,60 @@ impl SyncCore {
     /// (which had the worker reject every read after the first).
     pub fn advance_download_queue(&mut self) {
         if self.ble_dl_in_flight { return; }
-        let Some((name, size)) = self.ble_dl_queue.pop_front() else {
-            // Queue drained. If a sync pass was running, mark it complete
-            // and clear the cumulative-progress totals so the UI line
-            // disappears between passes.
-            if self.sync_pass_total > 0 {
-                self.sync_pass_total = 0;
-                self.sync_pass_total_bytes = 0;
-                self.sync_pass_completed_bytes = 0;
+        loop {
+            let Some((name, size)) = self.ble_dl_queue.pop_front() else {
+                // Queue drained. If a sync pass was running, mark it complete
+                // and clear the cumulative-progress totals so the UI line
+                // disappears between passes.
+                if self.sync_pass_total > 0 {
+                    self.sync_pass_total = 0;
+                    self.sync_pass_total_bytes = 0;
+                    self.sync_pass_completed_bytes = 0;
+                }
+                self.sync_in_flight_name = None;
+                return;
+            };
+            // Resume/grow from whatever is already mirrored locally. The
+            // firmware seeks to this offset, so an interrupted file
+            // continues and a grown log only fetches its new tail.
+            let offset = mirror_offset(&self.ble_out_dir, &name, size);
+            // Nothing to fetch: a 0-byte file (the FSEV~128 / SPOTL~99
+            // phantoms) or a manual re-download of an already-complete
+            // mirror. Issuing a READ here would hang: the box streams zero
+            // bytes, no FileData notify ever arrives, and the 45 s READ
+            // watchdog then tears the whole link down — one ticked 0-byte
+            // row used to cost a stall + reconnect. Mark the row done
+            // locally and move on to the next queue entry instead.
+            if offset >= size {
+                for f in self.ble_files.iter_mut() {
+                    if f.name == name {
+                        f.downloaded = true;
+                        f.bytes_done = f.size;
+                    }
+                }
+                if self.sync_pass_total > 0 {
+                    self.sync_pass_completed_bytes =
+                        self.sync_pass_completed_bytes.saturating_add(size);
+                }
+                push_log(
+                    &self.log,
+                    format!("ble: {name} already complete locally ({size} B) — skipped"),
+                );
+                continue;
             }
-            self.sync_in_flight_name = None;
+            let Some(b) = self.ble.as_ref() else { return; };
+            b.send(BleCmd::Read { name: name.clone(), size, offset });
+            self.sync_in_flight_name = Some(name.clone());
+            self.ble_dl_in_flight = true;
+            if offset > 0 {
+                push_log(
+                    &self.log,
+                    format!("ble: resuming {name} at {offset}/{size} B"),
+                );
+            } else {
+                push_log(&self.log, format!("ble: reading {name} ({size} B)"));
+            }
             return;
-        };
-        // Resume/grow from whatever is already mirrored locally. The
-        // firmware seeks to this offset, so an interrupted file
-        // continues and a grown log only fetches its new tail.
-        let offset = mirror_offset(&self.ble_out_dir, &name, size);
-        let Some(b) = self.ble.as_ref() else { return; };
-        b.send(BleCmd::Read { name: name.clone(), size, offset });
-        self.sync_in_flight_name = Some(name.clone());
-        self.ble_dl_in_flight = true;
-        if offset > 0 {
-            push_log(
-                &self.log,
-                format!("ble: resuming {name} at {offset}/{size} B"),
-            );
-        } else {
-            push_log(&self.log, format!("ble: reading {name} ({size} B)"));
         }
     }
 
