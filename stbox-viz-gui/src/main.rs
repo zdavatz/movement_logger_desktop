@@ -865,7 +865,7 @@ impl AppState {
                         push_log(
                             &self.log,
                             format!(
-                                "Update available: v{} → {}",
+                                "Update available: v{} -> {}",
                                 env!("CARGO_PKG_VERSION"),
                                 info.pretty()
                             ),
@@ -997,7 +997,7 @@ impl AppState {
                     ui.add_space(4.0);
                     ui.add(bar.text(phase_label));
                     if !p.detail.is_empty() {
-                        ui.label(egui::RichText::new(p.detail).weak().small());
+                        ui.label(egui::RichText::new(p.detail).weak());
                     }
                 }
                 if let Some(err) = self.install_error.clone() {
@@ -1076,9 +1076,7 @@ fn render_file_group(
         ui.add(egui::Label::new(
             egui::RichText::new(title).strong().size(13.0)
         ));
-        ui.label(egui::RichText::new(format!("({})", indices.len()))
-            .small()
-            .color(egui::Color32::from_gray(140)));
+        ui.label(egui::RichText::new(format!("({})", indices.len())));
         let label = if all_on { "Untick all" }
                     else if none_on { "Tick all" }
                     else { "Tick all" };
@@ -1160,9 +1158,7 @@ impl AppState {
                 "BLE FileSync — scan, connect (PIN 123456), list SD files. \
                  \"Download selected\" = manual transfer; \"Sync now\" = pull \
                  every new session, tracked in a local DB (never deletes on the box).",
-            )
-            .small()
-            .color(egui::Color32::from_gray(180)),
+            ),
         );
         ui.add_space(4.0);
         // Block-scoped to keep the body's existing closure-flavoured
@@ -1558,7 +1554,6 @@ impl AppState {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(&self.sync.ble_status)
-                                        .small()
                                         .color(egui::Color32::LIGHT_BLUE),
                                 )
                                 .selectable(true),
@@ -1740,9 +1735,7 @@ impl AppState {
                                 ui.colored_label(red, format!("⚠ {err}"));
                             } else if abs != self.sync.ble_out_dir {
                                 ui.label(
-                                    egui::RichText::new(format!("→ {}", abs.display()))
-                                        .small()
-                                        .color(egui::Color32::from_gray(150)),
+                                    egui::RichText::new(format!("-> {}", abs.display())),
                                 );
                             }
                         }
@@ -1750,9 +1743,7 @@ impl AppState {
 
                     if self.sync.ble_files.is_empty() {
                         ui.label(
-                            egui::RichText::new("No file list yet — hit Refresh.")
-                                .small()
-                                .color(egui::Color32::from_gray(170)),
+                            egui::RichText::new("No file list yet — hit Refresh."),
                         );
                     } else {
                         ui.add_space(4.0);
@@ -1882,12 +1873,10 @@ impl AppState {
             egui::RichText::new(
                 "Live CoreBluetooth diagnostics: prints every discovery event, \
                  checks the saved box id, then runs a bounded connect probe \
-                 (connect → subscribe → LIST → reply count). The output is \
+                 (connect -> subscribe -> LIST -> reply count). The output is \
                  also saved as a .log file in the download folder — send that \
                  file when reporting connection problems.",
-            )
-            .small()
-            .color(egui::Color32::from_gray(180)),
+            ),
         );
         ui.add_space(6.0);
 
@@ -2086,9 +2075,7 @@ impl AppState {
                  quality (DOP, accuracy), per-signal C/N0, and RF/antenna health \
                  (antStatus, AGC, jamming). Polls the receiver once a second and \
                  writes CSVs. Read-only — it never reconfigures the receiver.",
-            )
-            .small()
-            .color(egui::Color32::from_gray(180)),
+            ),
         );
         ui.add_space(6.0);
 
@@ -2169,8 +2156,7 @@ impl AppState {
                     ui.label(
                         egui::RichText::new(
                             "the connected box (no cable — bridges the u-blox over BLE)",
-                        )
-                        .color(egui::Color32::from_gray(180)),
+                        ),
                     );
                     ui.end_row();
                 }
@@ -2224,9 +2210,7 @@ impl AppState {
                  opcode; on older firmware you'll just see \"no NAV-PVT reply\".",
         };
         ui.label(
-            egui::RichText::new(hint)
-                .small()
-                .color(egui::Color32::from_gray(150)),
+            egui::RichText::new(hint),
         );
 
         ui.separator();
@@ -2455,9 +2439,7 @@ impl AppState {
             egui::RichText::new(
                 "SensorStream — 0.5 Hz packed all-sensor snapshot \
                  (IMU + mag + baro + GPS).",
-            )
-            .small()
-            .color(egui::Color32::from_gray(180)),
+            ),
         );
 
         // ----- Connection / capability gate ------------------------
@@ -2475,8 +2457,7 @@ impl AppState {
                     egui::RichText::new(
                         "Open the Sync tab, run Scan, and Connect to a box (PIN 123456). \
                          The live stream starts automatically — no extra button needed.",
-                    )
-                    .color(egui::Color32::from_gray(200)),
+                    ),
                 );
                 ui.add_space(8.0);
                 if ui.button("Go to Sync").clicked() {
@@ -2916,8 +2897,7 @@ impl eframe::App for AppState {
                         ui.label(
                             egui::RichText::new(
                                 "Sens*.csv • *_gps.csv (auto-paired) • .mov / .mp4 • .stl (optional)",
-                            )
-                            .color(egui::Color32::from_gray(200)),
+                            ),
                         );
                     });
                 });
@@ -3063,7 +3043,7 @@ impl eframe::App for AppState {
                 }
                 if let Some(msg) = &self.update_status_msg {
                     if self.update_info.is_none() {
-                        ui.label(egui::RichText::new(msg).weak().small());
+                        ui.label(egui::RichText::new(msg).weak());
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3393,6 +3373,16 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         &title,
         options,
-        Box::new(|_cc| Ok(Box::new(AppState::new()))),
+        Box::new(|cc| {
+            // Readability: egui's default text styles (12.5 px body) read
+            // small on macOS. Scale every style up ~20% once at startup;
+            // Ctrl/Cmd +/- zoom still works on top of this baseline.
+            let mut style = (*cc.egui_ctx.style()).clone();
+            for font in style.text_styles.values_mut() {
+                font.size = (font.size * 1.2).round();
+            }
+            cc.egui_ctx.set_style(style);
+            Ok(Box::new(AppState::new()))
+        }),
     )
 }
