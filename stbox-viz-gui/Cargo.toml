@@ -67,6 +67,11 @@ fs4 = { version = "1", features = ["sync"] }
 # GUI does in eframe::App::on_exit. Issue #14 part B.
 ctrlc = { version = "3", features = ["termination"] }
 
+# btleplug's internal CoreBluetooth log lines for the headless BLE
+# diagnostic (`--ble-debug`, RUST_LOG-controlled). Tiny; also used by
+# examples/ble_probe.rs.
+env_logger = "0.11"
+
 # Local sync-state DB: tracks, per box, which SD-card files have
 # already been pulled so "Sync now" only fetches new sessions. The
 # `bundled` feature compiles SQLite from source so there's no system

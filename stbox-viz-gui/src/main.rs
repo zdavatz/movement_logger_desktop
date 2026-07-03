@@ -18,6 +18,7 @@ mod agent;
 mod agent_config;
 mod autostart;
 mod ble;
+mod ble_debug;
 mod coord;
 mod installer;
 mod power;
@@ -3115,6 +3116,17 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         };
         std::process::exit(agent::flash(std::path::Path::new(path)));
+    }
+    /* Headless BLE diagnostic (`--ble-debug [seconds]`) — the GPS-Debug
+       analogue for the BLE side: prints every CoreBluetooth discovery
+       event live, then a retrieve-by-id test and a bounded connect
+       probe. Like --agent, returns before any window code. */
+    if let Some(pos) = args.iter().position(|a| a == "--ble-debug") {
+        let secs = args
+            .get(pos + 1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(20);
+        std::process::exit(ble_debug::run(secs));
     }
     // Autostart (de)registration entry points — invoked in a clean
     // child by the updater/agent so the login item always points at
