@@ -61,7 +61,10 @@ enum Tab {
     Live,
     Sync,
     Replay,
-    Gps,
+    /// Diagnostics: BLE probe (headless --ble-debug as a child) + the
+    /// GPS/antenna survey. One tab so every "send me the output" tool
+    /// lives in the same place.
+    Debug,
 }
 
 impl Default for Tab {
@@ -175,6 +178,17 @@ struct AppState {
     gps_dbg_cancel: Arc<AtomicBool>,
     /// True while a `gps-debug` child is alive.
     gps_dbg_running: Arc<AtomicBool>,
+
+    /// BLE debug probe (Debug tab): scan window in seconds for the
+    /// `MovementLogger --ble-debug N` child.
+    ble_dbg_secs: String,
+    /// Live output from the --ble-debug child; also mirrored to a
+    /// timestamped .log file in the download (CSV) folder.
+    ble_dbg_log: Arc<Mutex<Vec<String>>>,
+    /// Stop flag — flipped by the Stop button, polled by the reaper.
+    ble_dbg_cancel: Arc<AtomicBool>,
+    /// True while a --ble-debug child is alive.
+    ble_dbg_running: Arc<AtomicBool>,
 
     /// Cached GPU texture for the top-right logo. Lazily uploaded on
     /// first frame so the egui context is available.
@@ -713,6 +727,7 @@ impl AppState {
                 ..Default::default()
             },
             log,
+            ble_dbg_secs: "20".to_string(),
             gps_dbg_baud: "38400".to_string(),
             gps_dbg_label: "antenna".to_string(),
             // Pre-fill the serial port from a one-shot scan so the common
@@ -1859,6 +1874,210 @@ impl AppState {
     /// For antenna selection + mounting evaluation — fix quality,
     /// per-signal C/N0, RF/antenna health. CSVs land in a `gps-debug`
     /// subfolder of the configured save dir.
+    /// Debug tab: BLE probe section on top, GPS/antenna survey below —
+    /// every "run this and send me the output" diagnostic in one place.
+    fn ui_debug_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("BLE Debug");
+        ui.label(
+            egui::RichText::new(
+                "Live CoreBluetooth diagnostics: prints every discovery event, \
+                 checks the saved box id, then runs a bounded connect probe \
+                 (connect → subscribe → LIST → reply count). The output is \
+                 also saved as a .log file in the download folder — send that \
+                 file when reporting connection problems.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(180)),
+        );
+        ui.add_space(6.0);
+
+        let running = self.ble_dbg_running.load(Ordering::SeqCst);
+        let ble_busy = matches!(
+            self.sync.ble_state,
+            BleState::Connected | BleState::Connecting
+        );
+        ui.horizontal(|ui| {
+            ui.label("Scan window (s)");
+            ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.ble_dbg_secs).desired_width(48.0),
+            );
+            let run = ui
+                .add_enabled(!running && !ble_busy, egui::Button::new("▶ Run BLE debug"))
+                .on_disabled_hover_text(if ble_busy {
+                    "Disconnect from the box first — the probe needs the box advertising."
+                } else {
+                    "A probe is already running."
+                });
+            if run.clicked() {
+                self.start_ble_debug();
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("⏹ Stop"))
+                .clicked()
+            {
+                self.ble_dbg_cancel.store(true, Ordering::SeqCst);
+            }
+            if running {
+                ui.spinner();
+                ui.colored_label(egui::Color32::LIGHT_GREEN, "probing…");
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!running, egui::Button::new("Clear log"))
+                    .clicked()
+                {
+                    if let Ok(mut v) = self.ble_dbg_log.lock() {
+                        v.clear();
+                    }
+                }
+                if ui
+                    .button("Copy")
+                    .on_hover_text("Copy the whole probe output to the clipboard")
+                    .clicked()
+                {
+                    let text = self
+                        .ble_dbg_log
+                        .lock()
+                        .map(|v| v.join("\n"))
+                        .unwrap_or_default();
+                    ui.output_mut(|o| o.copied_text = text);
+                }
+            });
+        });
+
+        // Fixed-height output panel so the GPS section below keeps room.
+        let row_h = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
+        let panel_h = row_h * 14.0;
+        egui::ScrollArea::vertical()
+            .id_salt("ble_dbg_scroll")
+            .max_height(panel_h)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                let mut owned = self
+                    .ble_dbg_log
+                    .lock()
+                    .map(|v| v.join("\n"))
+                    .unwrap_or_default();
+                ui.add(
+                    egui::TextEdit::multiline(&mut owned)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(14)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
+        if running {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        self.ui_gps_debug_tab(ui);
+    }
+
+    /// Spawn `MovementLogger --ble-debug <secs>` as a child (same signed
+    /// binary → same Bluetooth TCC grant) and pump its stdout/stderr into
+    /// `ble_dbg_log` AND a timestamped .log file in the download (CSV)
+    /// folder, so the user can send the file as-is. Mirrors the
+    /// `start_gps_debug` child pattern.
+    fn start_ble_debug(&mut self) {
+        if self.ble_dbg_running.load(Ordering::SeqCst) {
+            return;
+        }
+        let secs: u64 = self.ble_dbg_secs.trim().parse().unwrap_or(20);
+        self.ble_dbg_secs = secs.to_string();
+
+        let out_dir = resolve_save_dir(&self.sync.ble_out_dir)
+            .unwrap_or_else(|_| self.sync.ble_out_dir.clone());
+        let _ = std::fs::create_dir_all(&out_dir);
+        let stamp = chrono::Local::now().format("%Y-%m-%d_%H%M%S");
+        let out_path = out_dir.join(format!("ble_debug_{stamp}.log"));
+
+        let exe = std::env::current_exe()
+            .unwrap_or_else(|_| std::path::PathBuf::from("MovementLogger"));
+        let mut cmd = Command::new(&exe);
+        cmd.arg("--ble-debug")
+            .arg(secs.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        push_log(
+            &self.ble_dbg_log,
+            format!("$ {} --ble-debug {}", exe.display(), secs),
+        );
+        push_log(&self.ble_dbg_log, format!("saving to {}", out_path.display()));
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                push_log(&self.ble_dbg_log, format!("error: failed to spawn probe: {e}"));
+                return;
+            }
+        };
+
+        self.ble_dbg_cancel.store(false, Ordering::SeqCst);
+        self.ble_dbg_running.store(true, Ordering::SeqCst);
+        let log = self.ble_dbg_log.clone();
+        let cancel = self.ble_dbg_cancel.clone();
+        let running = self.ble_dbg_running.clone();
+
+        let (tx, rx) = mpsc::channel::<String>();
+        if let Some(out) = child.stdout.take() {
+            let tx = tx.clone();
+            thread::spawn(move || pump_pipe(out, tx));
+        }
+        if let Some(err) = child.stderr.take() {
+            let tx = tx.clone();
+            thread::spawn(move || pump_pipe(err, tx));
+        }
+        drop(tx);
+
+        thread::spawn(move || {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&out_path).ok();
+            for line in rx {
+                if let Some(f) = file.as_mut() {
+                    let _ = writeln!(f, "{line}");
+                }
+                push_log(&log, line);
+            }
+            if let Some(f) = file.as_mut() {
+                let _ = f.flush();
+            }
+            let mut cancelled = false;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let msg = if cancelled {
+                            "--- stopped ---".to_string()
+                        } else if status.success() {
+                            format!("--- done — saved {} ---", out_path.display())
+                        } else {
+                            format!("--- exited with {status} ---")
+                        };
+                        push_log(&log, msg);
+                        break;
+                    }
+                    Ok(None) => {
+                        if cancel.load(Ordering::SeqCst) && !cancelled {
+                            let _ = child.kill();
+                            cancelled = true;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        push_log(&log, format!("error: try_wait failed: {e}"));
+                        break;
+                    }
+                }
+            }
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
     fn ui_gps_debug_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("GPS Debug");
         ui.label(
@@ -2646,7 +2865,7 @@ impl eframe::App for AppState {
                     (Tab::Live,   "Live"),
                     (Tab::Sync,   "Sync"),
                     (Tab::Replay, "Replay"),
-                    (Tab::Gps,    "GPS Debug"),
+                    (Tab::Debug,  "Debug"),
                 ] {
                     let selected = self.current_tab == tab;
                     // SelectableLabel gives us the standard egui
@@ -2671,7 +2890,7 @@ impl eframe::App for AppState {
             match self.current_tab {
                 Tab::Live   => { self.ui_live_tab(ui);   return; }
                 Tab::Sync   => { self.ui_sync_tab(ui);   return; }
-                Tab::Gps    => { self.ui_gps_debug_tab(ui); return; }
+                Tab::Debug  => { self.ui_debug_tab(ui); return; }
                 Tab::Replay => { /* fall through to original layout */ }
             }
 
