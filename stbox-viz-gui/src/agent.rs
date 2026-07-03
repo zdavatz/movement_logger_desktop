@@ -155,7 +155,7 @@ fn run_session(
     // Agent regime: unbounded auto-reconnect (the whole point — leave
     // it running and a multi-hour sync finishes across drops).
     b.set_keep_synced(true);
-    b.send(BleCmd::Scan);
+    b.send(BleCmd::Scan { known_id: sc.ble_connected_id.clone() });
     sc.ble = Some(b);
     sc.ble_state = BleState::Scanning;
 
@@ -191,7 +191,7 @@ fn run_session(
                     sc.ble_state = BleState::Connecting;
                 } else if last_scan.elapsed() >= RESCAN_INTERVAL {
                     if let Some(b) = sc.ble.as_ref() {
-                        b.send(BleCmd::Scan);
+                        b.send(BleCmd::Scan { known_id: sc.ble_connected_id.clone() });
                     }
                     sc.ble_state = BleState::Scanning;
                     last_scan = Instant::now();
@@ -249,7 +249,7 @@ pub fn flash(path: &std::path::Path) -> i32 {
     let b = BleBackend::spawn();
     // Bounded reconnect is fine for a one-shot — a flash is single-op and
     // short; if the link is too flaky to start we just fail out.
-    b.send(BleCmd::Scan);
+    b.send(BleCmd::Scan { known_id: sc.ble_connected_id.clone() });
     sc.ble = Some(b);
     sc.ble_state = BleState::Scanning;
 
@@ -290,7 +290,7 @@ pub fn flash(path: &std::path::Path) -> i32 {
                     eprintln!("[flash] connecting…");
                 } else if last_scan.elapsed() >= RESCAN_INTERVAL {
                     if let Some(b) = sc.ble.as_ref() {
-                        b.send(BleCmd::Scan);
+                        b.send(BleCmd::Scan { known_id: sc.ble_connected_id.clone() });
                     }
                     sc.ble_state = BleState::Scanning;
                     last_scan = Instant::now();

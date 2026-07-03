@@ -288,8 +288,13 @@ const FW_DATA_RETRIES: u32 = 5;
 #[derive(Clone, Debug)]
 pub enum BleCmd {
     /// Begin a 5-second scan; emits `Discovered` events as PumpTsueri
-    /// peripherals appear, then `ScanStopped`.
-    Scan,
+    /// peripherals appear, then `ScanStopped`. `known_id` is the
+    /// previously-connected box's peripheral id (config.toml `box_id`):
+    /// a peripheral matching it is surfaced even when its name doesn't
+    /// match `BOX_NAMES` — macOS serves scan names from a persistent
+    /// per-peripheral cache that can go stale/empty (survives reboots),
+    /// which otherwise makes a known box invisible to the name filter.
+    Scan { known_id: Option<String> },
     /// Connect by peripheral id (the platform-specific string from
     /// `Discovered.id`).
     Connect(String),
@@ -1005,7 +1010,7 @@ impl WorkerState {
 
     async fn handle_command(&mut self, cmd: BleCmd) {
         match cmd {
-            BleCmd::Scan        => self.scan().await,
+            BleCmd::Scan { known_id } => self.scan(known_id).await,
             BleCmd::Connect(id) => self.connect(id).await,
             BleCmd::Disconnect  => {
                 // disconnect_inner sends the 0x0F host-disconnect (ACK-
@@ -1039,7 +1044,7 @@ impl WorkerState {
         }
     }
 
-    async fn scan(&mut self) {
+    async fn scan(&mut self, known_id: Option<String>) {
         let Some(adapter) = self.ensure_adapter().await else { return; };
         self.emit(BleEvent::Status("scanning…".into()));
         if let Err(e) = adapter.start_scan(ScanFilter::default()).await {
@@ -1070,17 +1075,22 @@ impl WorkerState {
             let name_ok = name.as_deref()
                 .map(|n| BOX_NAMES.iter().any(|w| n.contains(w)))
                 .unwrap_or(false);
-            if name_ok {
+            // Also match the saved box by peripheral id: macOS answers scans
+            // with its persistent name cache, and a stale/empty cache entry
+            // (survives reboots) hides a known box from the name filter —
+            // "scan saw N, 0 matched" with the box advertising fine.
+            let id_ok = known_id.as_deref() == Some(p.id().to_string().as_str());
+            if name_ok || id_ok {
                 matched += 1;
                 self.emit(BleEvent::Discovered {
                     id: p.id().to_string(),
-                    name: name.unwrap_or_else(|| BOX_NAMES[0].into()),
+                    name: name.unwrap_or_else(|| format!("{} (saved box)", BOX_NAMES[0])),
                     rssi: props.and_then(|pp| pp.rssi),
                 });
             }
         }
         self.emit(BleEvent::Status(format!(
-            "scan saw {} peripheral(s), {} matched {:?}", all_count, matched, BOX_NAMES
+            "scan saw {} peripheral(s), {} matched {:?} or saved id", all_count, matched, BOX_NAMES
         )));
         self.emit(BleEvent::ScanStopped);
     }

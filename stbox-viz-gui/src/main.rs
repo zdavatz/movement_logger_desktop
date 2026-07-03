@@ -1268,8 +1268,11 @@ impl AppState {
                     {
                         self.sync.ble_devices.clear();
                         self.sync.ble_state = BleState::Scanning;
+                        // Pass the saved box id so the scan also matches it
+                        // when macOS' stale name cache hides the box's name.
+                        let known_id = self.sync.ble_last_box_id.clone();
                         let b = self.ensure_ble();
-                        b.send(BleCmd::Scan);
+                        b.send(BleCmd::Scan { known_id });
                     }
                     // Reconnect straight to the last box by id — no scan. On
                     // macOS CoreBluetooth suppresses a recently-disconnected
