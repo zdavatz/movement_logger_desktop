@@ -48,6 +48,13 @@ pub struct AgentConfig {
     /// item is registered only while this is `Some(false)` (AUTO); the
     /// agent self-exits if it sees MANUAL.
     pub log_mode_manual: Option<bool>,
+    /// Magnetometer hard-iron offset in mG, captured by the Live tab's
+    /// "Calibrate compass" flow (min/max midpoint per axis while the
+    /// user tumbles the box). Subtracted from the raw mag reading
+    /// before the eCompass heading — without it a box-fixed magnetic
+    /// bias bigger than the ~200 mG horizontal earth field pins the
+    /// heading regardless of rotation. `None` = uncalibrated.
+    pub mag_offset_mg: Option<[f64; 3]>,
 }
 
 impl AgentConfig {

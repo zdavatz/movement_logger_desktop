@@ -190,6 +190,16 @@ struct AppState {
     /// True while a --ble-debug child is alive.
     ble_dbg_running: Arc<AtomicBool>,
 
+    /// Compass calibration: hard-iron offset (mG) subtracted from the
+    /// raw mag before the eCompass heading. Loaded from config.toml at
+    /// startup; refreshed by the Live tab's "Calibrate compass" flow.
+    mag_offset: Option<[f64; 3]>,
+    /// While `Some`, a calibration run is collecting min/max until the
+    /// deadline; user tumbles the box through all orientations.
+    mag_cal_until: Option<std::time::Instant>,
+    mag_cal_min: [f64; 3],
+    mag_cal_max: [f64; 3],
+
     /// Cached GPU texture for the top-right logo. Lazily uploaded on
     /// first frame so the egui context is available.
     icon_tex: Option<egui::TextureHandle>,
@@ -728,6 +738,7 @@ impl AppState {
             },
             log,
             ble_dbg_secs: "20".to_string(),
+            mag_offset: agent_config::AgentConfig::load().mag_offset_mg,
             gps_dbg_baud: "38400".to_string(),
             gps_dbg_label: "antenna".to_string(),
             // Pre-fill the serial port from a one-shot scan so the common
@@ -2520,15 +2531,46 @@ impl AppState {
         // the mag vector projected onto the local horizontal plane
         // after de-rotating by pitch/roll — the standard "eCompass"
         // formula. Result is in degrees; heading is wrapped to 0..360.
+        // Compass calibration pass: while armed, fold every sample into
+        // the per-axis min/max; on deadline the midpoints become the
+        // hard-iron offset (persisted to config.toml).
+        if let Some(until) = self.mag_cal_until {
+            for i in 0..3 {
+                let v = s.mag_mg[i] as f64;
+                self.mag_cal_min[i] = self.mag_cal_min[i].min(v);
+                self.mag_cal_max[i] = self.mag_cal_max[i].max(v);
+            }
+            if std::time::Instant::now() >= until {
+                let off = [
+                    (self.mag_cal_min[0] + self.mag_cal_max[0]) / 2.0,
+                    (self.mag_cal_min[1] + self.mag_cal_max[1]) / 2.0,
+                    (self.mag_cal_min[2] + self.mag_cal_max[2]) / 2.0,
+                ];
+                self.mag_offset = Some(off);
+                self.mag_cal_until = None;
+                let mut cfg = agent_config::AgentConfig::load();
+                cfg.mag_offset_mg = Some(off);
+                let _ = cfg.save();
+                push_log(
+                    &self.log,
+                    format!(
+                        "compass calibrated: hard-iron offset [{:+.0} {:+.0} {:+.0}] mG",
+                        off[0], off[1], off[2]
+                    ),
+                );
+            }
+        }
+
         let (pitch_deg, roll_deg, heading_deg) = {
             let ax = acc_g(0) as f64;
             let ay = acc_g(1) as f64;
             let az = acc_g(2) as f64;
             let roll  = ay.atan2(az);
             let pitch = (-ax).atan2((ay * ay + az * az).sqrt());
-            let mx = s.mag_mg[0] as f64;
-            let my = s.mag_mg[1] as f64;
-            let mz = s.mag_mg[2] as f64;
+            let off = self.mag_offset.unwrap_or([0.0; 3]);
+            let mx = s.mag_mg[0] as f64 - off[0];
+            let my = s.mag_mg[1] as f64 - off[1];
+            let mz = s.mag_mg[2] as f64 - off[2];
             let (sr, cr) = (roll.sin(), roll.cos());
             let (sp, cp) = (pitch.sin(), pitch.cos());
             let xh = mx * cp + mz * sp;
@@ -2638,6 +2680,58 @@ impl AppState {
                 ui.end_row();
             });
 
+        ui.add_space(10.0);
+        ui.separator();
+
+        // ----- 3D orientation --------------------------------------
+        // Wireframe box rotated by the same pitch/roll/heading as the
+        // Orient row — instantaneous eCompass values, no smoothing, so
+        // it snaps at the 0.5 Hz sample rate and the same caveats apply
+        // (pitch/roll valid near 1 g, heading wobbles under motion).
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Box orientation").strong());
+            let calibrating = self.mag_cal_until.is_some();
+            if let Some(until) = self.mag_cal_until {
+                let left = until
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs();
+                ui.colored_label(
+                    egui::Color32::LIGHT_YELLOW,
+                    format!("calibrating — tumble the box through all orientations… {left}s"),
+                );
+            } else if ui
+                .button("Calibrate compass (30 s)")
+                .on_hover_text(
+                    "Fixes a heading that barely moves when you rotate the box: \
+                     rotate/tumble the box slowly through all orientations for 30 s; \
+                     the measured hard-iron offset is stored and applied from then on.",
+                )
+                .clicked()
+            {
+                self.mag_cal_min = [f64::INFINITY; 3];
+                self.mag_cal_max = [f64::NEG_INFINITY; 3];
+                self.mag_cal_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+            }
+            if !calibrating {
+                if let Some(off) = self.mag_offset {
+                    ui.label(format!(
+                        "offset [{:+.0} {:+.0} {:+.0}] mG",
+                        off[0], off[1], off[2]
+                    ));
+                }
+            }
+        });
+        ui.label(
+            "How to calibrate: click the button, then rotate the box slowly \
+             flat on the table through one full circle — pause about 3 s per \
+             quarter turn (the box sends one sample every 2 s). Then briefly \
+             tip it on its nose and on its side. When the 30 s are up the \
+             offset is stored for this box and survives restarts. Calibrate \
+             away from laptops, speakers and steel surfaces; re-calibrate if \
+             the arrow stops following the rotation.",
+        );
+        draw_orientation_box(ui, pitch_deg, roll_deg, heading_deg);
         ui.add_space(10.0);
         ui.separator();
 
@@ -3189,6 +3283,98 @@ fn file_row(
 /// flat line jittering on noise); when the actual sample range exceeds
 /// it, the painter expands to fit. Width fills available space; height
 /// is a fixed 60 px so two sparklines stack neatly without resize math.
+/// Wireframe cuboid rotated by the live eCompass angles — a quick "which
+/// way is the box pointing" visual for the Live tab. Body frame is NED
+/// (x forward, y right, z down), rotated body->world by Rz(yaw)·Ry(pitch)·
+/// Rx(roll), then viewed from the south at ~28° elevation (orthographic).
+/// The lid (top face) is blue, the nose edge green, and a fixed compass
+/// cross on the ground plane gives the N/E reference the heading rotates
+/// against. Pure painter calls — no new dependencies.
+fn draw_orientation_box(ui: &mut egui::Ui, pitch_deg: f64, roll_deg: f64, heading_deg: f64) {
+    let (resp, painter) =
+        ui.allocate_painter(egui::vec2(280.0, 190.0), egui::Sense::hover());
+    let rect = resp.rect;
+    let center = rect.center();
+    let scale = 60.0_f32;
+
+    let (sr, cr) = (roll_deg.to_radians().sin() as f32, roll_deg.to_radians().cos() as f32);
+    let (sp, cp) = (pitch_deg.to_radians().sin() as f32, pitch_deg.to_radians().cos() as f32);
+    let (sy, cy) = (heading_deg.to_radians().sin() as f32, heading_deg.to_radians().cos() as f32);
+
+    // body -> world (NED): Rz(yaw) * Ry(pitch) * Rx(roll)
+    let rot = |v: [f32; 3]| -> [f32; 3] {
+        let [x, y, z] = v;
+        // Rx(roll)
+        let (y, z) = (y * cr - z * sr, y * sr + z * cr);
+        // Ry(pitch)
+        let (x, z) = (x * cp + z * sp, -x * sp + z * cp);
+        // Rz(yaw)
+        [x * cy - y * sy, x * sy + y * cy, z]
+    };
+    // Orthographic camera: looking north from the south, 28° above the
+    // horizon. screen-x = east, screen-y = -(n·sin(el) - d·cos(el)).
+    let el = 28.0_f32.to_radians();
+    let (sel, cel) = (el.sin(), el.cos());
+    let project = |w: [f32; 3]| -> egui::Pos2 {
+        let [n, e, d] = w;
+        egui::pos2(
+            center.x + e * scale,
+            center.y - (n * sel - d * cel) * scale,
+        )
+    };
+    let p3 = |v: [f32; 3]| project(rot(v));
+
+    // Ground-plane compass cross (world frame, does not rotate with the
+    // box) — the reference the heading is read against.
+    let axis = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
+    painter.line_segment([project([1.35, 0.0, 0.0]), project([-1.35, 0.0, 0.0])], axis);
+    painter.line_segment([project([0.0, 1.35, 0.0]), project([0.0, -1.35, 0.0])], axis);
+    painter.text(
+        project([1.5, 0.0, 0.0]),
+        egui::Align2::CENTER_CENTER,
+        "N",
+        egui::TextStyle::Body.resolve(ui.style()),
+        egui::Color32::from_gray(160),
+    );
+    painter.text(
+        project([0.0, 1.5, 0.0]),
+        egui::Align2::CENTER_CENTER,
+        "E",
+        egui::TextStyle::Body.resolve(ui.style()),
+        egui::Color32::from_gray(160),
+    );
+
+    // Cuboid with SensorTile.box proportions — on the box the LONG side
+    // is the body Y axis (X is the short/transverse axis), so hy > hx.
+    let (hx, hy, hz) = (0.62_f32, 1.0_f32, 0.28_f32);
+    // z is down in NED: top face has z = -hz.
+    let v = [
+        [ hx,  hy, -hz], [ hx, -hy, -hz], [-hx, -hy, -hz], [-hx,  hy, -hz], // top
+        [ hx,  hy,  hz], [ hx, -hy,  hz], [-hx, -hy,  hz], [-hx,  hy,  hz], // bottom
+    ];
+    let pts: Vec<egui::Pos2> = v.iter().map(|&q| p3(q)).collect();
+
+    let side = egui::Stroke::new(1.3, egui::Color32::from_gray(130));
+    let top = egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 180, 250));
+    // bottom face + verticals
+    for (a, b) in [(4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)] {
+        painter.line_segment([pts[a], pts[b]], side);
+    }
+    // top face (lid)
+    for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+        painter.line_segment([pts[a], pts[b]], top);
+    }
+    // Nose marker: along the LONG (+y) end of the lid, drawn as a green
+    // arrow from the lid centre — shows which end the box points with.
+    let lid_c = p3([0.0, 0.0, -hz]);
+    let nose = p3([0.0, hy * 1.25, -hz]);
+    painter.arrow(
+        lid_c,
+        nose - lid_c,
+        egui::Stroke::new(2.0, egui::Color32::LIGHT_GREEN),
+    );
+}
+
 fn draw_sparkline(
     ui: &mut egui::Ui,
     history: &VecDeque<(f64, f64)>,

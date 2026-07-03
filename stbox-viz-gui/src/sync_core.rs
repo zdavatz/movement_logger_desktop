@@ -416,12 +416,13 @@ impl SyncCore {
     /// always has a current target. Best-effort; a write failure is
     /// logged, not fatal.
     pub fn persist_config(&self) {
-        let cfg = AgentConfig {
-            box_id: self.ble_connected_id.clone(),
-            save_dir: self.ble_out_dir.to_string_lossy().into_owned(),
-            keep_synced: self.ble_keep_synced,
-            log_mode_manual: self.ble_log_mode,
-        };
+        // Load-modify-save: fields the sync engine doesn't own (e.g.
+        // the Live tab's mag_offset_mg calibration) must survive.
+        let mut cfg = AgentConfig::load();
+        cfg.box_id = self.ble_connected_id.clone();
+        cfg.save_dir = self.ble_out_dir.to_string_lossy().into_owned();
+        cfg.keep_synced = self.ble_keep_synced;
+        cfg.log_mode_manual = self.ble_log_mode;
         if let Err(e) = cfg.save() {
             push_log(&self.log, format!("config: save failed: {e}"));
         }
