@@ -65,6 +65,9 @@ enum Tab {
     /// GPS/antenna survey. One tab so every "send me the output" tool
     /// lives in the same place.
     Debug,
+    /// Box firmware: manual `.bin` upload + one-click GitHub auto-update
+    /// ("Check FW"), plus the flash progress/result.
+    Firmware,
 }
 
 impl Default for Tab {
@@ -1600,97 +1603,9 @@ impl AppState {
                                 self.sync.ble_session_duration_s),
                         );
                     }
-                    if ui
-                        .add_enabled(connected, egui::Button::new("Disconnect"))
-                        .clicked()
-                    {
-                        if let Some(b) = self.sync.ble.as_ref() {
-                            // Break any in-progress auto-reconnect loop
-                            // first — the worker can't read the command
-                            // channel while inside it, so the abort flag
-                            // is the only thing it polls there.
-                            b.request_abort();
-                            b.send(BleCmd::Disconnect);
-                        }
-                        /* Optimistic state transition: drop straight to
-                           Idle without waiting for the worker's eventual
-                           Disconnected event. `peripheral.disconnect()`
-                           can take a few seconds on macOS CoreBluetooth
-                           while the LL_TERMINATE_IND propagates — without
-                           this, Scan stays disabled in that window. The
-                           worker's Disconnected event will arrive later
-                           and is idempotent (sets state to Idle again). */
-                        self.sync.ble_state = BleState::Idle;
-                        self.sync.ble_files.clear();
-                        self.sync.ble_dl_queue.clear();
-                        self.sync.ble_dl_in_flight = false;
-                        self.sync.ble_connected_id = None;
-                        self.sync.ble_sync_pending = false;
-                        self.sync.ble_resume_box = None; // intentional disconnect — don't auto-resume
-                        self.sync.ble_status = "disconnecting…".into();
-                        push_log(&self.log, "ble: Disconnect requested".into());
-                    }
-                    /* Firmware upload (dual-bank OTA). Picks a `.bin` and
-                       streams it over the same FileCmd characteristic as
-                       LIST/READ; the box verifies the SHA-256 on COMMIT,
-                       swaps banks, and reboots into the new firmware (the
-                       link drops — the user reconnects). Disabled while
-                       any other BLE op is in flight, since it claims the
-                       single-op worker slot for the whole upload. */
-                    if ui
-                        .add_enabled(
-                            connected && !worker_busy,
-                            egui::Button::new("Upload firmware"),
-                        )
-                        .on_hover_text(
-                            "Send a firmware .bin to the box over BLE. The box verifies \
-                             the image (SHA-256), swaps to the inactive flash bank, and \
-                             reboots into the new firmware — the connection drops, then \
-                             reconnect. The current firmware is untouched unless the \
-                             upload fully succeeds.",
-                        )
-                        .clicked()
-                    {
-                        if let Some(p) = rfd::FileDialog::new()
-                            .add_filter("firmware", &["bin"])
-                            .pick_file()
-                        {
-                            self.sync.start_firmware_upload(&p);
-                        }
-                    }
-                    /* One-click firmware auto-update: fetch the latest
-                       firmware-vX.Y.Z.bin from GitHub, ask the box its
-                       current version over BLE, and flash if the box is
-                       older (or legacy/unknown). Disabled while any other
-                       BLE op is in flight or a check is already running. */
-                    if ui
-                        .add_enabled(
-                            connected && !worker_busy && !self.sync.fw_check_active,
-                            egui::Button::new("Check FW"),
-                        )
-                        .on_hover_text(
-                            "Check GitHub for the latest box firmware and compare it \
-                             with the connected box's version. If the box is older (or \
-                             its firmware is too old to report a version), the newer \
-                             image is downloaded and flashed over BLE automatically.",
-                        )
-                        .clicked()
-                    {
-                        self.sync.start_fw_check();
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !self.sync.ble_status.is_empty() {
-                            /* Selectable so the user can copy error text
-                               (egui Labels are non-selectable by default). */
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&self.sync.ble_status)
-                                        .color(egui::Color32::LIGHT_BLUE),
-                                )
-                                .selectable(true),
-                            );
-                        }
-                    });
+                    /* Disconnect button + BLE status moved to the top-right of
+                       the tab strip (rendered in update(), under the logo).
+                       Firmware upload + "Check FW" moved to the Firmware tab. */
                 });
 
                 // ----- Discovered devices --------------------------
@@ -1772,71 +1687,9 @@ impl AppState {
                                 )),
                         );
                     }
-                    /* Firmware-upload progress bar + result line. Shown
-                       while an upload is in flight and after it finishes
-                       (the result message persists until the next
-                       action). The box reboots on success, so the bar
-                       disappears with the link drop while the message
-                       stays. */
-                    if let Some((done, total)) = self.sync.ble_flash_progress {
-                        let frac = if total > 0 {
-                            (done as f32 / total as f32).clamp(0.0, 1.0)
-                        } else {
-                            0.0
-                        };
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .desired_width(360.0)
-                                .text(format!(
-                                    "Firmware {} / {} kB ({}%)",
-                                    (done + 1023) / 1024,
-                                    (total + 1023) / 1024,
-                                    (frac * 100.0) as u32,
-                                )),
-                        );
-                        // Keep repainting so the bar advances even when
-                        // the mouse is idle during the multi-minute upload.
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
-                    }
-                    if !self.sync.ble_flash_msg.is_empty() {
-                        ui.add_space(2.0);
-                        let is_err = self.sync.ble_flash_msg.contains("failed")
-                            || self.sync.ble_flash_msg.contains("Can't")
-                            || self.sync.ble_flash_msg.contains("empty");
-                        ui.colored_label(
-                            if is_err {
-                                egui::Color32::from_rgb(225, 90, 90)
-                            } else {
-                                egui::Color32::from_rgb(120, 200, 140)
-                            },
-                            &self.sync.ble_flash_msg,
-                        );
-                    }
-                    /* "Check FW" status line. Kept separate from the flash
-                       message so both are visible during a check-then-flash
-                       run (this reads "Updating box to vX.Y.Z…" while the
-                       flash message reads "Uploading firmware…"). */
-                    if !self.sync.fw_check_msg.is_empty() {
-                        ui.add_space(2.0);
-                        let is_err = self.sync.fw_check_msg.contains("Couldn't")
-                            || self.sync.fw_check_msg.contains("empty");
-                        ui.colored_label(
-                            if is_err {
-                                egui::Color32::from_rgb(225, 90, 90)
-                            } else {
-                                egui::Color32::from_rgb(120, 200, 140)
-                            },
-                            &self.sync.fw_check_msg,
-                        );
-                        // Repaint while a check is polling for its two async
-                        // halves so the status advances without mouse motion.
-                        if self.sync.fw_check_active {
-                            ui.ctx().request_repaint_after(
-                                std::time::Duration::from_millis(200),
-                            );
-                        }
-                    }
+                    /* Firmware-upload progress bar + result line and the
+                       "Check FW" status live in the Firmware tab now
+                       (ui_firmware_tab). */
                     if let Some(err) = self.sync.ble_delete_err.clone() {
                         ui.add_space(4.0);
                         egui::Frame::group(ui.style())
@@ -2020,6 +1873,140 @@ impl AppState {
     /// For antenna selection + mounting evaluation — fix quality,
     /// per-signal C/N0, RF/antenna health. CSVs land in a `gps-debug`
     /// subfolder of the configured save dir.
+    /// Intentional disconnect: break any in-progress auto-reconnect (the
+    /// worker only polls the abort flag while inside it), send Disconnect,
+    /// and optimistically drop to Idle so Scan re-enables immediately (the
+    /// worker's later, idempotent Disconnected event confirms it). Shared by
+    /// the top-bar Disconnect button.
+    fn disconnect_box(&mut self) {
+        if let Some(b) = self.sync.ble.as_ref() {
+            b.request_abort();
+            b.send(BleCmd::Disconnect);
+        }
+        self.sync.ble_state = BleState::Idle;
+        self.sync.ble_files.clear();
+        self.sync.ble_dl_queue.clear();
+        self.sync.ble_dl_in_flight = false;
+        self.sync.ble_connected_id = None;
+        self.sync.ble_sync_pending = false;
+        self.sync.ble_resume_box = None; // intentional — don't auto-resume
+        self.sync.ble_status = "disconnecting…".into();
+        push_log(&self.log, "ble: Disconnect requested".into());
+    }
+
+    /// Firmware tab: manual `.bin` upload + one-click GitHub auto-update
+    /// ("Check FW"), with the flash progress + result. Moved out of the Sync
+    /// tab so the box-update tools have their own home. Needs a connected box.
+    fn ui_firmware_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Box firmware");
+        ui.add_space(6.0);
+        let connected = matches!(self.sync.ble_state, BleState::Connected);
+        if !connected {
+            ui.label(
+                "Connect to a box in the Sync tab first — the firmware update \
+                 tools appear here once a box is connected.",
+            );
+            return;
+        }
+        let worker_busy = self.sync.ble_dl_in_flight
+            || self.sync.ble_sync_pending
+            || !self.sync.ble_dl_queue.is_empty()
+            || self.sync.ble_flash_progress.is_some();
+
+        ui.horizontal(|ui| {
+            /* One-click auto-update: fetch the latest firmware-vX.Y.Z.bin from
+               GitHub, ask the box its version over BLE, flash if the box is
+               older (or legacy/unknown). */
+            if ui
+                .add_enabled(
+                    !worker_busy && !self.sync.fw_check_active,
+                    egui::Button::new("Check FW"),
+                )
+                .on_hover_text(
+                    "Check GitHub for the latest box firmware and compare it \
+                     with the connected box's version. If the box is older (or \
+                     its firmware is too old to report a version), the newer \
+                     image is downloaded and flashed over BLE automatically.",
+                )
+                .clicked()
+            {
+                self.sync.start_fw_check();
+            }
+            /* Manual firmware upload (dual-bank OTA): pick a `.bin`, stream it
+               over the FileCmd characteristic; the box verifies the SHA-256 on
+               COMMIT, swaps banks, and reboots. */
+            if ui
+                .add_enabled(!worker_busy, egui::Button::new("Upload firmware…"))
+                .on_hover_text(
+                    "Send a firmware .bin to the box over BLE. The box verifies \
+                     the image (SHA-256), swaps to the inactive flash bank, and \
+                     reboots into the new firmware — the connection drops, then \
+                     reconnect. The current firmware is untouched unless the \
+                     upload fully succeeds.",
+                )
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("firmware", &["bin"])
+                    .pick_file()
+                {
+                    self.sync.start_firmware_upload(&p);
+                }
+            }
+        });
+
+        // Firmware-upload progress bar (advances during the multi-minute flash).
+        if let Some((done, total)) = self.sync.ble_flash_progress {
+            let frac = if total > 0 {
+                (done as f32 / total as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            ui.add_space(6.0);
+            ui.add(
+                egui::ProgressBar::new(frac).desired_width(360.0).text(format!(
+                    "Firmware {} / {} kB ({}%)",
+                    (done + 1023) / 1024,
+                    (total + 1023) / 1024,
+                    (frac * 100.0) as u32,
+                )),
+            );
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        // "Check FW" status ("Updating box to vX.Y.Z…" / "up to date" / error).
+        if !self.sync.fw_check_msg.is_empty() {
+            ui.add_space(6.0);
+            let is_err = self.sync.fw_check_msg.contains("Couldn't")
+                || self.sync.fw_check_msg.contains("empty");
+            ui.colored_label(
+                if is_err {
+                    egui::Color32::from_rgb(225, 90, 90)
+                } else {
+                    egui::Color32::from_rgb(120, 200, 140)
+                },
+                &self.sync.fw_check_msg,
+            );
+            if self.sync.fw_check_active {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
+        // Flash result line.
+        if !self.sync.ble_flash_msg.is_empty() {
+            ui.add_space(2.0);
+            let is_err = self.sync.ble_flash_msg.contains("failed")
+                || self.sync.ble_flash_msg.contains("Can't")
+                || self.sync.ble_flash_msg.contains("empty");
+            ui.colored_label(
+                if is_err {
+                    egui::Color32::from_rgb(225, 90, 90)
+                } else {
+                    egui::Color32::from_rgb(120, 200, 140)
+                },
+                &self.sync.ble_flash_msg,
+            );
+        }
+    }
+
     /// Debug tab: BLE probe section on top, GPS/antenna survey below —
     /// every "run this and send me the output" diagnostic in one place.
     fn ui_debug_tab(&mut self, ui: &mut egui::Ui) {
@@ -3155,12 +3142,18 @@ impl eframe::App for AppState {
         // ----- Tab strip ---------------------------------------------
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.add_space(2.0);
+            let mut do_disconnect = false;
+            // Cloned/copied out so the right-aligned block borrows locals, not
+            // `self`, inside the nested layout closure.
+            let connected = matches!(self.sync.ble_state, BleState::Connected);
+            let status = self.sync.ble_status.clone();
             ui.horizontal(|ui| {
                 for (tab, label) in [
-                    (Tab::Live,   "Live"),
-                    (Tab::Sync,   "Sync"),
-                    (Tab::Replay, "Replay"),
-                    (Tab::Debug,  "Debug"),
+                    (Tab::Live,     "Live"),
+                    (Tab::Sync,     "Sync"),
+                    (Tab::Replay,   "Replay"),
+                    (Tab::Debug,    "Debug"),
+                    (Tab::Firmware, "Firmware"),
                 ] {
                     let selected = self.current_tab == tab;
                     // SelectableLabel gives us the standard egui
@@ -3170,7 +3163,33 @@ impl eframe::App for AppState {
                         self.current_tab = tab;
                     }
                 }
+                // Disconnect + live BLE status, right-aligned in the tab row
+                // (under the top-right logo, same height as the tabs). The
+                // status ("connecting…", "disconnecting…", errors) sits just
+                // left of the button. Visible on every tab; the button is
+                // enabled only while a box is connected.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(connected, egui::Button::new("Disconnect"))
+                        .clicked()
+                    {
+                        do_disconnect = true;
+                    }
+                    if !status.is_empty() {
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&status)
+                                    .color(egui::Color32::LIGHT_BLUE),
+                            )
+                            .selectable(true),
+                        );
+                    }
+                });
             });
+            if do_disconnect {
+                self.disconnect_box();
+            }
             ui.add_space(2.0);
         });
 
@@ -3186,10 +3205,11 @@ impl eframe::App for AppState {
             self.render_fw_banner(ui);
 
             match self.current_tab {
-                Tab::Live   => { self.ui_live_tab(ui);   return; }
-                Tab::Sync   => { self.ui_sync_tab(ui);   return; }
-                Tab::Debug  => { self.ui_debug_tab(ui); return; }
-                Tab::Replay => { /* fall through to original layout */ }
+                Tab::Live     => { self.ui_live_tab(ui);     return; }
+                Tab::Sync     => { self.ui_sync_tab(ui);     return; }
+                Tab::Firmware => { self.ui_firmware_tab(ui); return; }
+                Tab::Debug    => { self.ui_debug_tab(ui);    return; }
+                Tab::Replay   => { /* fall through to original layout */ }
             }
 
             // ----- Drop zone ------------------------------------------
