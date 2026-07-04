@@ -456,8 +456,10 @@ pub struct LiveSample {
     pub timestamp_ms: u32,
     /// Linear acceleration, mg per axis (LSM6DSV16X).
     pub acc_mg: [i16; 3],
-    /// Angular rate, centi-degrees per second per axis (= raw_LSB ×
-    /// 1.75 truncated to i16; ±327.67 dps range). Divide by 100 for °/s.
+    /// Angular rate. Firmware ≤ v0.0.26 packed centi-dps (÷100 for °/s,
+    /// clamped at ±327 dps); firmware v0.0.27+ packs DECI-dps (÷10 for
+    /// °/s, full ±500 dps FS). Field name kept for wire-parse stability;
+    /// consumers divide by 10 (see the Live tab + `OrientationFilter`).
     pub gyro_cdps: [i16; 3],
     /// Magnetic field, milligauss per axis (LIS2MDL).
     pub mag_mg: [i16; 3],

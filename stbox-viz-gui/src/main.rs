@@ -191,14 +191,38 @@ struct AppState {
     ble_dbg_running: Arc<AtomicBool>,
 
     /// Compass calibration: hard-iron offset (mG) subtracted from the
-    /// raw mag before the eCompass heading. Loaded from config.toml at
-    /// startup; refreshed by the Live tab's "Calibrate compass" flow.
+    /// raw mag. Learned SILENTLY by the sliding-window auto-cal (below);
+    /// loaded from config.toml at startup. `None` = uncalibrated.
     mag_offset: Option<[f64; 3]>,
-    /// While `Some`, a calibration run is collecting min/max until the
-    /// deadline; user tumbles the box through all orientations.
-    mag_cal_until: Option<std::time::Instant>,
-    mag_cal_min: [f64; 3],
-    mag_cal_max: [f64; 3],
+    /// Last offset written to config.toml — persists are throttled to
+    /// changes > 10 mG so auto-cal doesn't rewrite the file every 2 s.
+    mag_off_persisted: Option<[f64; 3]>,
+    /// Sliding window of recent FLAT mag (x, y) samples for the silent
+    /// hard-iron auto-calibration (iOS/Android parity — `FileSyncCore`
+    /// autoCalibrate). A window, not a session envelope, so one motion
+    /// spike can't poison the spans forever. 64 samples @ 0.5 Hz ≈ one
+    /// slow flat rotation.
+    auto_buf: Vec<(f64, f64)>,
+    /// One-tap direction anchor (iOS/Android parity): degrees subtracted
+    /// from the box's nose azimuth so "USB-C points SOUTH" reads as 180°.
+    /// Set by the "USB-C points SOUTH — set direction" button; every
+    /// auto-cal offset refinement folds its heading shift in here so the
+    /// set direction never drifts.
+    heading_bias_deg: f64,
+    /// Which body-axis end is the FRONT (USB-C connector): `Some(true)` =
+    /// +Y, `Some(false)` = -Y, `None` = not yet confirmed. From the
+    /// "USB-C end is UP — confirm" tap.
+    nose_plus_y: Option<bool>,
+
+    /// Gyro + accel complementary attitude filter — the 3D preview's
+    /// attitude source (mag-independent; iOS `OrientationFilter` parity).
+    /// STATEFUL across samples: fed once per received `LiveSample` in
+    /// `GuiSyncHost::on_sample`, read (as `ori_rows`) by the renderer.
+    orientation_filter: OrientationFilter,
+    /// Latest body-frame world axes (n, e, d) from `orientation_filter`,
+    /// snapshotted each sample so the egui redraw reads a plain value.
+    /// `None` until the filter has seeded from the first good accel+mag.
+    ori_rows: Option<OriRows>,
 
     /// Cached GPU texture for the top-right logo. Lazily uploaded on
     /// first frame so the egui context is available.
@@ -658,6 +682,12 @@ struct GuiSyncHost<'a> {
     live_sample_count: &'a mut u64,
     sensor_csv: &'a mut Option<PathBuf>,
     gps_csv: &'a mut Option<PathBuf>,
+    /// Gyro+accel attitude filter (mag-independent) driven once per
+    /// sample; `ori_rows` is its snapshot for the renderer. `mag_offset`
+    /// only SEEDS the filter's initial heading (iOS parity).
+    orientation_filter: &'a mut OrientationFilter,
+    ori_rows: &'a mut Option<OriRows>,
+    mag_offset: Option<[f64; 3]>,
 }
 
 impl SyncHost for GuiSyncHost<'_> {
@@ -671,12 +701,21 @@ impl SyncHost for GuiSyncHost<'_> {
         self.live_pressure_history.clear();
         *self.live_t0_ms = None;
         *self.live_sample_count = 0;
+        // Re-seed the attitude filter on the next sample (keeps the
+        // learned gyro bias); drop the stale render rows.
+        self.orientation_filter.reset();
+        *self.ori_rows = None;
     }
 
     fn on_sample(&mut self, s: &LiveSample) {
         *self.latest_sample = Some(*s);
         *self.latest_sample_at = Some(std::time::Instant::now());
         *self.live_sample_count = self.live_sample_count.saturating_add(1);
+        // Gyro+accel attitude for the 3D preview (mag-independent). The
+        // filter is stateful — updated once here per received sample; the
+        // egui redraw reads the snapshotted `ori_rows`.
+        self.orientation_filter.update(s, self.mag_offset);
+        *self.ori_rows = self.orientation_filter.rows();
         // Rebase time axis on the first sample so the chart X starts at
         // 0 regardless of how long the box has been booted.
         let t0 = *self.live_t0_ms.get_or_insert(s.timestamp_ms);
@@ -739,6 +778,9 @@ impl AppState {
             log,
             ble_dbg_secs: "20".to_string(),
             mag_offset: agent_config::AgentConfig::load().mag_offset_mg,
+            mag_off_persisted: agent_config::AgentConfig::load().mag_offset_mg,
+            heading_bias_deg: agent_config::AgentConfig::load().heading_bias_deg.unwrap_or(0.0),
+            nose_plus_y: agent_config::AgentConfig::load().nose_plus_y,
             gps_dbg_baud: "38400".to_string(),
             gps_dbg_label: "antenna".to_string(),
             // Pre-fill the serial port from a one-shot scan so the common
@@ -849,6 +891,9 @@ impl AppState {
             live_sample_count,
             sensor_csv,
             gps_csv,
+            orientation_filter,
+            ori_rows,
+            mag_offset,
             ..
         } = self;
         let mut host = GuiSyncHost {
@@ -860,6 +905,9 @@ impl AppState {
             live_sample_count,
             sensor_csv,
             gps_csv,
+            orientation_filter,
+            ori_rows,
+            mag_offset: *mag_offset,
         };
         sync.pump_ble_events(&mut host);
     }
@@ -2520,7 +2568,8 @@ impl AppState {
             return;
         };
         let acc_g = |i: usize| s.acc_mg[i] as f32 / 1000.0;
-        let gyro_dps = |i: usize| s.gyro_cdps[i] as f32 / 100.0;
+        // Firmware v0.0.27+ streams the gyro as DECI-dps (÷10 for °/s).
+        let gyro_dps = |i: usize| s.gyro_cdps[i] as f32 / 10.0;
         let pres_hpa = s.pressure_pa as f64 / 100.0;
         let temp_c = s.temperature_cc as f32 / 100.0;
 
@@ -2531,33 +2580,63 @@ impl AppState {
         // the mag vector projected onto the local horizontal plane
         // after de-rotating by pitch/roll — the standard "eCompass"
         // formula. Result is in degrees; heading is wrapped to 0..360.
-        // Compass calibration pass: while armed, fold every sample into
-        // the per-axis min/max; on deadline the midpoints become the
-        // hard-iron offset (persisted to config.toml).
-        if let Some(until) = self.mag_cal_until {
-            for i in 0..3 {
-                let v = s.mag_mg[i] as f64;
-                self.mag_cal_min[i] = self.mag_cal_min[i].min(v);
-                self.mag_cal_max[i] = self.mag_cal_max[i].max(v);
-            }
-            if std::time::Instant::now() >= until {
-                let off = [
-                    (self.mag_cal_min[0] + self.mag_cal_max[0]) / 2.0,
-                    (self.mag_cal_min[1] + self.mag_cal_max[1]) / 2.0,
-                    (self.mag_cal_min[2] + self.mag_cal_max[2]) / 2.0,
-                ];
-                self.mag_offset = Some(off);
-                self.mag_cal_until = None;
-                let mut cfg = agent_config::AgentConfig::load();
-                cfg.mag_offset_mg = Some(off);
-                let _ = cfg.save();
-                push_log(
-                    &self.log,
-                    format!(
-                        "compass calibrated: hard-iron offset [{:+.0} {:+.0} {:+.0}] mG",
-                        off[0], off[1], off[2]
-                    ),
-                );
+        // Silent hard-iron auto-calibration (iOS/Android parity —
+        // `FileSyncCore.autoCalibrate`): fold every FLAT, still sample's
+        // mag (x, y) into a sliding 64-sample window; once X and Y each
+        // span a full flat rotation (>= 180 mG, and the two spans are
+        // similar — a circle, not a stray arc) the midpoints become the
+        // offset. A window, not a session envelope, so one motion spike
+        // can't lock calibration out forever. Every offset refinement
+        // folds its heading shift into `heading_bias_deg` so the "set
+        // direction" anchor never drifts. No button — the only thing the
+        // user provides is the one south reference tap below.
+        {
+            let ax = s.acc_mg[0] as f64;
+            let ay = s.acc_mg[1] as f64;
+            let az = s.acc_mg[2] as f64;
+            // Flat + still: lid up or down, no big lateral acceleration.
+            if az.abs() >= 900.0 && ax.abs() <= 300.0 && ay.abs() <= 300.0 {
+                let mx = s.mag_mg[0] as f64;
+                let my = s.mag_mg[1] as f64;
+                if (mx * mx + my * my).sqrt() < 1500.0 {
+                    self.auto_buf.push((mx, my));
+                    let n = self.auto_buf.len();
+                    if n > 64 { self.auto_buf.drain(0..n - 64); }
+                    if self.auto_buf.len() >= 8 {
+                        let min_x = self.auto_buf.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+                        let max_x = self.auto_buf.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+                        let min_y = self.auto_buf.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+                        let max_y = self.auto_buf.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+                        let span_x = max_x - min_x;
+                        let span_y = max_y - min_y;
+                        let ratio = span_x.max(span_y) / span_x.min(span_y).max(1e-6);
+                        // Full circle in X and Y, similar spans (a circle,
+                        // not a stray arc). Spikes age out of the window.
+                        if span_x >= 180.0 && span_y >= 180.0 && ratio <= 2.0 {
+                            let nx = (max_x + min_x) / 2.0;
+                            let ny = (max_y + min_y) / 2.0;
+                            let mut off = self.mag_offset.unwrap_or([0.0; 3]);
+                            // Apply only on a real change (don't churn config).
+                            if (nx - off[0]).abs() > 10.0 || (ny - off[1]).abs() > 10.0 {
+                                off[0] = nx;
+                                off[1] = ny;
+                                self.mag_offset = Some(off);
+                                let mut cfg = agent_config::AgentConfig::load();
+                                cfg.mag_offset_mg = Some(off);
+                                let _ = cfg.save();
+                                self.mag_off_persisted = Some(off);
+                                // The offset only SEEDS the gyro filter's
+                                // initial heading now — the preview no longer
+                                // depends on the magnetometer, so an offset
+                                // change must NOT touch the render bias (owned
+                                // by "set direction", carried by the gyro).
+                                push_log(&self.log, format!(
+                                    "compass auto-calibrated: offset [{:+.0} {:+.0} {:+.0}] mG",
+                                    off[0], off[1], off[2]));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2567,16 +2646,14 @@ impl AppState {
             let az = acc_g(2) as f64;
             let roll  = ay.atan2(az);
             let pitch = (-ax).atan2((ay * ay + az * az).sqrt());
-            let off = self.mag_offset.unwrap_or([0.0; 3]);
-            let mx = s.mag_mg[0] as f64 - off[0];
-            let my = s.mag_mg[1] as f64 - off[1];
-            let mz = s.mag_mg[2] as f64 - off[2];
-            let (sr, cr) = (roll.sin(), roll.cos());
-            let (sp, cp) = (pitch.sin(), pitch.cos());
-            let xh = mx * cp + mz * sp;
-            let yh = mx * sr * sp + my * cr - mz * sr * cp;
-            let mut heading = (-yh).atan2(xh).to_degrees();
-            if heading < 0.0 { heading += 360.0; }
+            // Heading = the gyro+accel filter's nose azimuth (matches the
+            // preview arrow). Pure gyro carry (mag only seeds it), so the
+            // absolute value is anchored by the "USB-C south" tap and drifts
+            // slowly. `0.0` until the filter seeds.
+            let heading = self
+                .orientation_filter
+                .nose_azimuth(self.nose_plus_y.unwrap_or(false), self.heading_bias_deg)
+                .unwrap_or(0.0);
             (pitch.to_degrees(), roll.to_degrees(), heading)
         };
 
@@ -2683,55 +2760,98 @@ impl AppState {
         ui.add_space(10.0);
         ui.separator();
 
-        // ----- 3D orientation --------------------------------------
-        // Wireframe box rotated by the same pitch/roll/heading as the
-        // Orient row — instantaneous eCompass values, no smoothing, so
-        // it snaps at the 0.5 Hz sample rate and the same caveats apply
-        // (pitch/roll valid near 1 g, heading wobbles under motion).
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Box orientation").strong());
-            let calibrating = self.mag_cal_until.is_some();
-            if let Some(until) = self.mag_cal_until {
-                let left = until
-                    .saturating_duration_since(std::time::Instant::now())
-                    .as_secs();
-                ui.colored_label(
-                    egui::Color32::LIGHT_YELLOW,
-                    format!("calibrating — tumble the box through all orientations… {left}s"),
-                );
-            } else if ui
-                .button("Calibrate compass (30 s)")
-                .on_hover_text(
-                    "Fixes a heading that barely moves when you rotate the box: \
-                     rotate/tumble the box slowly through all orientations for 30 s; \
-                     the measured hard-iron offset is stored and applied from then on.",
-                )
-                .clicked()
+        // ----- 3D orientation (gyro + accel filter) ----------------
+        // Attitude comes from the gyro+accel complementary filter (NO
+        // magnetometer in the render path): the accel gives tilt (which
+        // face is up, exact every frame) and the gyro carries the
+        // horizontal frame (real rotation, consistent in every pose) with
+        // its bias auto-removed at rest. The one thing gyro+accel can't
+        // know — where north is — the user supplies with ONE "USB-C south"
+        // tap (a render bias). Fixed map preview, screen-up = SOUTH.
+        // Mirrors iOS `OrientationFilter` + `OrientationBoxCanvas`.
+        let norm360 = |x: f64| { let mut v = x % 360.0; if v < 0.0 { v += 360.0; } v };
+        ui.label(egui::RichText::new("Box orientation").strong());
+
+        let flat = (s.acc_mg[2] as f64).abs() >= 900.0;
+        ui.label("Lay the box flat, USB-C end pointing SOUTH, then tap:");
+        if ui
+            .add_enabled(flat, egui::Button::new("USB-C points SOUTH — set direction"))
+            .on_hover_text(
+                "The box's USB-C end is the FRONT. Point it south (use a compass / \
+                 phone), box flat on the table, and tap — this defines the gyro \
+                 filter's current yaw as south, so the green arrow then points south.",
+            )
+            .clicked()
+        {
+            // Define the gyro filter's current nose yaw as south (nose
+            // reads 180°). iOS `setDirectionSouth`.
+            if let Some(az) = self
+                .orientation_filter
+                .nose_azimuth(self.nose_plus_y.unwrap_or(false), 0.0)
             {
-                self.mag_cal_min = [f64::INFINITY; 3];
-                self.mag_cal_max = [f64::NEG_INFINITY; 3];
-                self.mag_cal_until =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+                self.heading_bias_deg = norm360(az - 180.0);
+                let mut cfg = agent_config::AgentConfig::load();
+                cfg.heading_bias_deg = Some(self.heading_bias_deg);
+                let _ = cfg.save();
+                push_log(&self.log, "compass: direction set (USB-C = south)".to_string());
             }
-            if !calibrating {
-                if let Some(off) = self.mag_offset {
-                    ui.label(format!(
-                        "offset [{:+.0} {:+.0} {:+.0}] mG",
-                        off[0], off[1], off[2]
-                    ));
-                }
+        }
+
+        let upright = (s.acc_mg[1] as f64).abs() >= 900.0;
+        ui.label("Once, for tilt: stand the box upright, USB-C end UP, and tap:");
+        if ui
+            .add_enabled(upright, egui::Button::new("USB-C end is UP — confirm"))
+            .clicked()
+        {
+            let was = self.nose_plus_y.unwrap_or(false);
+            let now = s.acc_mg[1] as f64 > 0.0;
+            self.nose_plus_y = Some(now);
+            // Flipping the nose end flips its azimuth by exactly 180° in any
+            // pose — nudge the bias to keep the set direction valid.
+            if now != was {
+                self.heading_bias_deg = norm360(self.heading_bias_deg + 180.0);
+            }
+            let mut cfg = agent_config::AgentConfig::load();
+            cfg.nose_plus_y = self.nose_plus_y;
+            cfg.heading_bias_deg = Some(self.heading_bias_deg);
+            let _ = cfg.save();
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("Reset calibration").clicked() {
+                self.mag_offset = None;
+                self.mag_off_persisted = None;
+                self.heading_bias_deg = 0.0;
+                self.nose_plus_y = None;
+                self.auto_buf.clear();
+                self.orientation_filter.reset();
+                self.ori_rows = None;
+                let mut cfg = agent_config::AgentConfig::load();
+                cfg.mag_offset_mg = None;
+                cfg.heading_bias_deg = None;
+                cfg.nose_plus_y = None;
+                cfg.lateral_sign = None;   // clear any stale stored value
+                let _ = cfg.save();
+                push_log(&self.log, "compass calibration reset".to_string());
+            }
+            if let Some(off) = self.mag_offset {
+                ui.label(format!("offset [{:+.0} {:+.0} {:+.0}] mG", off[0], off[1], off[2]));
             }
         });
         ui.label(
-            "How to calibrate: click the button, then rotate the box slowly \
-             flat on the table through one full circle — pause about 3 s per \
-             quarter turn (the box sends one sample every 2 s). Then briefly \
-             tip it on its nose and on its side. When the 30 s are up the \
-             offset is stored for this box and survives restarts. Calibrate \
-             away from laptops, speakers and steel surfaces; re-calibrate if \
-             the arrow stops following the rotation.",
+            "Attitude is gyro + accel (no magnetometer): tilt is exact every \
+             frame, rotation is tracked by the gyro with its bias auto-removed \
+             at rest. You set which way is south once — USB-C south, box flat. \
+             The preview is a FIXED map: screen-up is SOUTH, so once set the \
+             green nose arrow points down/south. The absolute heading drifts \
+             slowly — re-tap USB-C south if it wanders.",
         );
-        draw_orientation_box(ui, pitch_deg, roll_deg, heading_deg);
+        draw_orientation_box(
+            ui,
+            self.ori_rows,
+            self.heading_bias_deg,
+            self.nose_plus_y.unwrap_or(false),
+        );
         ui.add_space(10.0);
         ui.separator();
 
@@ -3283,96 +3403,330 @@ fn file_row(
 /// flat line jittering on noise); when the actual sample range exceeds
 /// it, the painter expands to fit. Width fills available space; height
 /// is a fixed 60 px so two sparklines stack neatly without resize math.
-/// Wireframe cuboid rotated by the live eCompass angles — a quick "which
-/// way is the box pointing" visual for the Live tab. Body frame is NED
-/// (x forward, y right, z down), rotated body->world by Rz(yaw)·Ry(pitch)·
-/// Rx(roll), then viewed from the south at ~28° elevation (orthographic).
-/// The lid (top face) is blue, the nose edge green, and a fixed compass
-/// cross on the ground plane gives the N/E reference the heading rotates
-/// against. Pure painter calls — no new dependencies.
-fn draw_orientation_box(ui: &mut egui::Ui, pitch_deg: f64, roll_deg: f64, heading_deg: f64) {
+// --- TRIAD seed helpers + gyro/accel attitude filter (iOS parity) --------
+// `triad_rows`/`triad_world` build a full 3D frame straight from gravity +
+// magnetic field — no Euler chaining, no gimbal. They are used ONLY to
+// SEED the gyro+accel `OrientationFilter` below (initial heading) and to
+// project the filter's body-frame axes into the fixed south-up preview.
+// The live render attitude is the filter's — mag-independent. Mirrors iOS
+// `enum Triad` + `OrientationFilter`.
+
+/// Body-frame world axes (n, e, d) — the render rows, produced by the
+/// gyro+accel filter instead of the magnetometer. Mirrors iOS `OriRows`.
+#[derive(Clone, Copy)]
+struct OriRows {
+    n: [f64; 3],
+    e: [f64; 3],
+    d: [f64; 3],
+}
+
+/// Accel + gyro complementary filter with drone-style gyro-bias
+/// auto-calibration — the live 3D preview's attitude source. Mirrors iOS
+/// `OrientationFilter`.
+///
+///   • DOWN (tilt) comes from the accelerometer — exact, drift-free, every
+///     frame, so which face is up is always right in every pose.
+///   • the horizontal frame is carried by the gyroscope (EXACT Rodrigues
+///     rotation), so blue-face / on-end / backflip stay consistent.
+///   • gyro bias (the slow-yaw-drift culprit) is auto-measured whenever the
+///     box rests still and subtracted, so the heading barely drifts.
+///   • absolute heading (where north is) is the one thing gyro+accel can't
+///     know; the "USB-C south" tap supplies it via the render bias.
+struct OrientationFilter {
+    n: [f64; 3],       // body-frame world-North
+    e: [f64; 3],       // body-frame world-East
+    d: [f64; 3],       // body-frame world-Down (flat lid-up)
+    gbias: [f64; 3],   // gyro bias, deci-dps
+    last_tick: Option<u32>,
+    inited: bool,
+}
+
+impl Default for OrientationFilter {
+    fn default() -> Self {
+        Self {
+            n: [1.0, 0.0, 0.0],
+            e: [0.0, 1.0, 0.0],
+            d: [0.0, 0.0, -1.0],
+            gbias: [0.0, 0.0, 0.0],
+            last_tick: None,
+            inited: false,
+        }
+    }
+}
+
+impl OrientationFilter {
+    /// Latest body-frame world axes, or `None` before the first seed.
+    fn rows(&self) -> Option<OriRows> {
+        if self.inited {
+            Some(OriRows { n: self.n, e: self.e, d: self.d })
+        } else {
+            None
+        }
+    }
+
+    /// Re-seed the attitude on the next sample; keep the learned gyro bias.
+    fn reset(&mut self) {
+        self.inited = false;
+        self.last_tick = None;
+    }
+
+    /// Consume one SensorStream snapshot. `mag_offset` only SEEDS the
+    /// initial heading (once) — there is NO magnetometer re-anchor.
+    fn update(&mut self, s: &LiveSample, mag_offset: Option<[f64; 3]>) {
+        let acc = [s.acc_mg[0] as f64, s.acc_mg[1] as f64, s.acc_mg[2] as f64];
+        let a_mag = (acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]).sqrt();
+        if a_mag <= 100.0 { return; }
+
+        // gyro_cdps carries DECI-dps from firmware v0.0.27+ (÷10 for dps).
+        let g_raw = [s.gyro_cdps[0] as f64, s.gyro_cdps[1] as f64, s.gyro_cdps[2] as f64];
+        let mut g_corr = [
+            g_raw[0] - self.gbias[0],
+            g_raw[1] - self.gbias[1],
+            g_raw[2] - self.gbias[2],
+        ];
+
+        // Drone-style gyro-bias cal: while the box rests (tiny corrected
+        // rate AND ~1 g), the raw gyro reading IS the bias — ease toward it.
+        // 25 deci-dps = 2.5 dps threshold for "still".
+        let g_mag = (g_corr[0] * g_corr[0] + g_corr[1] * g_corr[1] + g_corr[2] * g_corr[2]).sqrt();
+        if g_mag < 25.0 && a_mag > 900.0 && a_mag < 1100.0 {
+            let k = 0.02;
+            for i in 0..3 {
+                self.gbias[i] = self.gbias[i] * (1.0 - k) + g_raw[i] * k;
+            }
+            g_corr = [
+                g_raw[0] - self.gbias[0],
+                g_raw[1] - self.gbias[1],
+                g_raw[2] - self.gbias[2],
+            ];
+        }
+
+        let dt = match self.last_tick {
+            Some(last) => {
+                (s.timestamp_ms.wrapping_sub(last) as f64 / 1000.0).clamp(0.005, 0.5)
+            }
+            None => 0.1,
+        };
+        self.last_tick = Some(s.timestamp_ms);
+
+        // Seed the frame from accel + a mag-derived heading (once), so the
+        // preview doesn't start at a random yaw; the gyro owns it after.
+        if !self.inited {
+            if let Some((rn, re, rd)) = triad_rows(s.acc_mg, s.mag_mg, mag_offset) {
+                self.n = rn;
+                self.e = re;
+                self.d = rd;
+                self.inited = true;
+            }
+            return;
+        }
+
+        // Gyro propagation. A world-fixed vector expressed in the body frame
+        // rotates by the body's inverse rotation over dt — EXACT rotation
+        // (Rodrigues) by angle -|ω|·dt about ω̂, correct at any angle.
+        let scale = std::f64::consts::PI / 1800.0; // deci-dps → rad/s (÷10 ·π/180)
+        let w = [g_corr[0] * scale, g_corr[1] * scale, g_corr[2] * scale];
+        let w_mag = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+        if w_mag > 1e-9 {
+            let ang = -w_mag * dt;
+            let axis = [w[0] / w_mag, w[1] / w_mag, w[2] / w_mag];
+            self.n = Self::rotate(self.n, axis, ang);
+            self.d = Self::rotate(self.d, axis, ang);
+        }
+
+        // Tilt correction: nudge DOWN toward measured gravity when the accel
+        // is trustworthy (near 1 g). Rate-independent gain (∝ dt, τ ≈ 0.6 s).
+        if a_mag > 800.0 && a_mag < 1200.0 {
+            let inv = -1.0 / a_mag;
+            let d_meas = [acc[0] * inv, acc[1] * inv, acc[2] * inv];
+            let k = (dt / 0.6).min(0.15);
+            for i in 0..3 {
+                self.d[i] = self.d[i] * (1.0 - k) + d_meas[i] * k;
+            }
+        }
+
+        // Re-orthonormalise: D, then N ⟂ D, then E = D × N (NED: D×N = E).
+        self.d = Self::normalized(self.d);
+        let nd = self.n[0] * self.d[0] + self.n[1] * self.d[1] + self.n[2] * self.d[2];
+        self.n = Self::normalized([
+            self.n[0] - nd * self.d[0],
+            self.n[1] - nd * self.d[1],
+            self.n[2] - nd * self.d[2],
+        ]);
+        self.e = tri_cross(self.d, self.n);
+
+        // NO magnetometer heading re-anchor (this box's hard-iron pins the
+        // computed flat heading ≈ south regardless of orientation). Heading
+        // is pure gyro, seeded once from the mag; the user sets the absolute
+        // direction with "USB-C south".
+        let _ = mag_offset;
+    }
+
+    /// Rodrigues rotation of `v` about unit axis `k` by angle `a` (rad).
+    fn rotate(v: [f64; 3], k: [f64; 3], a: f64) -> [f64; 3] {
+        let (ca, sa) = (a.cos(), a.sin());
+        let kv = tri_cross(k, v);
+        let kd = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+        let f = kd * (1.0 - ca);
+        Self::normalized([
+            v[0] * ca + kv[0] * sa + k[0] * f,
+            v[1] * ca + kv[1] * sa + k[1] * f,
+            v[2] * ca + kv[2] * sa + k[2] * f,
+        ])
+    }
+
+    /// Nose-end compass azimuth (deg, [0,360)) from the filter, bias
+    /// applied. `None` before the filter has seeded.
+    fn nose_azimuth(&self, nose_plus_y: bool, bias_deg: f64) -> Option<f64> {
+        if !self.inited { return None; }
+        let nose = [0.0, if nose_plus_y { 1.0 } else { -1.0 }, 0.0];
+        let (wn, we, _) = triad_world(nose, (self.n, self.e, self.d), bias_deg);
+        let mut az = we.atan2(wn).to_degrees();
+        if az < 0.0 { az += 360.0; }
+        Some(az)
+    }
+
+    fn normalized(v: [f64; 3]) -> [f64; 3] {
+        let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if m > 1e-9 { [v[0] / m, v[1] / m, v[2] / m] } else { v }
+    }
+}
+
+fn tri_dot(a: [f64; 3], b: [f64; 3]) -> f64 { a[0]*b[0] + a[1]*b[1] + a[2]*b[2] }
+fn tri_cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]]
+}
+fn tri_norm(a: [f64; 3]) -> f64 { (a[0]*a[0] + a[1]*a[1] + a[2]*a[2]).sqrt() }
+
+/// Body-frame unit rows (north, east, down) of the attitude, or `None`
+/// when degenerate (zero vectors / field parallel to gravity).
+fn triad_rows(acc_mg: [i16; 3], mag_mg: [i16; 3], off: Option<[f64; 3]>)
+    -> Option<([f64; 3], [f64; 3], [f64; 3])>
+{
+    let a = [acc_mg[0] as f64, acc_mg[1] as f64, acc_mg[2] as f64];
+    let an = tri_norm(a);
+    if an <= 100.0 { return None; }              // < 0.1 g: free-fall/garbage
+    let d = [-a[0]/an, -a[1]/an, -a[2]/an];      // accel reads +1 g on the UP axis
+    let o = off.unwrap_or([0.0; 3]);
+    // The LIS2MDL's Y axis is mirrored relative to the IMU frame on this
+    // board (ST "esu" vs "enu" mounting) — the mag-Y flip is a fixed
+    // hardware fact, always applied. iOS `Triad.rows` parity.
+    let m = [
+        mag_mg[0] as f64 - o[0],
+        -(mag_mg[1] as f64 - o[1]),
+        mag_mg[2] as f64 - o[2],
+    ];
+    let mn = tri_norm(m);
+    if mn <= 20.0 { return None; }               // essentially no field signal
+    let mu = [m[0]/mn, m[1]/mn, m[2]/mn];
+    let e = tri_cross(d, mu);
+    let en = tri_norm(e);
+    if en <= 0.05 { return None; }               // field ~parallel to gravity
+    let e = [e[0]/en, e[1]/en, e[2]/en];
+    let n = tri_cross(e, d);                      // unit by construction
+    Some((n, e, d))
+}
+
+/// World (north, east, down) coordinates of a body-frame point, with the
+/// vertical-axis bias rotation applied. No scene reflection: the mag-Y flip
+/// in `triad_rows` already yields the physically-correct handedness (iOS
+/// `Triad.world` parity — the user-facing left/right mirror was removed).
+fn triad_world(p: [f64; 3], rows: ([f64; 3], [f64; 3], [f64; 3]), bias_deg: f64)
+    -> (f64, f64, f64)
+{
+    let (rn, re, rd) = rows;
+    let n0 = tri_dot(rn, p);
+    let e0 = tri_dot(re, p);
+    let d0 = tri_dot(rd, p);
+    let b = bias_deg.to_radians();
+    // Rotate the world frame by -bias: azimuths shrink by bias.
+    let n1 = n0 * b.cos() + e0 * b.sin();
+    let e1 = -n0 * b.sin() + e0 * b.cos();
+    (n1, e1, d0)
+}
+
+/// Wireframe cuboid rendered from the gyro+accel filter attitude. Fixed
+/// map view, screen-up = SOUTH (the box is calibrated with USB-C pointing
+/// south, so the green nose arrow then points down/south); N/E/S/W labels
+/// (N red); semi-transparent lid; green nose arrow on the confirmed front
+/// end. All poses consistent — no Euler chaining. Mirrors iOS
+/// `OrientationBoxCanvas`.
+fn draw_orientation_box(
+    ui: &mut egui::Ui,
+    rows: Option<OriRows>,
+    bias_deg: f64,
+    nose_plus_y: bool,
+) {
     let (resp, painter) =
-        ui.allocate_painter(egui::vec2(280.0, 190.0), egui::Sense::hover());
+        ui.allocate_painter(egui::vec2(280.0, 200.0), egui::Sense::hover());
     let rect = resp.rect;
-    let center = rect.center();
-    let scale = 60.0_f32;
-
-    let (sr, cr) = (roll_deg.to_radians().sin() as f32, roll_deg.to_radians().cos() as f32);
-    let (sp, cp) = (pitch_deg.to_radians().sin() as f32, pitch_deg.to_radians().cos() as f32);
-    let (sy, cy) = (heading_deg.to_radians().sin() as f32, heading_deg.to_radians().cos() as f32);
-
-    // body -> world (NED): Rz(yaw) * Ry(pitch) * Rx(roll)
-    let rot = |v: [f32; 3]| -> [f32; 3] {
-        let [x, y, z] = v;
-        // Rx(roll)
-        let (y, z) = (y * cr - z * sr, y * sr + z * cr);
-        // Ry(pitch)
-        let (x, z) = (x * cp + z * sp, -x * sp + z * cp);
-        // Rz(yaw)
-        [x * cy - y * sy, x * sy + y * cy, z]
-    };
-    // Orthographic camera: looking north from the south, 28° above the
-    // horizon. screen-x = east, screen-y = -(n·sin(el) - d·cos(el)).
-    let el = 28.0_f32.to_radians();
+    let cx = rect.center().x as f64;
+    let cy = rect.center().y as f64;
+    let scale = rect.height() as f64 / 3.2;
+    let el = 28.0_f64.to_radians();
     let (sel, cel) = (el.sin(), el.cos());
-    let project = |w: [f32; 3]| -> egui::Pos2 {
-        let [n, e, d] = w;
+
+    // Fixed south-up orthographic mapping for a world (north, east, down)
+    // point: screen-up = SOUTH, screen-right = WEST.
+    let screen = |n: f64, e: f64, d: f64| -> egui::Pos2 {
         egui::pos2(
-            center.x + e * scale,
-            center.y - (n * sel - d * cel) * scale,
+            (cx + (-e) * scale) as f32,
+            (cy - ((-n) * sel - d * cel) * scale) as f32,
         )
     };
-    let p3 = |v: [f32; 3]| project(rot(v));
 
-    // Ground-plane compass cross (world frame, does not rotate with the
-    // box) — the reference the heading is read against.
     let axis = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
-    painter.line_segment([project([1.35, 0.0, 0.0]), project([-1.35, 0.0, 0.0])], axis);
-    painter.line_segment([project([0.0, 1.35, 0.0]), project([0.0, -1.35, 0.0])], axis);
-    painter.text(
-        project([1.5, 0.0, 0.0]),
-        egui::Align2::CENTER_CENTER,
-        "N",
-        egui::TextStyle::Body.resolve(ui.style()),
-        egui::Color32::from_gray(160),
-    );
-    painter.text(
-        project([0.0, 1.5, 0.0]),
-        egui::Align2::CENTER_CENTER,
-        "E",
-        egui::TextStyle::Body.resolve(ui.style()),
-        egui::Color32::from_gray(160),
-    );
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    // Ground compass cross (world frame, fixed).
+    painter.line_segment([screen(1.35, 0.0, 0.0), screen(-1.35, 0.0, 0.0)], axis);
+    painter.line_segment([screen(0.0, 1.35, 0.0), screen(0.0, -1.35, 0.0)], axis);
+    painter.text(screen(1.5, 0.0, 0.0), egui::Align2::CENTER_CENTER, "N",
+        font.clone(), egui::Color32::from_rgb(211, 47, 47));
+    painter.text(screen(0.0, 1.5, 0.0), egui::Align2::CENTER_CENTER, "E",
+        font.clone(), egui::Color32::from_gray(160));
+    painter.text(screen(-1.5, 0.0, 0.0), egui::Align2::CENTER_CENTER, "S",
+        font.clone(), egui::Color32::from_gray(160));
+    painter.text(screen(0.0, -1.5, 0.0), egui::Align2::CENTER_CENTER, "W",
+        font.clone(), egui::Color32::from_gray(160));
 
-    // Cuboid with SensorTile.box proportions — on the box the LONG side
-    // is the body Y axis (X is the short/transverse axis), so hy > hx.
-    let (hx, hy, hz) = (0.62_f32, 1.0_f32, 0.28_f32);
-    // z is down in NED: top face has z = -hz.
-    let v = [
-        [ hx,  hy, -hz], [ hx, -hy, -hz], [-hx, -hy, -hz], [-hx,  hy, -hz], // top
-        [ hx,  hy,  hz], [ hx, -hy,  hz], [-hx, -hy,  hz], [-hx,  hy,  hz], // bottom
+    // Attitude from the gyro+accel filter; flat until it seeds.
+    let r = rows.unwrap_or(OriRows {
+        n: [1.0, 0.0, 0.0],
+        e: [0.0, 1.0, 0.0],
+        d: [0.0, 0.0, -1.0],
+    });
+    let p3 = |p: [f64; 3]| -> egui::Pos2 {
+        let (n, e, d) = triad_world(p, (r.n, r.e, r.d), bias_deg);
+        screen(n, e, d)
+    };
+
+    // Cuboid in the SENSOR frame: z points UP out of the lid (accel reads
+    // +1 g on z when flat lid-up), long side = y.
+    let (hx, hy, hz) = (0.62, 1.0, 0.28);
+    let v: [[f64; 3]; 8] = [
+        [hx, hy, hz], [hx, -hy, hz], [-hx, -hy, hz], [-hx, hy, hz],     // lid
+        [hx, hy, -hz], [hx, -hy, -hz], [-hx, -hy, -hz], [-hx, hy, -hz], // bottom
     ];
     let pts: Vec<egui::Pos2> = v.iter().map(|&q| p3(q)).collect();
 
-    let side = egui::Stroke::new(1.3, egui::Color32::from_gray(130));
-    let top = egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 180, 250));
-    // bottom face + verticals
+    let side = egui::Stroke::new(1.3, egui::Color32::from_gray(128));
+    let lid = egui::Color32::from_rgb(79, 181, 250);
+    // Bottom face + verticals.
     for (a, b) in [(4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)] {
         painter.line_segment([pts[a], pts[b]], side);
     }
-    // top face (lid)
-    for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
-        painter.line_segment([pts[a], pts[b]], top);
-    }
-    // Nose marker: along the LONG (+y) end of the lid, drawn as a green
-    // arrow from the lid centre — shows which end the box points with.
-    let lid_c = p3([0.0, 0.0, -hz]);
-    let nose = p3([0.0, hy * 1.25, -hz]);
-    painter.arrow(
-        lid_c,
-        nose - lid_c,
-        egui::Stroke::new(2.0, egui::Color32::LIGHT_GREEN),
-    );
+    // Filled + outlined lid.
+    painter.add(egui::Shape::convex_polygon(
+        vec![pts[0], pts[1], pts[2], pts[3]],
+        egui::Color32::from_rgba_unmultiplied(79, 181, 250, 64),
+        egui::Stroke::new(2.0, lid),
+    ));
+    // Nose arrow on the confirmed front end, on the lid.
+    let ny = if nose_plus_y { hy } else { -hy };
+    let nose_col = egui::Color32::from_rgb(66, 161, 71);
+    let lid_c = p3([0.0, 0.0, hz]);
+    let tip = p3([0.0, ny * 1.25, hz]);
+    painter.arrow(lid_c, tip - lid_c, egui::Stroke::new(2.0, nose_col));
 }
 
 fn draw_sparkline(

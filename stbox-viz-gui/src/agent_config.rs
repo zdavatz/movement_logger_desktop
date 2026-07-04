@@ -55,6 +55,18 @@ pub struct AgentConfig {
     /// bias bigger than the ~200 mG horizontal earth field pins the
     /// heading regardless of rotation. `None` = uncalibrated.
     pub mag_offset_mg: Option<[f64; 3]>,
+    /// One-tap direction anchor (deg) subtracted from the box's nose
+    /// azimuth so "USB-C points SOUTH" reads as 180° (iOS/Android
+    /// parity). `None`/absent = 0 (no anchor set yet).
+    #[serde(default)]
+    pub heading_bias_deg: Option<f64>,
+    /// Which body-axis end is the FRONT (USB-C): `Some(true)` = +Y,
+    /// `Some(false)` = -Y, `None` = not confirmed.
+    #[serde(default)]
+    pub nose_plus_y: Option<bool>,
+    /// Lateral render mirror (+1/-1) from the right-side confirm tap.
+    #[serde(default)]
+    pub lateral_sign: Option<f64>,
 }
 
 impl AgentConfig {
