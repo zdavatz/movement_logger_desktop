@@ -208,6 +208,33 @@ pub struct SyncCore {
     /// — box rebooting…" on success, the mapped error on failure). Empty
     /// = no upload attempted yet this session.
     pub ble_flash_msg: String,
+
+    // ----- "Check FW" box-firmware auto-update -------------------------
+    /// A firmware check is running: both halves (GitHub latest + box
+    /// version) are being gathered. Cleared once the compare fires (or a
+    /// fetch fails). Gates the "Check FW" button + drives the status line.
+    pub fw_check_active: bool,
+    /// Latest firmware release from GitHub: `(version "X.Y.Z", download_url)`.
+    /// Filled by `poll_fw_check` when the background fetch lands.
+    pub fw_latest: Option<(String, String)>,
+    /// The box's firmware version from a GET_VERSION reply. Outer `None` =
+    /// not queried yet; inner `None` = queried but legacy/no-reply (→ treat
+    /// as older than latest); `Some(Some(v))` = the parsed box version.
+    pub fw_box_version: Option<Option<String>>,
+    /// Status line for the "Check FW" flow ("Checking…", "Firmware up to
+    /// date (vX.Y.Z)", "Updating box to vX.Y.Z…", or an error).
+    pub fw_check_msg: String,
+    /// Set by `fw_maybe_decide` when the box is older than the latest GitHub
+    /// firmware (or legacy/unknown): `(version, download_url)`. Drives the
+    /// "New FW" banner — the flash is deferred to `fw_apply_update` (the
+    /// banner's "Update box" button), never automatic. `None` = up to date /
+    /// no check done / banner dismissed.
+    pub fw_update_available: Option<(String, String)>,
+    /// Background GitHub-fetch hand-off, polled each frame by
+    /// `poll_fw_check`. `None` = fetch still running / idle; `Some(inner)` =
+    /// the fetch finished — `inner` is `Some((ver, url))` on success,
+    /// `None` on network failure / no release.
+    pub fw_fetch_result: Arc<Mutex<Option<Option<(String, String)>>>>,
     /// Shared log sink. The GUI shares its scrollable-panel `Arc` here
     /// so BLE/sync lines land in the same buffer as before; the agent
     /// points it at a stdout/file drain.
@@ -506,6 +533,17 @@ impl SyncCore {
                         b.send(BleCmd::SetTime { epoch_ms });
                         b.send(BleCmd::List);
                     }
+                    /* Auto-run the firmware check on every clean connect so
+                       the user never has to press "Check FW". Fires the GitHub
+                       fetch + a box GET_VERSION query; when both land,
+                       `fw_maybe_decide` raises the "New FW" banner (never
+                       auto-flashes). No-ops if a check is already active or a
+                       sync/flash is in flight (e.g. a reconnect resuming a
+                       sync). The direct GET_VERSION it sends here loses the
+                       single-op slot to the LIST above and is dropped by the
+                       worker's op-busy guard; the ListDone handler re-issues
+                       it once the worker is idle, so the query still lands. */
+                    self.start_fw_check();
                 }
                 BleEvent::Disconnected => {
                     /* If a transfer/sync was live when the link dropped,
@@ -549,6 +587,15 @@ impl SyncCore {
                        from another client) rather than show a stale
                        value while disconnected. */
                     self.ble_log_mode = None;
+                    /* Abandon any in-flight "Check FW" — the box version
+                       query can't complete across a drop, so drop the
+                       active flag (the worker also emits FirmwareVersion(None)
+                       on the mid-query disconnect path). Keep fw_check_msg
+                       so a result/error from before the drop stays visible. */
+                    self.fw_check_active = false;
+                    self.fw_latest = None;
+                    self.fw_box_version = None;
+                    self.fw_update_available = None;
                 }
                 BleEvent::ListEntry { name, size } => {
                     /* Default-tick only sensor-data rows (Sens*.csv,
@@ -574,6 +621,21 @@ impl SyncCore {
                     if self.ble_sync_pending {
                         self.ble_sync_pending = false;
                         self.run_sync_diff();
+                    } else if self.fw_check_active && self.fw_box_version.is_none() {
+                        /* Auto fw-check box half: the GET_VERSION sent from
+                           the Connected handler lost the single-op slot to
+                           the connect-time LIST and was dropped. Re-issue it
+                           now that the worker is idle (mirrors GET_MODE's
+                           ListDone trigger). GET_VERSION goes FIRST; the
+                           GET_MODE query is chained after the version reply
+                           (FirmwareVersion handler) since the two single-op
+                           queries can't both hold the slot — and on a legacy
+                           box (no reply to either) GET_VERSION still times out
+                           → FirmwareVersion(None), which completes the check
+                           and raises the banner. */
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::GetFirmwareVersion);
+                        }
                     } else if self.ble_log_mode.is_none() {
                         /* Worker op is Idle right after ListDone and no
                            sync is about to queue reads — a safe window to
@@ -733,6 +795,32 @@ impl SyncCore {
                        fine that both the GUI and the agent run this. */
                     if let Err(e) = crate::autostart::sync_with_mode(manual) {
                         push_log(&self.log, format!("autostart: {e}"));
+                    }
+                }
+                BleEvent::FirmwareVersion(v) => {
+                    push_log(
+                        &self.log,
+                        format!(
+                            "ble: box firmware version = {}",
+                            v.as_deref().unwrap_or("unknown (legacy / no reply)")
+                        ),
+                    );
+                    // Record the box half of the "Check FW" comparison
+                    // (outer Some = queried; inner mirrors the reply). Then
+                    // try to decide — the GitHub half may already be in.
+                    self.fw_box_version = Some(v);
+                    self.fw_maybe_decide();
+                    /* Chain the connect-time GET_MODE query now that the
+                       version slot has freed. On the auto fw-check path the
+                       ListDone handler sent GET_VERSION *instead of* GET_MODE
+                       (single-op slot), so GET_MODE must be issued here.
+                       Guarded to the same conditions ListDone uses so a
+                       manual "Check FW" (mode already known) or a sync-in-
+                       progress connect doesn't re-query needlessly. */
+                    if self.ble_log_mode.is_none() && !self.ble_sync_pending {
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::GetLogMode);
+                        }
                     }
                 }
                 BleEvent::DeleteDone { name } => {
@@ -995,6 +1083,32 @@ impl SyncCore {
     /// which `pump_ble_events` folds into `ble_flash_progress` /
     /// `ble_flash_msg`.
     pub fn start_firmware_upload(&mut self, path: &Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.ble_flash_msg = format!("Can't read firmware file: {e}");
+                push_log(&self.log, format!("ble: firmware read failed: {e}"));
+                return;
+            }
+        };
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.flash_bytes(bytes, &label);
+    }
+
+    /// Upload an in-memory firmware image (used by the "Check FW" flow, which
+    /// downloads the `.bin` from GitHub rather than picking it off disk).
+    /// Same guards + wire path as `start_firmware_upload`.
+    pub fn start_firmware_upload_bytes(&mut self, bytes: Vec<u8>) {
+        self.flash_bytes(bytes, "downloaded");
+    }
+
+    /// Shared tail for both firmware-upload entry points: guard (connected /
+    /// not-busy / non-empty), set the progress + status state, and hand the
+    /// image to the worker. `label` is the human name shown in the status line.
+    fn flash_bytes(&mut self, bytes: Vec<u8>, label: &str) {
         if !matches!(self.ble_state, BleState::Connected) {
             self.ble_flash_msg = "Connect to a box before uploading firmware.".into();
             return;
@@ -1007,14 +1121,6 @@ impl SyncCore {
             self.ble_flash_msg = "Another BLE op is in flight — wait for it to finish.".into();
             return;
         }
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) => {
-                self.ble_flash_msg = format!("Can't read firmware file: {e}");
-                push_log(&self.log, format!("ble: firmware read failed: {e}"));
-                return;
-            }
-        };
         if bytes.is_empty() {
             self.ble_flash_msg = "Firmware file is empty.".into();
             return;
@@ -1022,18 +1128,167 @@ impl SyncCore {
         let len = bytes.len();
         self.ble_flash_progress = Some((0, len as u64));
         self.ble_flash_msg = format!(
-            "Uploading firmware ({}) — {} kB…",
-            path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string()),
+            "Uploading firmware ({label}) — {} kB…",
             (len as f64 / 1024.0).round() as u64,
         );
         push_log(
             &self.log,
-            format!("ble: uploading firmware {} ({len} B)", path.display()),
+            format!("ble: uploading firmware {label} ({len} B)"),
         );
         if let Some(b) = self.ble.as_ref() {
             b.send(BleCmd::FlashFirmware { bytes: Arc::new(bytes) });
+        }
+    }
+
+    // ----- "Check FW" box-firmware auto-update -----------------------------
+
+    /// Kick off a firmware check: fetch the latest firmware release from
+    /// GitHub (off-thread) and query the connected box's current version over
+    /// BLE. When both halves land (`poll_fw_check` for the GitHub side,
+    /// `BleEvent::FirmwareVersion` for the box side) `fw_maybe_decide` compares
+    /// them and either flashes the newer image or reports "up to date". No-op
+    /// with a status message if not connected, busy, or already checking.
+    pub fn start_fw_check(&mut self) {
+        if !matches!(self.ble_state, BleState::Connected) {
+            self.fw_check_msg = "Connect to a box before checking firmware.".into();
+            return;
+        }
+        if self.fw_check_active {
+            return;
+        }
+        if self.ble_dl_in_flight
+            || self.ble_sync_pending
+            || !self.ble_dl_queue.is_empty()
+            || self.ble_flash_progress.is_some()
+        {
+            self.fw_check_msg = "Another BLE op is in flight — wait for it to finish.".into();
+            return;
+        }
+        self.fw_check_active = true;
+        self.fw_latest = None;
+        self.fw_box_version = None;
+        self.fw_check_msg = "Checking for firmware updates…".into();
+        if let Ok(mut g) = self.fw_fetch_result.lock() {
+            *g = None;
+        }
+        // GitHub half — off the UI thread; the result lands in the shared
+        // slot that `poll_fw_check` drains each frame.
+        let slot = self.fw_fetch_result.clone();
+        std::thread::spawn(move || {
+            let res = crate::update::check_latest_firmware()
+                .map(|r| (r.version, r.download_url));
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(res);
+            }
+        });
+        // Box half — GET_VERSION over BLE (demuxed reply → FirmwareVersion).
+        if let Some(b) = self.ble.as_ref() {
+            b.send(BleCmd::GetFirmwareVersion);
+        }
+        push_log(&self.log, "fw-check: querying box version + latest release".into());
+    }
+
+    /// Drain the background GitHub-fetch result (if it landed) and re-run the
+    /// decision. Called once per frame by the GUI while a check is active,
+    /// mirroring how the app-updater's `update_rx` is polled.
+    pub fn poll_fw_check(&mut self) {
+        if !self.fw_check_active {
+            return;
+        }
+        let landed = self.fw_fetch_result.lock().ok().and_then(|mut g| g.take());
+        if let Some(res) = landed {
+            match res {
+                Some((ver, url)) => {
+                    push_log(&self.log, format!("fw-check: latest release v{ver}"));
+                    self.fw_latest = Some((ver, url));
+                }
+                None => {
+                    self.fw_check_active = false;
+                    self.fw_check_msg =
+                        "Couldn't reach GitHub for the latest firmware.".into();
+                    push_log(&self.log, "fw-check: GitHub fetch failed".into());
+                    return;
+                }
+            }
+        }
+        self.fw_maybe_decide();
+    }
+
+    /// Once BOTH the GitHub latest and the box version are known, compare and
+    /// act: flash the newer image (or when the box is legacy/unknown), else
+    /// report "up to date". Idempotent — returns early until both halves are
+    /// in, and clears `fw_check_active` when it fires.
+    fn fw_maybe_decide(&mut self) {
+        if !self.fw_check_active {
+            return;
+        }
+        let (Some((latest_ver, url)), Some(box_ver)) =
+            (self.fw_latest.clone(), self.fw_box_version.clone())
+        else {
+            return; // still waiting for one half
+        };
+        self.fw_check_active = false;
+
+        // latest > box, OR box unknown/unparseable (legacy) → update.
+        let latest_parsed = crate::update::parse_version(&latest_ver);
+        let needs_update = match (&box_ver, latest_parsed) {
+            (_, None) => false, // couldn't parse the latest tag — be safe, no flash
+            (None, Some(_)) => true, // legacy box, no GET_VERSION reply → update
+            (Some(bv), Some(lv)) => match crate::update::parse_version(bv) {
+                Some(bvp) => lv > bvp,
+                None => true, // unparseable box version → treat as older
+            },
+        };
+
+        if needs_update {
+            // Banner-first: surface the availability + stash the target, but
+            // DON'T flash yet. The user consents via the "New FW" banner's
+            // "Update box" button → `fw_apply_update`, mirroring the desktop
+            // app's own update banner (no silent OTA).
+            self.fw_update_available = Some((latest_ver.clone(), url));
+            self.fw_check_msg = format!("New box firmware v{latest_ver} available.");
+            push_log(
+                &self.log,
+                format!(
+                    "fw-check: box={} latest=v{latest_ver} → update available",
+                    box_ver.as_deref().unwrap_or("unknown")
+                ),
+            );
+        } else {
+            self.fw_update_available = None;
+            self.fw_check_msg = format!("Firmware up to date (v{latest_ver}).");
+            push_log(
+                &self.log,
+                format!("fw-check: box up to date (latest v{latest_ver})"),
+            );
+        }
+    }
+
+    /// Apply the pending firmware update (the "New FW" banner's "Update box"
+    /// button). Downloads the stashed `.bin` and flashes it over BLE via the
+    /// existing FOTA path — the deferred half of the old auto-flash, now
+    /// user-triggered. No-op if nothing is pending.
+    pub fn fw_apply_update(&mut self) {
+        let Some((version, url)) = self.fw_update_available.clone() else {
+            return;
+        };
+        self.fw_check_msg = format!("Updating box to v{version}…");
+        push_log(&self.log, format!("fw-check: downloading + flashing v{version}"));
+        match crate::update::download(&url) {
+            Ok(bytes) => {
+                if bytes.is_empty() {
+                    self.fw_check_msg = "Downloaded firmware image was empty.".into();
+                    return;
+                }
+                self.start_firmware_upload_bytes(bytes);
+                // Consumed — clear the banner so it doesn't re-offer during
+                // the flash (the flash progress + result take over the UI).
+                self.fw_update_available = None;
+            }
+            Err(e) => {
+                self.fw_check_msg = format!("Couldn't download firmware: {e}");
+                push_log(&self.log, format!("fw-check: download failed: {e}"));
+            }
         }
     }
 

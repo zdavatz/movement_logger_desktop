@@ -47,6 +47,12 @@
 //!                               No reply. macOS fix: cancelPeripheralConnection
 //!                               leaves the ACL alive controller-side, so we ask
 //!                               the box to drop it (firmware v0.0.22+).
+//!   0x10 GET_VERSION          — replies with one FileData notify carrying the
+//!                               ASCII firmware version (e.g. "0.0.29", no NUL).
+//!                               Legacy firmware (≤ v0.0.28) doesn't know it and
+//!                               sends no reply → the GettingVersion op times out
+//!                               → FirmwareVersion(None). Same single-op/demux
+//!                               rules as GET_MODE (0x07).
 //!
 //!   Status bytes: 0x00 OK, 0xB0 BUSY, 0xE1 NOT_FOUND, 0xE2 IO_ERROR, 0xE3 BAD_REQ.
 
@@ -351,6 +357,13 @@ pub enum BleCmd {
     /// `PumpTsueri` firmware never replies; the GettingMode op just times
     /// out and drops to Idle (mode stays "unknown", no error surfaced).
     GetLogMode,
+    /// GET_VERSION opcode `0x10` (firmware v0.0.29+). Box replies with one
+    /// FileData notify carrying the ASCII firmware version (e.g. `"0.0.29"`,
+    /// no NUL) → `BleEvent::FirmwareVersion(Some(..))`. Mirrors `GetLogMode`
+    /// exactly (single-byte command, demuxed reply). Legacy firmware never
+    /// replies; the `GettingVersion` op times out and emits
+    /// `FirmwareVersion(None)` without reconnecting.
+    GetFirmwareVersion,
     /// SET_TIME opcode `0x08` + `<epoch_ms:u64-LE>` (firmware v0.0.10+).
     /// The box has no RTC, so we push the host's current wall-clock millis
     /// and the firmware stamps a `# SYNC epoch_ms=.. tick_ms=..` anchor into
@@ -422,6 +435,11 @@ pub enum BleEvent {
     /// `true` → MANUAL (idle until START_LOG). Never emitted on legacy
     /// `PumpTsueri` firmware (no GET_MODE) — the UI stays at "unknown".
     LogMode { manual: bool },
+    /// The box's firmware version, from a GET_VERSION (0x10) reply. `Some`
+    /// carries the parsed ASCII version (e.g. `"0.0.29"`); `None` means the
+    /// query got no reply (legacy firmware ≤ v0.0.28) and timed out — the
+    /// "Check FW" flow treats `None` as "older than latest → update".
+    FirmwareVersion(Option<String>),
     /// User-facing error — display in the log panel.
     Error(String),
     /// One decoded SensorStream snapshot (0.5 Hz). Only emitted while
@@ -796,6 +814,12 @@ enum CurrentOp {
     /// (0 = auto, 1 = manual). Like Deleting, a stall just drops to Idle
     /// without reconnecting (legacy firmware never replies).
     GettingMode { last_progress: Instant },
+    /// GET_VERSION in flight — waiting for the ASCII firmware-version reply.
+    /// Twin of `GettingMode`: demuxed over FileData, single-op-slot, and a
+    /// stall just drops to Idle without reconnecting. Difference: on timeout
+    /// it emits `FirmwareVersion(None)` (legacy box = unknown → "update"),
+    /// where GettingMode stays silent.
+    GettingVersion { last_progress: Instant },
     /// Firmware upload in flight. Unlike the other ops, the flash is
     /// driven *inline* by `flash_firmware` (it owns the notification
     /// stream for its whole duration and reads each reply with its own
@@ -1075,6 +1099,7 @@ impl WorkerState {
             BleCmd::Delete { name } => self.delete(name).await,
             BleCmd::SetLogMode { manual } => self.set_log_mode(manual).await,
             BleCmd::GetLogMode => self.get_log_mode().await,
+            BleCmd::GetFirmwareVersion => self.get_firmware_version().await,
             BleCmd::SetTime { epoch_ms } => self.set_time(epoch_ms).await,
             BleCmd::FlashFirmware { bytes } => self.flash_firmware(bytes).await,
             BleCmd::GpsBridge { on } => self.gps_bridge(on).await,
@@ -1640,6 +1665,12 @@ impl WorkerState {
                 self.emit_err(format!("DELETE {name} aborted by disconnect"));
             }
             CurrentOp::GettingMode { .. } => {}
+            CurrentOp::GettingVersion { .. } => {
+                // The link dropped mid-query — report "unknown" so the
+                // "Check FW" flow doesn't hang waiting for a reply that
+                // will never come (the Disconnected handler also resets it).
+                self.emit(BleEvent::FirmwareVersion(None));
+            }
             CurrentOp::Flashing { .. } => {
                 self.emit(BleEvent::FlashError {
                     msg: "firmware upload aborted by disconnect".into(),
@@ -2012,6 +2043,29 @@ impl WorkerState {
             return;
         }
         self.op = CurrentOp::GettingMode { last_progress: Instant::now() };
+    }
+
+    /// GET_VERSION (0x10). Box replies with one FileData notify carrying the
+    /// ASCII firmware version; handled in the GettingVersion op arm. Exact
+    /// twin of `get_log_mode`: self-guards on `op == Idle` (so it can't
+    /// trample an in-flight LIST/READ — the reply is demuxed by `op`), writes
+    /// the single opcode byte, and parks the op. Legacy firmware (≤ v0.0.28)
+    /// never replies → the GettingVersion watchdog emits FirmwareVersion(None).
+    async fn get_firmware_version(&mut self) {
+        if !matches!(self.op, CurrentOp::Idle) {
+            // Don't trample an in-flight LIST/READ — GET_VERSION is
+            // best-effort; the caller re-tries when idle.
+            return;
+        }
+        if self.peripheral.is_none() {
+            self.emit_err("not connected");
+            return;
+        }
+        if let Err(e) = self.write_cmd(&[0x10]).await {
+            self.emit_err(e);
+            return;
+        }
+        self.op = CurrentOp::GettingVersion { last_progress: Instant::now() };
     }
 
     // ---------------- Firmware upload (OTA) --------------------------------
@@ -2435,6 +2489,17 @@ impl WorkerState {
                 self.op = CurrentOp::Idle;
                 return;
             }
+            CurrentOp::GettingVersion { .. } => {
+                /* Firmware replies with the ASCII version string (no NUL),
+                   e.g. "0.0.29". Parse as UTF-8 and trim; a lossy/empty
+                   decode yields None so a garbled reply reads as "unknown"
+                   (→ update) rather than a bogus version. */
+                let v = String::from_utf8_lossy(&n.value).trim().to_string();
+                let parsed = if v.is_empty() { None } else { Some(v) };
+                self.emit(BleEvent::FirmwareVersion(parsed));
+                self.op = CurrentOp::Idle;
+                return;
+            }
             CurrentOp::Flashing { .. } => {
                 /* The flash drives the stream inline (see `flash_firmware`
                    / `next_filedata`), so a FileData reply never reaches
@@ -2563,6 +2628,7 @@ impl WorkerState {
             CurrentOp::Reading  { last_progress, .. } => now.duration_since(*last_progress) > READ_STALL_TIMEOUT,
             CurrentOp::Deleting { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingMode { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
+            CurrentOp::GettingVersion { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             // A flash is driven inline and never yields to the watchdog
             // (its own per-step timeouts cover stalls), so it's never
             // "stale" here.
@@ -2615,6 +2681,15 @@ impl WorkerState {
                 // Legacy PumpTsueri firmware never replies to GET_MODE.
                 // Silently drop to Idle (mode stays "unknown"); never
                 // reconnect — there's nothing wrong with the link.
+                false
+            }
+            CurrentOp::GettingVersion { .. } => {
+                // Legacy firmware (≤ v0.0.28) never replies to GET_VERSION.
+                // Unlike GettingMode we DO emit a terminal event — None, so
+                // the "Check FW" flow learns the box is legacy (→ update)
+                // instead of waiting forever. Never reconnect (the link is
+                // fine); op already dropped to Idle above.
+                self.emit(BleEvent::FirmwareVersion(None));
                 false
             }
             // Unreachable in practice (the flash never yields here), but

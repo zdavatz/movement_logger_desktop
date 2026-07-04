@@ -1070,6 +1070,58 @@ impl AppState {
         ui.add_space(6.0);
     }
 
+    /// Render the "New box firmware available" banner. Twin of
+    /// `render_update_banner` but for the *box's* firmware (FOTA over BLE)
+    /// rather than this app's own release: shown only while connected and
+    /// with a pending update. "Update box" downloads + flashes via
+    /// `fw_apply_update`; "✕" dismisses. Same colored strip as the app-update
+    /// banner so the two read as one family.
+    fn render_fw_banner(&mut self, ui: &mut egui::Ui) {
+        if !matches!(self.sync.ble_state, BleState::Connected) {
+            return;
+        }
+        let Some((version, _url)) = self.sync.fw_update_available.clone() else {
+            return;
+        };
+        // A flash in flight takes over the Sync-tab UI; hide the offer while
+        // one runs so the banner can't re-trigger it.
+        let flashing = self.sync.ble_flash_progress.is_some();
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(220, 240, 255))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 130, 200)))
+            .inner_margin(8.0)
+            .rounding(4.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(20, 60, 120),
+                        format!("🔄 New box firmware v{version} available"),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if !flashing && ui.button("✕").on_hover_text("Dismiss").clicked() {
+                                self.sync.fw_update_available = None;
+                            }
+                            let label = if flashing { "Updating…" } else { "Update box" };
+                            if ui
+                                .add_enabled(!flashing, egui::Button::new(label))
+                                .on_hover_text(
+                                    "Download the firmware image and flash it to the \
+                                     connected box over BLE. The box verifies the image, \
+                                     swaps flash banks, and reboots into the new firmware.",
+                                )
+                                .clicked()
+                            {
+                                self.sync.fw_apply_update();
+                            }
+                        },
+                    );
+                });
+            });
+        ui.add_space(6.0);
+    }
+
 }
 
 /// Recency rank for the file list: the trailing per-session counter in
@@ -1606,6 +1658,26 @@ impl AppState {
                             self.sync.start_firmware_upload(&p);
                         }
                     }
+                    /* One-click firmware auto-update: fetch the latest
+                       firmware-vX.Y.Z.bin from GitHub, ask the box its
+                       current version over BLE, and flash if the box is
+                       older (or legacy/unknown). Disabled while any other
+                       BLE op is in flight or a check is already running. */
+                    if ui
+                        .add_enabled(
+                            connected && !worker_busy && !self.sync.fw_check_active,
+                            egui::Button::new("Check FW"),
+                        )
+                        .on_hover_text(
+                            "Check GitHub for the latest box firmware and compare it \
+                             with the connected box's version. If the box is older (or \
+                             its firmware is too old to report a version), the newer \
+                             image is downloaded and flashed over BLE automatically.",
+                        )
+                        .clicked()
+                    {
+                        self.sync.start_fw_check();
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !self.sync.ble_status.is_empty() {
                             /* Selectable so the user can copy error text
@@ -1740,6 +1812,30 @@ impl AppState {
                             },
                             &self.sync.ble_flash_msg,
                         );
+                    }
+                    /* "Check FW" status line. Kept separate from the flash
+                       message so both are visible during a check-then-flash
+                       run (this reads "Updating box to vX.Y.Z…" while the
+                       flash message reads "Uploading firmware…"). */
+                    if !self.sync.fw_check_msg.is_empty() {
+                        ui.add_space(2.0);
+                        let is_err = self.sync.fw_check_msg.contains("Couldn't")
+                            || self.sync.fw_check_msg.contains("empty");
+                        ui.colored_label(
+                            if is_err {
+                                egui::Color32::from_rgb(225, 90, 90)
+                            } else {
+                                egui::Color32::from_rgb(120, 200, 140)
+                            },
+                            &self.sync.fw_check_msg,
+                        );
+                        // Repaint while a check is polling for its two async
+                        // halves so the status advances without mouse motion.
+                        if self.sync.fw_check_active {
+                            ui.ctx().request_repaint_after(
+                                std::time::Duration::from_millis(200),
+                            );
+                        }
                     }
                     if let Some(err) = self.sync.ble_delete_err.clone() {
                         ui.add_space(4.0);
@@ -2957,6 +3053,10 @@ impl eframe::App for AppState {
         self.pump_ble_events();
         // Same idea for the version-check + install pipeline.
         self.pump_update_events();
+        // Drain the "Check FW" GitHub-fetch result (box half arrives via
+        // pump_ble_events → FirmwareVersion); fires the compare/flash once
+        // both halves are in.
+        self.sync.poll_fw_check();
 
         // Mirror "Keep synced" into the worker every frame (cheap
         // relaxed atomic). It's what flips auto_reconnect between the
@@ -3081,6 +3181,9 @@ impl eframe::App for AppState {
             // Shared across all tabs so a user on Live still sees
             // "Update available" without having to switch panes.
             self.render_update_banner(ui);
+            // Box-firmware update banner (FOTA over BLE) — same treatment,
+            // only while a box is connected with a pending firmware update.
+            self.render_fw_banner(ui);
 
             match self.current_tab {
                 Tab::Live   => { self.ui_live_tab(ui);   return; }
