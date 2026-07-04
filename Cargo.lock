@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "gps-debug"
-version = "0.0.47"
+version = "0.0.48"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "movement-logger"
-version = "0.0.47"
+version = "0.0.48"
 dependencies = [
  "anyhow",
  "btleplug",

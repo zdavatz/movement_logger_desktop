@@ -601,6 +601,29 @@ impl SyncCore {
                         if f.name == name { f.bytes_done = bytes_done; }
                     }
                 }
+                BleEvent::ReadChunk { name, content, base } => {
+                    /* One intermediate 64 KB READ segment completed
+                       (v0.0.48 segmenting). Append it to the live mirror
+                       right away so progress is persisted incrementally
+                       (crash-safe, and a mid-file drop resumes from the
+                       real byte, not the last whole file) and the worker
+                       only ever holds one segment in RAM. NOT the end of
+                       the file: don't mark done, don't advance the queue —
+                       the terminal ReadDone does that. */
+                    if !content.is_empty() {
+                        match append_mirror(&self.ble_out_dir, &name, base, &content) {
+                            Ok(have) => {
+                                for f in self.ble_files.iter_mut() {
+                                    if f.name == name { f.bytes_done = have; }
+                                }
+                            }
+                            Err(e) => push_log(
+                                &self.log,
+                                format!("ble: could not save segment of {name}: {e}"),
+                            ),
+                        }
+                    }
+                }
                 BleEvent::ReadAborted { name, content, base } => {
                     /* The link dropped mid-file. Persist the partial
                        segment into <name>.part so the resume continues

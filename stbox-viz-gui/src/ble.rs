@@ -113,6 +113,27 @@ const OP_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// both-sides-think-connected stall. LIST keeps the tighter 20 s
 /// (OP_IDLE_TIMEOUT); its stall handling is tuned separately.
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Chunk a long file READ into fixed-size segments instead of one to-EOF
+/// stream (v0.0.48). Each segment is a separate capped READ opcode
+/// (`READ <name>\0<offset><cap>`, firmware v0.0.24+): the box streams
+/// exactly this many bytes, then its READ state machine returns to
+/// FSM_IDLE — which resets the firmware's own 45 s `FSM_READ_STALL_DEADLINE`
+/// every segment. A single 200 MB READ kept the box in FSM_READ_STREAM for
+/// the entire multi-hour transfer, so any macOS BLE pause ≥ 45 s tripped
+/// the firmware stall → `ble_recover_lost_peer` failed to re-advertise
+/// (rc=211, ACL-TX still saturated) → the box went radio-silent and the
+/// desktop's reconnect had nothing to connect to (Peter's overnight
+/// freeze; ERRLOG 04.07.2026 shows 13 stalls, all re-adv=211). Cycling to
+/// IDLE every ≤ 21 s (64 KB even at the ~3 KB/s worst case) keeps the box
+/// out of that trap. Deliberately NOT paired with a lower
+/// READ_STALL_TIMEOUT: dropping the desktop side to 20 s was tried and
+/// rolled back (see that const's history) — it churned. Segmenting fixes
+/// the box side without touching the desktop ride-out. Also bounds worker
+/// RAM to one segment: each completed segment is flushed to the mirror via
+/// `BleEvent::ReadChunk` and drained, so a healthy 200 MB transfer no
+/// longer buffers 200 MB before the terminal ReadDone.
+const READ_SEGMENT_BYTES: u64 = 64 * 1024;
 /* If LIST has produced at least one entry and no new bytes have arrived for
    this long, treat LIST as complete and go back to Idle. Defensive: the
    firmware's terminator notify can be missed/merged on flaky BLE links and
@@ -375,6 +396,15 @@ pub enum BleEvent {
     /// `bytes_done` is absolute (resume base + bytes streamed this
     /// segment), so the progress bar is correct across a resume.
     ReadProgress { name: String, bytes_done: u64 },
+    /// One intermediate READ segment completed (v0.0.48 segmenting). Unlike
+    /// ReadDone this is NOT the end of the file — `content` is just the
+    /// bytes of this 64 KB segment, `base` its start offset. The caller
+    /// appends them to the mirror immediately (persisting progress and
+    /// keeping worker RAM to one segment) but must NOT mark the file done
+    /// or advance the queue — more segments follow and the terminal
+    /// ReadDone closes the file. Emitted between segments while the box's
+    /// READ FSM is briefly idle.
+    ReadChunk { name: String, content: Vec<u8>, base: u64 },
     /// A READ segment finished at EOF. `content` is just this segment
     /// (from `base` to EOF); `base` is the offset it was requested at.
     /// The caller appends `content` at `base` into the `.part` file.
@@ -741,9 +771,15 @@ enum CurrentOp {
     Reading {
         name: String,
         expected: u64,
-        /// Byte offset this READ was requested at (bytes already on
-        /// disk in `.part`). Absolute progress = base + content.len().
+        /// Byte offset the CURRENT segment was requested at. Advanced by
+        /// one segment each time a segment completes and `content` is
+        /// drained (v0.0.48). Absolute progress = base + content.len().
         base: u64,
+        /// Absolute byte offset where the in-flight capped segment ends —
+        /// i.e. `base + this segment's cap`. When `base + content.len()`
+        /// reaches it (but is still < `expected`) the segment is flushed
+        /// and the next capped READ is issued. See `READ_SEGMENT_BYTES`.
+        segment_end: u64,
         content: Vec<u8>,
         last_emit: u64,
         last_progress: Instant,
@@ -1774,22 +1810,31 @@ impl WorkerState {
         // 02.07.2026). Legacy firmware ignores the extra 4 bytes (it only
         // parses name + offset) and falls back to stream-to-EOF.
         // offset/len are u32 on the wire — SD files are well under 4 GiB.
+        // Only request ONE segment now (v0.0.48): cap = min(remaining,
+        // READ_SEGMENT_BYTES). handle_notification issues the next segment
+        // as each one completes, so the box's READ FSM returns to IDLE
+        // between segments and its 45 s stall never accumulates over a big
+        // file. `expected` stays the WHOLE file size (the terminal
+        // ReadDone still fires at true EOF); `segment_end` tracks this
+        // segment's boundary.
+        let seg_cap = size.saturating_sub(offset).min(READ_SEGMENT_BYTES);
         let mut payload = Vec::with_capacity(name.len() + 10);
         payload.push(0x02);
         payload.extend_from_slice(name.as_bytes());
         payload.push(0x00);
         payload.extend_from_slice(&(offset as u32).to_le_bytes());
-        payload.extend_from_slice(&(size.saturating_sub(offset) as u32).to_le_bytes());
+        payload.extend_from_slice(&(seg_cap as u32).to_le_bytes());
         if let Err(e) = self.write_cmd(&payload).await {
             self.emit_err(e);
             return;
         }
-        let remaining = size.saturating_sub(offset) as usize;
         self.op = CurrentOp::Reading {
             name: name.clone(),
             expected: size,
             base: offset,
-            content: Vec::with_capacity(remaining),
+            segment_end: offset + seg_cap,
+            // One segment at a time; drained on each ReadChunk flush.
+            content: Vec::with_capacity(READ_SEGMENT_BYTES as usize),
             last_emit: offset,
             last_progress: Instant::now(),
             first_packet: true,
@@ -2228,6 +2273,11 @@ impl WorkerState {
         // running into the borrow checker on `self.emit`.
         let mut op = std::mem::replace(&mut self.op, CurrentOp::Idle);
 
+        // If a READ segment completes mid-file, the request for the NEXT
+        // capped segment is stashed here and sent after the match (so the
+        // `&mut op` borrow is released before the `&self` write_cmd).
+        let mut next_read: Option<Vec<u8>> = None;
+
         match &mut op {
             CurrentOp::Idle => {
                 // Stray notify between ops — harmless, ignore.
@@ -2253,7 +2303,7 @@ impl WorkerState {
                     }
                 }
             }
-            CurrentOp::Reading { name, expected, base, content, last_emit, last_progress, first_packet } => {
+            CurrentOp::Reading { name, expected, base, segment_end, content, last_emit, last_progress, first_packet } => {
                 *last_progress = Instant::now();
 
                 // Status-byte detection: only on the FIRST notify, only
@@ -2278,32 +2328,75 @@ impl WorkerState {
                 }
                 *first_packet = false;
 
-                content.extend_from_slice(&n.value);
+                // A lone 0xB0 BUSY on a NON-first packet is never file data
+                // (the box streams multi-byte chunks, and CSV/log bytes are
+                // < 0x80). It's a spurious reply to a segment-continuation
+                // READ that either raced the box's FSM or — the important
+                // case — hit a LEGACY box (firmware < v0.0.24) that ignored
+                // the `cap` and is still streaming the previous to-EOF read.
+                // Appending it would corrupt the mirror by one byte per
+                // segment. Drop it and stop segmenting (segment_end =
+                // expected): ride the single to-EOF stream out, which still
+                // delivers every real byte in order — `base`-tracking
+                // assembles the file and the terminal ReadDone fires at EOF.
+                // This makes segmenting safe on cap-ignoring firmware.
+                if n.value.len() == 1 && n.value[0] == 0xB0 {
+                    *segment_end = *expected;
+                } else {
+                    content.extend_from_slice(&n.value);
 
-                // Absolute position = resume base + bytes this segment.
-                // Throttle progress events — every ~4 KB or at EOF.
-                let done = *base + content.len() as u64;
-                if done - *last_emit >= 4 * 1024 || done >= *expected {
-                    *last_emit = done;
-                    self.emit(BleEvent::ReadProgress { name: name.clone(), bytes_done: done });
-                }
-
-                if done >= *expected {
-                    // Trim any over-read so base + content == expected.
-                    let want = expected.saturating_sub(*base) as usize;
-                    if content.len() > want {
-                        content.truncate(want);
+                    // Absolute position = resume base + bytes this segment.
+                    // Throttle progress events — every ~4 KB or at EOF.
+                    let done = *base + content.len() as u64;
+                    if done - *last_emit >= 4 * 1024 || done >= *expected {
+                        *last_emit = done;
+                        self.emit(BleEvent::ReadProgress { name: name.clone(), bytes_done: done });
                     }
-                    let final_content = std::mem::take(content);
-                    let final_name    = std::mem::take(name);
-                    let final_base    = *base;
-                    self.emit(BleEvent::ReadDone {
-                        name: final_name,
-                        content: final_content,
-                        base: final_base,
-                    });
-                    self.op = CurrentOp::Idle;
-                    return;
+
+                    if done >= *expected {
+                        // Trim any over-read so base + content == expected.
+                        let want = expected.saturating_sub(*base) as usize;
+                        if content.len() > want {
+                            content.truncate(want);
+                        }
+                        let final_content = std::mem::take(content);
+                        let final_name    = std::mem::take(name);
+                        let final_base    = *base;
+                        self.emit(BleEvent::ReadDone {
+                            name: final_name,
+                            content: final_content,
+                            base: final_base,
+                        });
+                        self.op = CurrentOp::Idle;
+                        return;
+                    }
+
+                    // Segment boundary (v0.0.48): this capped segment
+                    // finished but the file has more. Flush its bytes to the
+                    // mirror now (persist progress + keep worker RAM to one
+                    // segment), drain `content`, advance `base`, and queue
+                    // the next capped READ. The box's READ FSM has returned
+                    // to IDLE, so it accepts the new READ and its 45 s stall
+                    // clock resets.
+                    if done >= *segment_end {
+                        let seg_bytes = std::mem::take(content);
+                        let seg_base  = *base;
+                        *base += seg_bytes.len() as u64;   // == done
+                        self.emit(BleEvent::ReadChunk {
+                            name: name.clone(),
+                            content: seg_bytes,
+                            base: seg_base,
+                        });
+                        let next_cap = (*expected - *base).min(READ_SEGMENT_BYTES);
+                        *segment_end = *base + next_cap;
+                        let mut p = Vec::with_capacity(name.len() + 10);
+                        p.push(0x02);
+                        p.extend_from_slice(name.as_bytes());
+                        p.push(0x00);
+                        p.extend_from_slice(&(*base as u32).to_le_bytes());
+                        p.extend_from_slice(&(next_cap as u32).to_le_bytes());
+                        next_read = Some(p);
+                    }
                 }
             }
             CurrentOp::Deleting { name, .. } => {
@@ -2353,6 +2446,18 @@ impl WorkerState {
         // complete), put it back.
         if matches!(self.op, CurrentOp::Idle) {
             self.op = op;
+        }
+
+        // A READ segment completed mid-file: request the next one now that
+        // the `&mut op` borrow is gone. On write failure the link is dying
+        // — leave `op` as Reading (restored above, with the flushed
+        // segments already on the mirror) so the READ_STALL watchdog /
+        // central-disconnect sweep tears down + reconnects, and the mirror
+        // length drives a clean byte-resume.
+        if let Some(p) = next_read {
+            if let Err(e) = self.write_cmd(&p).await {
+                self.emit_err(format!("READ next segment failed: {e}"));
+            }
         }
     }
 

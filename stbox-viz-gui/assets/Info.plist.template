@@ -32,6 +32,16 @@
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <!-- Opt the whole app out of App Nap. The BLE worker already takes a
+         renewing NSProcessInfo activity assertion while connected
+         (power.rs), but a long unattended "Keep synced" pass — or the
+         headless --agent, which has no AppKit run loop for the dynamic
+         assertion to lean on — must never be throttled: App Nap stops us
+         draining BLE notifies, which stalls the transfer and (firmware
+         side) wedges the box's re-advertise. Static belt-and-suspenders
+         to the dynamic assertion. -->
+    <key>NSAppSleepDisabled</key>
+    <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <!-- macOS BLE consent prompt text. Shown the first time the
