@@ -39,8 +39,8 @@ use std::thread;
 
 use ble::{BatterySample, BleBackend, BleCmd, LiveSample};
 use sync_core::{
-    default_save_base, is_sensor_data_name, mirror_path, push_log, resolve_save_dir, BleFile,
-    BleState, SyncCore, SyncHost,
+    default_save_base, is_sensor_data_name, push_log, resolve_save_dir, BleFile, BleState,
+    SyncCore, SyncHost,
 };
 
 /// Bundled-into-binary 512×512 PNG. The build pipeline already
@@ -2078,32 +2078,29 @@ impl AppState {
         }
         ui.heading("Box health (ERRLOG.LOG)");
         ui.label(egui::RichText::new(
-            "Automatic per-boot check of the box error log: GPS wiring/link quality, \
-             watchdog resets, init failures and BLE recovery trouble. Re-runs by itself \
-             after every sync that pulls ERRLOG.LOG, so each box boot is graded as soon \
-             as its log lands.",
-        ));
+            "Automatic per-boot check of the box error log — re-runs after every sync.",
+        ).weak());
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button("Re-check now").clicked() {
-                self.sync.run_errlog_check("manual");
-            }
-            let mirror = mirror_path(&self.sync.ble_out_dir, "ERRLOG.LOG");
-            ui.label(egui::RichText::new(mirror.display().to_string()).weak());
-        });
+        // Deferred: the button sits inside the errlog_report borrow, so
+        // the actual re-check runs after the match releases it.
+        let mut recheck = false;
         match self.sync.errlog_report.as_ref() {
             None => {
-                ui.label(
-                    "No ERRLOG.LOG mirror yet — connect to the box in the Sync tab and \
-                     run one sync; the check then runs automatically.",
-                );
+                ui.horizontal(|ui| {
+                    recheck = ui.button("Re-check now").clicked();
+                    ui.label(
+                        "No ERRLOG.LOG mirror yet — connect in the Sync tab and run one sync.",
+                    );
+                });
             }
             Some(rep) => {
                 if let Some(last) = rep.latest() {
+                    let verdict = last.verdict();
                     ui.horizontal(|ui| {
+                        recheck = ui.button("Re-check now").clicked();
                         ui.label("Latest boot:");
                         ui.colored_label(
-                            color(last.verdict()),
+                            color(verdict),
                             format!("#{}  {}", last.index, last.verdict_label()),
                         );
                         ui.label(
@@ -2116,15 +2113,28 @@ impl AppState {
                             .weak(),
                         );
                     });
-                    for f in &last.findings {
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.colored_label(color(f.severity), "•");
-                            ui.label(&f.msg);
-                        });
-                    }
+                    // Findings collapsed behind a header so the section
+                    // stays compact; auto-open only when something is
+                    // actually wrong with the latest boot.
+                    egui::CollapsingHeader::new(format!(
+                        "Latest boot findings ({})",
+                        last.findings.len()
+                    ))
+                    .id_salt("errlog_latest_findings")
+                    .default_open(verdict != errlog_check::Severity::Info)
+                    .show(ui, |ui| {
+                        for f in &last.findings {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(color(f.severity), "•");
+                                ui.label(&f.msg);
+                            });
+                        }
+                    });
                 }
-                egui::CollapsingHeader::new(format!("Boot history ({} boots)", rep.boots.len()))
+                egui::CollapsingHeader::new(format!(
+                    "Boot history ({} boots)",
+                    rep.boots.len()
+                ))
                     .id_salt("errlog_boot_history")
                     .show(ui, |ui| {
                         // Newest first; the full log is still available
@@ -2158,12 +2168,28 @@ impl AppState {
                     });
             }
         }
+        if recheck {
+            self.sync.run_errlog_check("manual");
+        }
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(6.0);
     }
 
     fn ui_debug_tab(&mut self, ui: &mut egui::Ui) {
+        /* The tab stacks three sections (Box health, BLE Debug, GPS
+           Debug) that together outgrow the window — scroll the whole
+           tab so no section can clip off-screen (the BLE debug log was
+           unreachable once Box health landed above it). The BLE/GPS
+           output panels keep their own inner scroll areas; egui routes
+           the wheel to the hovered one. */
+        egui::ScrollArea::vertical()
+            .id_salt("debug_tab_scroll")
+            .auto_shrink([false; 2])
+            .show(ui, |ui| self.ui_debug_tab_inner(ui));
+    }
+
+    fn ui_debug_tab_inner(&mut self, ui: &mut egui::Ui) {
         self.ui_box_health(ui);
         ui.heading("BLE Debug");
         ui.label(
