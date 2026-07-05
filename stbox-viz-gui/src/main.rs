@@ -2520,6 +2520,21 @@ impl AppState {
                         v.clear();
                     }
                 }
+                // Copy the whole survey output — parity with the BLE
+                // Debug panel; the per-second summary lines are exactly
+                // what gets pasted into an issue report.
+                if ui
+                    .button("Copy")
+                    .on_hover_text("Copy the whole survey output to the clipboard")
+                    .clicked()
+                {
+                    let text = self
+                        .gps_dbg_log
+                        .lock()
+                        .map(|v| v.join("\n"))
+                        .unwrap_or_default();
+                    ui.output_mut(|o| o.copied_text = text);
+                }
             });
         });
 

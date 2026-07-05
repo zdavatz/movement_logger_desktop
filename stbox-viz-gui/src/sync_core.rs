@@ -223,6 +223,12 @@ pub struct SyncCore {
     /// version) are being gathered. Cleared once the compare fires (or a
     /// fetch fails). Gates the "Check FW" button + drives the status line.
     pub fw_check_active: bool,
+    /// When the running check started — `poll_fw_check` aborts the check
+    /// after `FW_CHECK_DEADLINE` so it can never spin forever. The box
+    /// half has silent no-reply paths (GET_VERSION is skipped when the
+    /// worker is mid-LIST/READ, and a wedged link never answers), and
+    /// without a deadline "Checking for firmware updates…" was permanent.
+    pub fw_check_started: Option<std::time::Instant>,
     /// Latest firmware release from GitHub: `(version "X.Y.Z", download_url)`.
     /// Filled by `poll_fw_check` when the background fetch lands.
     pub fw_latest: Option<(String, String)>,
@@ -1220,6 +1226,7 @@ impl SyncCore {
             return;
         }
         self.fw_check_active = true;
+        self.fw_check_started = Some(std::time::Instant::now());
         self.fw_latest = None;
         self.fw_box_version = None;
         self.fw_check_msg = "Checking for firmware updates…".into();
@@ -1248,6 +1255,24 @@ impl SyncCore {
     /// mirroring how the app-updater's `update_rx` is polled.
     pub fn poll_fw_check(&mut self) {
         if !self.fw_check_active {
+            return;
+        }
+        /* Hard deadline: the box half can silently never land (worker
+           GET_VERSION is a best-effort no-op while a LIST/READ is in
+           flight; a wedged link answers nothing) and the GitHub half can
+           hang on a bad network. 30 s is far above both happy paths
+           (GET_VERSION replies in <1 s, the release fetch in a few). */
+        const FW_CHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        if self
+            .fw_check_started
+            .is_some_and(|t| t.elapsed() > FW_CHECK_DEADLINE)
+        {
+            self.fw_check_active = false;
+            self.fw_check_started = None;
+            self.fw_check_msg =
+                "Firmware check timed out — box busy or link stalled; try again when idle."
+                    .into();
+            push_log(&self.log, "fw-check: timed out (no answer in 30 s)".into());
             return;
         }
         let landed = self.fw_fetch_result.lock().ok().and_then(|mut g| g.take());
