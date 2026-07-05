@@ -136,6 +136,74 @@ The **GPS Debug** tab (`enum Tab::Gps`) runs the `gps-debug` u-blox UBX survey (
 
 The firmware half lives in `movement_logger_firmware` (opcodes `0x0D GPS_BRIDGE` / `0x0E GPS_TX` in `ble.c`; raw UBX frame capture + `$PUBX,41` output-protocol toggle in `gps.c`). NMEA keeps flowing to the SD logger the whole time — enabling the bridge only *adds* UBX output on the port. See that repo's docs for the wire details.
 
+## ERRLOG auto-check — `errlog_check.rs` + `--check-errlog`
+
+Automatic per-boot health grading of the box's mirrored `ERRLOG.LOG`. The
+firmware appends one section per cold boot (banner `--- Boot … ---`, init
+lines, a cumulative `gps_diag: …` counters line every 5 s — see
+`movement_logger_firmware/Src/logger.c:345`); `errlog_check::analyze` splits
+the mirror into boots and grades each one OK/WARN/FAIL: subsystem `init FAIL`
+and `***` markers (with joint-level GPS-wiring diagnosis for `GPS NO NMEA` /
+`no baud lock`) → FAIL; IWDG/WWDG reset, GPS stuck at the 9600 fallback
+(box→module wire suspect), growing NMEA-checksum / UART-error counters,
+mid-run UART silence windows, failed BLE re-advertises, unconfirmed FOTA
+trial boots → WARN. **Auto-run, no manual step:** `SyncCore::run_errlog_check`
+fires from the `ReadDone` handler whenever a sync pass pulls `ERRLOG.LOG`
+(so every new box boot is graded as soon as its log lands — the headless
+`--agent` gets this for free via the shared engine) and once at GUI startup
+on the existing mirror. Rendered as "Box health (ERRLOG.LOG)" at the top of
+the **Debug tab** (latest boot + collapsible history); the Sync tab shows a
+one-line WARN/FAIL badge pointing there. `MovementLogger --check-errlog
+[path]` (default `<save base>/csv/ERRLOG.LOG`) runs the same analysis
+headless — exit 0/1/2 = latest boot OK/WARN/FAIL — for scripting/cron.
+
+Parser hard-won robustness rules (all observed in Peter's real 1.2 MB
+mirror and/or confirmed by adversarial review — don't simplify them away):
+
+- **Torn/spliced lines** (sudden power cut mid-write, F-PWR-5): any
+  `gps_diag` line failing the strict 8-distinct-keys parse (bitmask, not a
+  count — splices can repeat one `k=v` while dropping another) is torn,
+  never trusted. A diag line with a **missing or implausible `[N ms]` tick**
+  is also torn: > 30 days (`TICK_CAP_MS`) or a > 6 h forward jump
+  (`MAX_TICK_JUMP_MS` — digit-fused ticks like `[79642534253 ms]` carry 8
+  plausible-looking fields and would otherwise poison uptime + frontier).
+  If a fused tick does get accepted, 3 mutually-consistent rejected samples
+  **self-heal** the frontier back onto the live stream.
+- **Replayed byte ranges**: the live-mirror byte-resume can leave duplicated
+  regions (same tick+content twice, or a short rewind). A **monotonic-tick
+  frontier** skips any diag sample at/below the highest accepted tick —
+  without it, duplicates read as fake "UART went silent" stalls (boot #4
+  showed 24 phantom stalls, real count 0). Graded non-diag lines (markers,
+  `init FAIL`, BLE failures) with a tick strictly below the frontier are
+  skipped too (no double counting). A **replayed boot banner** would mint a
+  phantom "latest boot" and flip the verdict/exit code — a short section
+  whose raw lines exactly prefix-match the previous boot's head is merged
+  away, but **only when ≥ 1 matching line is tick-stamped**: banner/fw/reset
+  are constant strings identical across genuine boots, and a tickless
+  3-line section is a real rapid power-cycle (magnet flicker), not a replay.
+- **Signed rc values**: the firmware prints `re-adv=`/`rc=` with `%d`; a
+  dead SPI/BLE chip yields `-10`/`-11` — the exact box-invisible condition.
+  Parse them signed (`field_i64`); an unsigned parse + `unwrap_or(0)`
+  silently inverted these failures into success. Torn/absent values are
+  "not proven", not zero.
+- **GPS-survey bridge windows**: between `gps: bridge ON` / `gps: bridge
+  off` the UBX/NMEA interleave inflates `lines_bad` (~300–700 per survey in
+  real logs). Checksum/error growth in bridge windows — including a window
+  that merely *touches* a bridge toggle at either end — is bucketed
+  separately and reported as expected Info, never as a wiring WARN.
+- Stall detection requires a real tick advance (≥ 2.5 s) between equal-byte
+  samples, only outside bridge windows; pair deltas are skipped across
+  > 10 min discontinuities.
+- Boots with < 6 lines and no GPS-ready are "cut short during init (power
+  removed?)" — but **hard evidence is graded before that early-return**:
+  a 4-line boot ending in `fuel: init FAIL` or carrying `reset: IWDG` must
+  FAIL/WARN, not hide behind "too little data" (bootloops produce exactly
+  this shape on every iteration).
+- CLI: a file with zero `--- Boot` sections exits 3 (wrong file), never a
+  false-healthy 0. The default path prefers `config.toml`'s `save_dir`
+  (which IS the csv dir — the agent assigns it to `ble_out_dir` verbatim)
+  over the cwd-derived save base.
+
 ## In-app updater — sharp edge
 
 `stbox-viz-gui/src/update.rs` hardcodes the repo it polls for new releases. When importing fixes from `fp-sns-stbox1/Utilities/rust`, the upstream version of this file has `const REPO: &str = "zdavatz/fp-sns-stbox1"` — that is the **firmware** repo, not this one. **Always check this constant after a pull from upstream**:

@@ -200,6 +200,12 @@ pub struct SyncCore {
     /// delete isn't only buried in the log. Cleared on a successful
     /// delete, a new delete attempt, or disconnect.
     pub ble_delete_err: Option<String>,
+    /// Per-boot health report of the mirrored `ERRLOG.LOG`, refreshed
+    /// automatically by [`Self::run_errlog_check`] after every sync
+    /// pass that touches the errlog and once at startup — so each new
+    /// box boot is graded as soon as its log lands. `None` until a
+    /// mirror exists. Rendered in the Debug tab ("Box health").
+    pub errlog_report: Option<crate::errlog_check::ErrlogReport>,
 
     // ----- Firmware upload (OTA) ---------------------------------------
     /// `Some((bytes_done, total))` while a firmware upload is in flight —
@@ -757,6 +763,14 @@ impl SyncCore {
                                     }
                                 }
                             }
+                            /* Auto health check: the errlog mirror just
+                               gained its newest boot section(s) — grade
+                               them right away so a bad boot (wiring,
+                               watchdog reset, GPS trouble) surfaces in
+                               the Debug tab without any manual step. */
+                            if name.eq_ignore_ascii_case("ERRLOG.LOG") {
+                                self.run_errlog_check("synced");
+                            }
                         }
                         Err(e) => {
                             self.ble_status = format!("save failed: {e}");
@@ -931,6 +945,34 @@ impl SyncCore {
     /// completed read triggers the next, giving us serial multi-file
     /// downloads instead of the original blast-all-at-once behaviour
     /// (which had the worker reject every read after the first).
+    /// Re-analyze the mirrored `ERRLOG.LOG` and refresh
+    /// [`Self::errlog_report`]. Called after every completed sync/read
+    /// of the errlog, on a save-dir change, and once at startup — so
+    /// every new box boot gets graded automatically as soon as its log
+    /// section lands. Cheap (one linear pass over the mirror). When the
+    /// mirror doesn't exist the stale report is CLEARED (not kept):
+    /// after a save-dir change the old dir's verdict must not keep
+    /// rendering against the new path's label.
+    pub fn run_errlog_check(&mut self, why: &str) {
+        let path = mirror_path(&self.ble_out_dir, "ERRLOG.LOG");
+        if !path.exists() {
+            if self.errlog_report.take().is_some() {
+                push_log(
+                    &self.log,
+                    format!("errlog check ({why}): no ERRLOG.LOG at {}", path.display()),
+                );
+            }
+            return;
+        }
+        match crate::errlog_check::analyze_file(&path) {
+            Ok(rep) => {
+                push_log(&self.log, format!("errlog check ({why}): {}", rep.summary));
+                self.errlog_report = Some(rep);
+            }
+            Err(e) => push_log(&self.log, format!("errlog check ({why}) failed: {e}")),
+        }
+    }
+
     pub fn advance_download_queue(&mut self) {
         if self.ble_dl_in_flight { return; }
         loop {
@@ -1020,8 +1062,15 @@ impl SyncCore {
         {
             Ok(d) => {
                 self.ble_save_err = None;
+                let changed = self.ble_out_dir != d;
                 self.ble_out_dir = d.clone();
                 self.persist_config();
+                if changed {
+                    // The mirror location moved: re-grade (or clear) the
+                    // errlog report so the Box-health panel never shows
+                    // a verdict from the previous folder.
+                    self.run_errlog_check("save-dir change");
+                }
                 Some(d)
             }
             Err(e) => {

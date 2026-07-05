@@ -20,6 +20,7 @@ mod autostart;
 mod ble;
 mod ble_debug;
 mod coord;
+mod errlog_check;
 mod installer;
 mod power;
 mod sync_core;
@@ -38,8 +39,8 @@ use std::thread;
 
 use ble::{BatterySample, BleBackend, BleCmd, LiveSample};
 use sync_core::{
-    default_save_base, is_sensor_data_name, push_log, resolve_save_dir, BleFile, BleState,
-    SyncCore, SyncHost,
+    default_save_base, is_sensor_data_name, mirror_path, push_log, resolve_save_dir, BleFile,
+    BleState, SyncCore, SyncHost,
 };
 
 /// Bundled-into-binary 512×512 PNG. The build pipeline already
@@ -781,7 +782,7 @@ impl AppState {
         // `self.log`; the sync engine writes via `self.sync.log`. Same
         // `Arc` so BLE/sync lines land in the same panel as before.
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        Self {
+        let mut s = Self {
             output_dir,
             tz_offset_h: 3.0,
             fps: 15,
@@ -814,7 +815,12 @@ impl AppState {
             update_rx: Some(spawn_update_check()),
             update_checking: true,
             ..Self::default()
-        }
+        };
+        /* Grade the existing ERRLOG mirror once at startup so the Debug
+           tab's "Box health" panel is populated before any connect;
+           every later sync of ERRLOG.LOG re-runs it automatically. */
+        s.sync.run_errlog_check("startup");
+        s
     }
 
     fn trigger_update_check(&mut self) {
@@ -1665,6 +1671,33 @@ impl AppState {
                     }
                 }
 
+                /* Surface a bad box boot right where the user syncs: the
+                   errlog auto-check (Debug tab has the details) graded
+                   the newest boot section of the mirrored log. Rendered
+                   regardless of connection state — the report also
+                   exists offline (startup check on the local mirror).
+                   Quiet when the latest boot is healthy. */
+                if let Some(last) = self
+                    .sync
+                    .errlog_report
+                    .as_ref()
+                    .and_then(|r| r.latest())
+                    .filter(|b| b.verdict() != errlog_check::Severity::Info)
+                {
+                    ui.add_space(2.0);
+                    let col = match last.verdict() {
+                        errlog_check::Severity::Fail => egui::Color32::from_rgb(235, 90, 90),
+                        _ => egui::Color32::from_rgb(230, 175, 60),
+                    };
+                    ui.colored_label(
+                        col,
+                        format!(
+                            "Box health: latest boot {} — see Debug tab",
+                            last.verdict_label()
+                        ),
+                    );
+                }
+
                 // ----- File list / download ------------------------
                 if matches!(self.sync.ble_state, BleState::Connected) {
                     if !self.sync.ble_sync_msg.is_empty() {
@@ -2030,7 +2063,110 @@ impl AppState {
 
     /// Debug tab: BLE probe section on top, GPS/antenna survey below —
     /// every "run this and send me the output" diagnostic in one place.
+    /// "Box health (ERRLOG.LOG)" section at the top of the Debug tab:
+    /// renders the automatic per-boot grading of the mirrored box error
+    /// log (`errlog_check`). The report refreshes itself — at startup
+    /// and after every sync pass that pulls ERRLOG.LOG — so each new
+    /// box boot appears here without any manual step.
+    fn ui_box_health(&mut self, ui: &mut egui::Ui) {
+        fn color(v: errlog_check::Severity) -> egui::Color32 {
+            match v {
+                errlog_check::Severity::Fail => egui::Color32::from_rgb(235, 90, 90),
+                errlog_check::Severity::Warn => egui::Color32::from_rgb(230, 175, 60),
+                errlog_check::Severity::Info => egui::Color32::from_rgb(110, 200, 110),
+            }
+        }
+        ui.heading("Box health (ERRLOG.LOG)");
+        ui.label(egui::RichText::new(
+            "Automatic per-boot check of the box error log: GPS wiring/link quality, \
+             watchdog resets, init failures and BLE recovery trouble. Re-runs by itself \
+             after every sync that pulls ERRLOG.LOG, so each box boot is graded as soon \
+             as its log lands.",
+        ));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("Re-check now").clicked() {
+                self.sync.run_errlog_check("manual");
+            }
+            let mirror = mirror_path(&self.sync.ble_out_dir, "ERRLOG.LOG");
+            ui.label(egui::RichText::new(mirror.display().to_string()).weak().small());
+        });
+        match self.sync.errlog_report.as_ref() {
+            None => {
+                ui.label(
+                    "No ERRLOG.LOG mirror yet — connect to the box in the Sync tab and \
+                     run one sync; the check then runs automatically.",
+                );
+            }
+            Some(rep) => {
+                if let Some(last) = rep.latest() {
+                    ui.horizontal(|ui| {
+                        ui.label("Latest boot:");
+                        ui.colored_label(
+                            color(last.verdict()),
+                            format!("#{}  {}", last.index, last.verdict_label()),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "up {:.0} s · reset: {} · {}",
+                                last.last_tick_ms as f64 / 1000.0,
+                                if last.reset.is_empty() { "?" } else { &last.reset },
+                                last.fw,
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    });
+                    for f in &last.findings {
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.colored_label(color(f.severity), "•");
+                            ui.label(egui::RichText::new(&f.msg).small());
+                        });
+                    }
+                }
+                egui::CollapsingHeader::new(format!("Boot history ({} boots)", rep.boots.len()))
+                    .id_salt("errlog_boot_history")
+                    .show(ui, |ui| {
+                        // Newest first; the full log is still available
+                        // via --check-errlog for anything older.
+                        for b in rep.boots.iter().rev().take(25) {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(
+                                    color(b.verdict()),
+                                    format!("#{:<3} {}", b.index, b.verdict_label()),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "up {:.0} s · {}",
+                                        b.last_tick_ms as f64 / 1000.0,
+                                        if b.reset.is_empty() { "?" } else { &b.reset },
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            });
+                            for f in b.findings.iter().filter(|f| {
+                                f.severity != errlog_check::Severity::Info
+                                    || b.verdict() == errlog_check::Severity::Info
+                            }) {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(18.0);
+                                    ui.colored_label(color(f.severity), "•");
+                                    ui.label(egui::RichText::new(&f.msg).small());
+                                });
+                            }
+                        }
+                    });
+            }
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+    }
+
     fn ui_debug_tab(&mut self, ui: &mut egui::Ui) {
+        self.ui_box_health(ui);
         ui.heading("BLE Debug");
         ui.label(
             egui::RichText::new(
@@ -4056,6 +4192,27 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         };
         std::process::exit(agent::flash(std::path::Path::new(path)));
+    }
+    /* Headless per-boot health check of the mirrored box error log
+       (`--check-errlog [path]`). Default path prefers the persisted
+       save_dir from ~/.movementlogger/config.toml — where the GUI/agent
+       actually mirror — over the cwd-derived save base, so a cron
+       invocation grades the same file the app writes. Prints one graded
+       section per box boot; exit 0/1/2 = latest boot OK/WARN/FAIL,
+       3 = unreadable / not an errlog. Like --agent, returns before any
+       window code. */
+    if let Some(pos) = args.iter().position(|a| a == "--check-errlog") {
+        let path = args.get(pos + 1).map(PathBuf::from).unwrap_or_else(|| {
+            // config.toml's save_dir IS the download (csv) dir — the
+            // agent assigns it to ble_out_dir verbatim (agent.rs).
+            let cfg_dir = agent_config::AgentConfig::load().save_dir;
+            if cfg_dir.trim().is_empty() {
+                default_save_base().join("csv").join("ERRLOG.LOG")
+            } else {
+                PathBuf::from(cfg_dir).join("ERRLOG.LOG")
+            }
+        });
+        std::process::exit(errlog_check::run_cli(&path));
     }
     /* Headless BLE diagnostic (`--ble-debug [seconds]`) — the GPS-Debug
        analogue for the BLE side: prints every CoreBluetooth discovery

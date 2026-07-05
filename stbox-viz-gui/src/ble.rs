@@ -1425,23 +1425,32 @@ impl WorkerState {
                 "SensorStream characteristic not advertised — legacy firmware, live tab will be empty".into()
             ));
         }
-        // BatteryStatus is optional too — subscribe if present, seed the
-        // meter with one bounded READ so it shows a value immediately
-        // instead of waiting up to a minute for the box's first periodic
-        // notify. Never fail the connect on absence (legacy firmware).
+        // BatteryStatus is optional too — subscribe if present so the box's
+        // ~1/min notifies drive the meter. Never fail the connect on absence
+        // (legacy firmware). The one-shot READ that seeds an immediate value
+        // runs ONLY on a manual connect: on `auto_reconnect` (a silent mid-
+        // sync recovery) the reconnect path must stay as lean as it was
+        // before the meter — an extra GATT read there just adds a round-trip
+        // (up to LINK_OP_TIMEOUT of latency on a marginal macOS link) to a
+        // recovery that needs to be fast, and the value is already on screen
+        // from before the drop; the notify repopulates it within a minute.
+        let seed_read = matches!(mode, ConnectMode::Manual);
         self.battery_capable = false;
         if let Some(batt_char) = chars.iter().find(|c| c.uuid == BATTERY_UUID).cloned() {
             match tokio::time::timeout(LINK_OP_TIMEOUT, p.subscribe(&batt_char)).await {
                 Ok(Ok(())) => {
                     self.battery_capable = true;
                     self.emit(BleEvent::Status("BatteryStatus subscribed".into()));
-                    // One-shot read for an immediate value. Bounded like
-                    // every GATT step here; non-fatal on error/timeout.
-                    if let Ok(Ok(v)) =
-                        tokio::time::timeout(LINK_OP_TIMEOUT, p.read(&batt_char)).await
-                    {
-                        if let Some(b) = BatterySample::parse(&v) {
-                            self.emit(BleEvent::Battery(b));
+                    // One-shot read for an immediate value (manual connect
+                    // only — see above). Bounded like every GATT step here;
+                    // non-fatal on error/timeout.
+                    if seed_read {
+                        if let Ok(Ok(v)) =
+                            tokio::time::timeout(LINK_OP_TIMEOUT, p.read(&batt_char)).await
+                        {
+                            if let Some(b) = BatterySample::parse(&v) {
+                                self.emit(BleEvent::Battery(b));
+                            }
                         }
                     }
                 }
