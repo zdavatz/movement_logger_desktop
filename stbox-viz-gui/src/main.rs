@@ -3429,8 +3429,13 @@ impl eframe::App for AppState {
                     if let Some(b) = batt.filter(|_| connected) {
                         ui.add_space(8.0);
                         let pct = b.soc_pct();
+                        /* One glyph for all levels: egui's bundled emoji
+                           font has 🔋 (U+1F50B) but NOT the newer
+                           low-battery 🪫 (U+1FAAB, Unicode 14) — that one
+                           rendered as a missing-glyph box. Colour carries
+                           the low/mid/ok state; ⚠ (in-font) marks low. */
                         let (col, glyph) = if pct < 20 {
-                            (egui::Color32::from_rgb(220, 90, 90), "🪫")
+                            (egui::Color32::from_rgb(220, 90, 90), "⚠🔋")
                         } else if pct < 40 {
                             (egui::Color32::from_rgb(210, 170, 60), "🔋")
                         } else {
