@@ -36,7 +36,7 @@ use std::sync::{
 };
 use std::thread;
 
-use ble::{BleBackend, BleCmd, LiveSample};
+use ble::{BatterySample, BleBackend, BleCmd, LiveSample};
 use sync_core::{
     default_save_base, is_sensor_data_name, push_log, resolve_save_dir, BleFile, BleState,
     SyncCore, SyncHost,
@@ -253,6 +253,14 @@ struct AppState {
     /// Wall-clock instant the latest sample arrived. Used for the
     /// "x s ago" freshness label so the user notices a stalled stream.
     latest_sample_at: Option<std::time::Instant>,
+    /// Most recent BatteryStatus snapshot (dedicated …0200… characteristic
+    /// — richer than the SensorStream `low_batt` bit: real voltage / SoC%
+    /// / current). Cleared on link reset.
+    latest_battery: Option<BatterySample>,
+    /// Wall-clock instant the latest battery reading arrived. Battery
+    /// notifies land ~once/min, so the meter tolerates a much longer
+    /// staleness window than the stream.
+    latest_battery_at: Option<std::time::Instant>,
     /// Rolling history of acc-magnitude samples (in g) for the small
     /// time-series chart on the Live tab. Tuple = (t_seconds_relative,
     /// acc_g_magnitude). Bounded by LIVE_HISTORY_LEN.
@@ -679,6 +687,8 @@ impl std::io::Write for BleTransport {
 struct GuiSyncHost<'a> {
     latest_sample: &'a mut Option<LiveSample>,
     latest_sample_at: &'a mut Option<std::time::Instant>,
+    latest_battery: &'a mut Option<BatterySample>,
+    latest_battery_at: &'a mut Option<std::time::Instant>,
     live_acc_history: &'a mut VecDeque<(f64, f64)>,
     live_pressure_history: &'a mut VecDeque<(f64, f64)>,
     live_t0_ms: &'a mut Option<u32>,
@@ -700,6 +710,8 @@ impl SyncHost for GuiSyncHost<'_> {
            clean history, not graft new samples onto stale chart data. */
         *self.latest_sample = None;
         *self.latest_sample_at = None;
+        *self.latest_battery = None;
+        *self.latest_battery_at = None;
         self.live_acc_history.clear();
         self.live_pressure_history.clear();
         *self.live_t0_ms = None;
@@ -738,6 +750,11 @@ impl SyncHost for GuiSyncHost<'_> {
         }
         self.live_acc_history.push_back((dt, acc_g));
         self.live_pressure_history.push_back((dt, pres_hpa));
+    }
+
+    fn on_battery(&mut self, b: &BatterySample) {
+        *self.latest_battery = Some(*b);
+        *self.latest_battery_at = Some(std::time::Instant::now());
     }
 
     fn on_downloaded(&mut self, name: &str, path: &Path) {
@@ -888,6 +905,8 @@ impl AppState {
             sync,
             latest_sample,
             latest_sample_at,
+            latest_battery,
+            latest_battery_at,
             live_acc_history,
             live_pressure_history,
             live_t0_ms,
@@ -902,6 +921,8 @@ impl AppState {
         let mut host = GuiSyncHost {
             latest_sample,
             latest_sample_at,
+            latest_battery,
+            latest_battery_at,
             live_acc_history,
             live_pressure_history,
             live_t0_ms,
@@ -2840,6 +2861,47 @@ impl AppState {
                 ui.end_row();
             });
 
+        // ----- Battery (dedicated BatteryStatus characteristic) --------
+        // Desktop-only super-set: iOS/Android show only the low_batt flag
+        // (in the grid above). This meter is driven by the box's dedicated
+        // …0200… BatteryStatus characteristic (real voltage / SoC% /
+        // current from the STC3115 fuel gauge) and has no mobile
+        // equivalent — don't delete it in a future "match mobile" pass.
+        // `None` on legacy firmware ⇒ section simply hidden. Lets the user
+        // watch the pack level directly (GPS acquisition browns out on a
+        // low battery — this makes that correlation visible).
+        if let Some(b) = self.latest_battery {
+            let stale = self
+                .latest_battery_at
+                .map(|t| t.elapsed().as_secs() > 90)   // notifies ~once/min
+                .unwrap_or(true);
+            ui.add_space(8.0);
+            let pct = b.soc_pct();
+            // Same red<20 / yellow<40 / green ramp as the C/N0 row above.
+            let fill = if pct < 20 { egui::Color32::from_rgb(200, 70, 70) }
+                       else if pct < 40 { egui::Color32::from_rgb(210, 170, 60) }
+                       else { egui::Color32::from_rgb(70, 170, 90) };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Battery").strong());
+                ui.add(
+                    egui::ProgressBar::new(b.soc_frac())
+                        .desired_width(360.0)
+                        .fill(fill)
+                        .text(format!(
+                            "{}%  ·  {:.2} V  ·  {:+.2} A{}",
+                            pct,
+                            b.volts(),
+                            b.amps(),
+                            if stale { "  · stale" } else { "" },
+                        )),
+                );
+            });
+            if b.low_batt {
+                ui.colored_label(egui::Color32::LIGHT_RED,
+                    "⚠ low battery (< 10 %) — charge the box; GPS may lose fix");
+            }
+        }
+
         ui.add_space(10.0);
         ui.separator();
 
@@ -3147,6 +3209,7 @@ impl eframe::App for AppState {
             // `self`, inside the nested layout closure.
             let connected = matches!(self.sync.ble_state, BleState::Connected);
             let status = self.sync.ble_status.clone();
+            let batt = self.latest_battery;
             ui.horizontal(|ui| {
                 for (tab, label) in [
                     (Tab::Live,     "Live"),
@@ -3184,6 +3247,21 @@ impl eframe::App for AppState {
                             )
                             .selectable(true),
                         );
+                    }
+                    // Compact always-visible battery chip while connected —
+                    // so the pack level is in view on every tab, not just
+                    // Live (issue: GPS browns out on a low battery).
+                    if let Some(b) = batt.filter(|_| connected) {
+                        ui.add_space(8.0);
+                        let pct = b.soc_pct();
+                        let (col, glyph) = if pct < 20 {
+                            (egui::Color32::from_rgb(220, 90, 90), "🪫")
+                        } else if pct < 40 {
+                            (egui::Color32::from_rgb(210, 170, 60), "🔋")
+                        } else {
+                            (egui::Color32::from_rgb(90, 190, 110), "🔋")
+                        };
+                        ui.colored_label(col, format!("{glyph} {pct}%"));
                     }
                 });
             });

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_config::AgentConfig;
-use crate::ble::{BleBackend, BleCmd, BleEvent, LiveSample};
+use crate::ble::{BatterySample, BleBackend, BleCmd, BleEvent, LiveSample};
 use crate::sync_db;
 
 /// Append a line to the shared log buffer (the GUI's scrollable log
@@ -42,6 +42,9 @@ pub trait SyncHost {
     /// One decoded SensorStream snapshot arrived (GUI updates the Live
     /// charts; the agent ignores it — it never subscribes to Live).
     fn on_sample(&mut self, s: &LiveSample);
+    /// One decoded BatteryStatus snapshot arrived (GUI updates the Live
+    /// battery meter; the agent ignores it — it never renders Live).
+    fn on_battery(&mut self, b: &BatterySample);
     /// A file finished downloading — auto-route it into the Replay
     /// form slots (no-op for the agent).
     fn on_downloaded(&mut self, name: &str, path: &Path);
@@ -831,6 +834,9 @@ impl SyncCore {
                 }
                 BleEvent::Sample(s) => {
                     host.on_sample(&s);
+                }
+                BleEvent::Battery(b) => {
+                    host.on_battery(&b);
                 }
                 BleEvent::FlashStarted { total } => {
                     self.ble_flash_progress = Some((0, total));

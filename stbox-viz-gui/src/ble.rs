@@ -93,6 +93,12 @@ const FILEDATA_UUID: Uuid = Uuid::from_u128(0x00000040_0010_11e1_ac36_0002a5d5c5
 /// PumpLogger; not present in SDDataLogFileX (optional characteristic).
 /// See DESIGN.md §3 for the byte layout.
 const STREAM_UUID:   Uuid = Uuid::from_u128(0x00000100_0010_11e1_ac36_0002a5d5c51b);
+/// BatteryStatus — 8-byte packed STC3115 fuel-gauge snapshot; the box
+/// notifies once/min + immediately on the low-battery transition, and the
+/// value is READ-able on demand. New in PumpLogger; absent on legacy
+/// SDDataLogFileX (optional characteristic). NOTE: its flags byte differs
+/// from the SensorStream packet — here bit0=low_batt, bit1=logging.
+const BATTERY_UUID:  Uuid = Uuid::from_u128(0x00000200_0010_11e1_ac36_0002a5d5c51b);
 
 /// Watchdog — if no notification arrives for this long during an active
 /// LIST or READ, give up and surface a timeout error so the user isn't
@@ -446,6 +452,11 @@ pub enum BleEvent {
     /// connected to a PumpLogger firmware that exposes the SensorStream
     /// characteristic; legacy PumpTsueri builds never produce this event.
     Sample(LiveSample),
+    /// One decoded BatteryStatus snapshot (dedicated …0200… characteristic).
+    /// Only emitted while connected to a PumpLogger firmware that exposes
+    /// the BatteryStatus characteristic; legacy PumpTsueri builds never
+    /// produce this event.
+    Battery(BatterySample),
     /// A firmware upload has started (FW_BEGIN accepted; the box erased
     /// its inactive bank). `total` is the image byte length.
     FlashStarted { total: u64 },
@@ -550,6 +561,50 @@ impl LiveSample {
         if !self.gps_valid || self.gps_lat_e7 == i32::MAX { return None; }
         Some((self.gps_lat_e7 as f64 / 1.0e7, self.gps_lon_e7 as f64 / 1.0e7))
     }
+}
+
+/// One decoded BatteryStatus snapshot (8-byte LE packed layout, DESIGN.md
+/// §4). Distinct from `LiveSample` — its flags byte uses bit0=low_batt,
+/// bit1=logging (see firmware `Src/battery.c`), so it does NOT share
+/// `LiveSample`'s decode.
+#[derive(Clone, Copy, Debug)]
+pub struct BatterySample {
+    /// Pack voltage, millivolts (STC3115).
+    pub voltage_mv: u16,
+    /// State-of-charge in 0.1 % steps (÷10 for %).
+    pub soc_x10: u16,
+    /// Current in 100 µA steps, signed (+ charging / − draining;
+    /// ÷10000 for A).
+    pub current_x100ua: i16,
+    /// Firmware low-battery warning (raised at SoC < 10 %).
+    pub low_batt: bool,
+    /// Box is actively logging to SD.
+    pub logging: bool,
+}
+
+impl BatterySample {
+    /// Decode the fixed 8-byte little-endian BatteryStatus payload.
+    /// `None` if the length is wrong. Single-notify only (8 B is well
+    /// under any MTU) — no chunk reassembly, unlike SensorStream.
+    fn parse(b: &[u8]) -> Option<Self> {
+        if b.len() != 8 { return None; }
+        Some(Self {
+            voltage_mv:     u16::from_le_bytes([b[0], b[1]]),
+            soc_x10:        u16::from_le_bytes([b[2], b[3]]),
+            current_x100ua: i16::from_le_bytes([b[4], b[5]]),
+            low_batt:       b[6] & 0x01 != 0,
+            logging:        b[6] & 0x02 != 0,
+            // b[7] reserved.
+        })
+    }
+    /// SoC as a 0..1 fraction for a ProgressBar.
+    pub fn soc_frac(&self) -> f32 { (self.soc_x10 as f32 / 10.0 / 100.0).clamp(0.0, 1.0) }
+    /// SoC as whole percent (rounded).
+    pub fn soc_pct(&self) -> u16 { (self.soc_x10 + 5) / 10 }
+    /// Voltage in volts.
+    pub fn volts(&self) -> f32 { self.voltage_mv as f32 / 1000.0 }
+    /// Current in amps (signed: + charging, − draining).
+    pub fn amps(&self) -> f32 { self.current_x100ua as f32 / 10_000.0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -884,6 +939,9 @@ struct WorkerState {
     /// characteristic — kept so we can emit a one-shot status line
     /// telling the user whether the box's firmware supports live data.
     stream_capable: bool,
+    /// True iff the connected peripheral exposed the BatteryStatus
+    /// characteristic. Same rationale as `stream_capable`.
+    battery_capable: bool,
     /// Peripheral id of the last successful connect — the auto-reconnect
     /// target. Set by `connect` / `auto_reconnect`, never cleared (a
     /// stale id just makes a future reconnect fail one round and fall
@@ -919,6 +977,7 @@ impl WorkerState {
             op: CurrentOp::Idle,
             stream_asm: StreamAsm::default(),
             stream_capable: false,
+            battery_capable: false,
             last_id: None,
             shared,
             pending_set_mode: None,
@@ -1366,6 +1425,42 @@ impl WorkerState {
                 "SensorStream characteristic not advertised — legacy firmware, live tab will be empty".into()
             ));
         }
+        // BatteryStatus is optional too — subscribe if present, seed the
+        // meter with one bounded READ so it shows a value immediately
+        // instead of waiting up to a minute for the box's first periodic
+        // notify. Never fail the connect on absence (legacy firmware).
+        self.battery_capable = false;
+        if let Some(batt_char) = chars.iter().find(|c| c.uuid == BATTERY_UUID).cloned() {
+            match tokio::time::timeout(LINK_OP_TIMEOUT, p.subscribe(&batt_char)).await {
+                Ok(Ok(())) => {
+                    self.battery_capable = true;
+                    self.emit(BleEvent::Status("BatteryStatus subscribed".into()));
+                    // One-shot read for an immediate value. Bounded like
+                    // every GATT step here; non-fatal on error/timeout.
+                    if let Ok(Ok(v)) =
+                        tokio::time::timeout(LINK_OP_TIMEOUT, p.read(&batt_char)).await
+                    {
+                        if let Some(b) = BatterySample::parse(&v) {
+                            self.emit(BleEvent::Battery(b));
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.emit(BleEvent::Status(format!(
+                        "BatteryStatus subscribe failed ({e}) — no live battery meter"
+                    )));
+                }
+                Err(_) => {
+                    self.emit(BleEvent::Status(
+                        "BatteryStatus subscribe timed out — no live battery meter".into()
+                    ));
+                }
+            }
+        } else {
+            self.emit(BleEvent::Status(
+                "BatteryStatus characteristic not advertised — legacy firmware, no battery meter".into()
+            ));
+        }
         let stream: NotifStream = match tokio::time::timeout(
             LINK_OP_TIMEOUT, p.notifications()
         ).await {
@@ -1709,9 +1804,10 @@ impl WorkerState {
         if let Some(pump) = self.notif_pump.take() {
             pump.abort();
         }
-        self.notif_rx       = None;
-        self.stream_asm     = StreamAsm::default();
-        self.stream_capable = false;
+        self.notif_rx        = None;
+        self.stream_asm      = StreamAsm::default();
+        self.stream_capable  = false;
+        self.battery_capable = false;
         if let Some(p) = self.peripheral.take() {
             drop_link(&p).await;
         }
@@ -2099,6 +2195,11 @@ impl WorkerState {
                         // for the FileData reply we actually want.
                         self.handle_stream_notification(&n.value);
                     }
+                    if n.uuid == BATTERY_UUID {
+                        // Battery notify landed mid-flash — decode it so the
+                        // meter keeps ticking, then keep waiting.
+                        self.handle_battery_notification(&n.value);
+                    }
                     // Any other characteristic — ignore, keep waiting.
                 }
                 Ok(None) => return Ok(None), // stream closed
@@ -2311,6 +2412,14 @@ impl WorkerState {
         // them on their own path before touching `op`.
         if n.uuid == STREAM_UUID {
             self.handle_stream_notification(&n.value);
+            return;
+        }
+        // BatteryStatus notifies are also concurrent + unsolicited and
+        // ride their own characteristic — decode on their own path before
+        // touching `op` (same rule as SensorStream), so a once/min battery
+        // notify can never collide with an in-flight LIST/READ/DELETE/FLASH.
+        if n.uuid == BATTERY_UUID {
+            self.handle_battery_notification(&n.value);
             return;
         }
         // GPS-bridge mode: FileData notifies carry raw u-blox UBX frames,
@@ -2595,6 +2704,15 @@ impl WorkerState {
                 // Unknown sequence byte — corrupt frame, reset.
                 self.stream_asm = StreamAsm::default();
             }
+        }
+    }
+
+    /// Decode + emit an 8-byte BatteryStatus notify. Fixed-length,
+    /// single-notify — no reassembly (unlike SensorStream). Malformed
+    /// frames are dropped silently.
+    fn handle_battery_notification(&mut self, bytes: &[u8]) {
+        if let Some(b) = BatterySample::parse(bytes) {
+            self.emit(BleEvent::Battery(b));
         }
     }
 

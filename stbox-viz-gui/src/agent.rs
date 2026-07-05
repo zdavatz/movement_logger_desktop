@@ -39,6 +39,7 @@ struct NoopHost;
 impl SyncHost for NoopHost {
     fn on_link_reset(&mut self) {}
     fn on_sample(&mut self, _s: &crate::ble::LiveSample) {}
+    fn on_battery(&mut self, _b: &crate::ble::BatterySample) {}
     fn on_downloaded(&mut self, _name: &str, _path: &std::path::Path) {}
 }
 
