@@ -2089,7 +2089,7 @@ impl AppState {
                 self.sync.run_errlog_check("manual");
             }
             let mirror = mirror_path(&self.sync.ble_out_dir, "ERRLOG.LOG");
-            ui.label(egui::RichText::new(mirror.display().to_string()).weak().small());
+            ui.label(egui::RichText::new(mirror.display().to_string()).weak());
         });
         match self.sync.errlog_report.as_ref() {
             None => {
@@ -2113,15 +2113,14 @@ impl AppState {
                                 if last.reset.is_empty() { "?" } else { &last.reset },
                                 last.fw,
                             ))
-                            .weak()
-                            .small(),
+                            .weak(),
                         );
                     });
                     for f in &last.findings {
                         ui.horizontal(|ui| {
                             ui.add_space(12.0);
                             ui.colored_label(color(f.severity), "•");
-                            ui.label(egui::RichText::new(&f.msg).small());
+                            ui.label(&f.msg);
                         });
                     }
                 }
@@ -2142,8 +2141,7 @@ impl AppState {
                                         b.last_tick_ms as f64 / 1000.0,
                                         if b.reset.is_empty() { "?" } else { &b.reset },
                                     ))
-                                    .weak()
-                                    .small(),
+                                    .weak(),
                                 );
                             });
                             for f in b.findings.iter().filter(|f| {
@@ -2153,7 +2151,7 @@ impl AppState {
                                 ui.horizontal(|ui| {
                                     ui.add_space(18.0);
                                     ui.colored_label(color(f.severity), "•");
-                                    ui.label(egui::RichText::new(&f.msg).small());
+                                    ui.label(&f.msg);
                                 });
                             }
                         }
