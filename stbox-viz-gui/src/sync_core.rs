@@ -206,6 +206,10 @@ pub struct SyncCore {
     /// box boot is graded as soon as its log lands. `None` until a
     /// mirror exists. Rendered in the Debug tab ("Box health").
     pub errlog_report: Option<crate::errlog_check::ErrlogReport>,
+    /// Local wall-clock of the last `run_errlog_check` (`HH:MM:SS`), shown
+    /// next to the Debug-tab "Re-check now" button so a manual re-check on
+    /// an unchanged mirror still gives visible feedback that it ran.
+    pub errlog_checked_at: Option<String>,
 
     // ----- Firmware upload (OTA) ---------------------------------------
     /// `Some((bytes_done, total))` while a firmware upload is in flight —
@@ -960,6 +964,7 @@ impl SyncCore {
     /// after a save-dir change the old dir's verdict must not keep
     /// rendering against the new path's label.
     pub fn run_errlog_check(&mut self, why: &str) {
+        self.errlog_checked_at = Some(chrono::Local::now().format("%H:%M:%S").to_string());
         let path = mirror_path(&self.ble_out_dir, "ERRLOG.LOG");
         if !path.exists() {
             if self.errlog_report.take().is_some() {

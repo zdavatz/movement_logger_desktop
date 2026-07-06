@@ -2088,6 +2088,9 @@ impl AppState {
             None => {
                 ui.horizontal(|ui| {
                     recheck = ui.button("Re-check now").clicked();
+                    if let Some(t) = &self.sync.errlog_checked_at {
+                        ui.label(egui::RichText::new(format!("checked {t}")).weak());
+                    }
                     ui.label(
                         "No ERRLOG.LOG mirror yet — connect in the Sync tab and run one sync.",
                     );
@@ -2098,11 +2101,25 @@ impl AppState {
                     let verdict = last.verdict();
                     ui.horizontal(|ui| {
                         recheck = ui.button("Re-check now").clicked();
+                        if let Some(t) = &self.sync.errlog_checked_at {
+                            ui.label(egui::RichText::new(format!("checked {t}")).weak());
+                        }
                         ui.label("Latest boot:");
                         ui.colored_label(
                             color(verdict),
                             format!("#{}  {}", last.index, last.verdict_label()),
                         );
+                        // Boot wall-clock (HH:MM-DD.MM.YYYY) from the host
+                        // SET_TIME anchor — the box has no RTC, so this is
+                        // blank ("time?") on boots with no host connect.
+                        match last.boot_time_label() {
+                            Some(t) => {
+                                ui.colored_label(egui::Color32::LIGHT_BLUE, t);
+                            }
+                            None => {
+                                ui.label(egui::RichText::new("time?").weak());
+                            }
+                        }
                         ui.label(
                             egui::RichText::new(format!(
                                 "up {:.0} s · reset: {} · {}",
@@ -2145,6 +2162,14 @@ impl AppState {
                                     color(b.verdict()),
                                     format!("#{:<3} {}", b.index, b.verdict_label()),
                                 );
+                                match b.boot_time_label() {
+                                    Some(t) => {
+                                        ui.colored_label(egui::Color32::LIGHT_BLUE, t);
+                                    }
+                                    None => {
+                                        ui.label(egui::RichText::new("time?").weak());
+                                    }
+                                }
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "up {:.0} s · {}",

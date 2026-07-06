@@ -84,6 +84,12 @@ pub struct BootReport {
     pub reset: String,
     /// Highest sane `[N ms]` stamp seen — approximate section duration.
     pub last_tick_ms: u64,
+    /// Boot-start wall-clock in epoch-ms, back-computed from the firmware's
+    /// `ble: SET_TIME epoch_ms=<E> tick=<T>` line (`E - T`). The box has no
+    /// RTC, so a boot only gets an absolute time once a host (phone/desktop)
+    /// connected and pushed SET_TIME during that boot. `None` = no connect
+    /// that boot → no time knowable. See `boot_time_label`.
+    pub host_epoch_ms: Option<i64>,
     pub findings: Vec<Finding>,
     /// First and last accepted gps_diag sample.
     pub gps_first: Option<GpsDiag>,
@@ -107,6 +113,17 @@ impl BootReport {
             .map(|f| f.severity)
             .max()
             .unwrap_or(Severity::Info)
+    }
+
+    /// Boot-start wall-clock as `HH:MM-DD.MM.YYYY` in local time, when a
+    /// host pushed SET_TIME during this boot (`host_epoch_ms`). `None` when
+    /// no host connected that boot — the box has no RTC, so that boot's
+    /// absolute time is genuinely unknown.
+    pub fn boot_time_label(&self) -> Option<String> {
+        let ms = self.host_epoch_ms?;
+        let dt = chrono::DateTime::from_timestamp_millis(ms)?
+            .with_timezone(&chrono::Local);
+        Some(dt.format("%H:%M-%d.%m.%Y").to_string())
     }
 
     /// Short human label: "OK", "WARN", "FAIL".
@@ -355,6 +372,29 @@ pub fn analyze(text: &str) -> ErrlogReport {
         // diag tick. (Lines without a tick — banner, `reset:`, `fw:` —
         // are not affected.)
         let replayed = matches!(tick, Some(ms) if ms < scan.tick_frontier);
+
+        // Host wall-clock anchor. On the first connect after a boot the
+        // host pushes SET_TIME and the firmware logs
+        // `ble: SET_TIME epoch_ms=<E> tick=<T>` (firmware v0.0.33+; older
+        // builds log only `tick=` → no anchor, boot stays untimed). Boot-start
+        // epoch = E − T, where T is the ErrLog `[N ms]` prefix (the same
+        // HAL_GetTick() ms-since-boot clock as `tick=`). First anchor per
+        // boot wins — it's the earliest, closest to the true boot start.
+        // This is the ONLY absolute time a boot ever gets (no RTC).
+        if rep.host_epoch_ms.is_none()
+            && !replayed
+            && rest.starts_with("ble: SET_TIME ")
+        {
+            if let Some(epoch) = field_i64(rest, "epoch_ms") {
+                let off = tick
+                    .map(|t| t as i64)
+                    .or_else(|| field_i64(rest, "tick"))
+                    .unwrap_or(0);
+                if epoch > 0 {
+                    rep.host_epoch_ms = Some(epoch - off);
+                }
+            }
+        }
 
         if let Some(r) = rest.strip_prefix("reset: ") {
             rep.reset = r.trim().to_string();
@@ -838,6 +878,41 @@ reset: SOFTWARE+BOR (CSR=0x0C004400)
 [15000 ms] gps_diag: bytes=10000 lines_good=200 lines_bad=3 rmc=10 gga=100 errors=2 rx_drop=0 ubx_drop=0
 [20000 ms] gps_diag: bytes=15000 lines_good=300 lines_bad=3 rmc=60 gga=150 errors=2 rx_drop=0 ubx_drop=0
 ";
+
+    #[test]
+    fn host_set_time_anchor_gives_boot_wall_clock() {
+        // 2026-07-06 06:00:00 UTC = 1751781600000 ms, logged at tick 12000
+        // ⇒ boot start epoch = 1751781600000 − 12000 = 1751781588000.
+        let log = "\
+--- Boot Error_Log_Pump_Tsueri_06.07.2026 --- MovementLogger 0.0.55 build #1
+reset: SOFTWARE+BOR (CSR=0x0C004400)
+[325 ms] fuel: ok (STC3115)
+[12000 ms] ble: SET_TIME epoch_ms=1751781600000 tick=12000 wrote=1
+[17000 ms] ble: SET_TIME epoch_ms=1751781605000 tick=17000 wrote=1
+";
+        let rep = analyze(log);
+        assert_eq!(rep.boots.len(), 1);
+        let b = &rep.boots[0];
+        // First anchor wins; both anchors agree on the same boot start.
+        assert_eq!(b.host_epoch_ms, Some(1751781588000));
+        // Label renders in the shape HH:MM-DD.MM.YYYY (exact value is
+        // timezone-dependent, so check the structure, not the digits).
+        let t = b.boot_time_label().expect("label");
+        let ok = t.len() == 16
+            && &t[2..3] == ":"
+            && &t[5..6] == "-"
+            && &t[8..9] == "."
+            && &t[11..12] == "."
+            && t.chars().filter(|c| c.is_ascii_digit()).count() == 12;
+        assert!(ok, "unexpected label shape: {t}");
+    }
+
+    #[test]
+    fn boot_without_host_connect_has_no_time() {
+        let rep = analyze(HEALTHY);
+        assert_eq!(rep.boots[0].host_epoch_ms, None);
+        assert!(rep.boots[0].boot_time_label().is_none());
+    }
 
     #[test]
     fn healthy_boot_is_ok() {
