@@ -129,6 +129,13 @@ pub struct SyncCore {
     /// MANUAL (box idle until START_LOG). Mirrors the Android
     /// `FileSyncUiState.logModeManual`.
     pub ble_log_mode: Option<bool>,
+    /// The box's persisted GPS power state, from a GPS_GET_POWER (0x12) reply
+    /// (queried on every Connect) or a confirmed GPS_POWER (0x11). `None` =
+    /// unknown / not yet answered / legacy firmware (< v0.0.35, no reply);
+    /// `Some(true)` = u-blox receiver on; `Some(false)` = off (backup mode, to
+    /// save battery — IMU + baro keep logging, Replay still time-aligns via the
+    /// `# SYNC` anchor). NOT persisted in the app config — the box owns it.
+    pub ble_gps_power: Option<bool>,
 
     // ----- Sync (vs. plain transfer) -----------------------------------
     /// Peripheral id of the box we're connected to, captured at Connect
@@ -606,6 +613,9 @@ impl SyncCore {
                        from another client) rather than show a stale
                        value while disconnected. */
                     self.ble_log_mode = None;
+                    /* Same for the box GPS power state — re-query on the
+                       next Connect rather than show a stale toggle. */
+                    self.ble_gps_power = None;
                     /* Abandon any in-flight "Check FW" — the box version
                        query can't complete across a drop, so drop the
                        active flag (the worker also emits FirmwareVersion(None)
@@ -667,6 +677,15 @@ impl SyncCore {
                            legacy PumpTsueri (never replies → stays None). */
                         if let Some(b) = self.ble.as_ref() {
                             b.send(BleCmd::GetLogMode);
+                        }
+                    } else if self.ble_gps_power.is_none() {
+                        /* Log mode already known but GPS power isn't (e.g. a
+                           reconnect / keep-synced re-LIST where the LogMode
+                           chain didn't re-fire). Query it on this idle window;
+                           reply demuxed like GET_MODE. Legacy firmware never
+                           answers → stays None. */
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::GetGpsPower);
                         }
                     }
                 }
@@ -823,6 +842,19 @@ impl SyncCore {
                     if let Err(e) = crate::autostart::sync_with_mode(manual) {
                         push_log(&self.log, format!("autostart: {e}"));
                     }
+                    /* Chain the connect-time GPS-power query now that the
+                       GET_MODE reply has freed the single-op slot: the
+                       connect flow is GET_VERSION → GET_MODE → GET_GPS_POWER,
+                       each self-guarding on an idle worker (its reply is
+                       demuxed by `op`, so it can't overlap). Only when the
+                       state is still unknown and no sync is queued — so it's
+                       one-shot per connect on v0.0.35+ and a harmless no-op on
+                       legacy firmware (never replies → stays None). */
+                    if self.ble_gps_power.is_none() && !self.ble_sync_pending {
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::GetGpsPower);
+                        }
+                    }
                 }
                 BleEvent::FirmwareVersion(v) => {
                     push_log(
@@ -849,6 +881,17 @@ impl SyncCore {
                             b.send(BleCmd::GetLogMode);
                         }
                     }
+                }
+                BleEvent::GpsPower { on } => {
+                    self.ble_gps_power = Some(on);
+                    self.ble_status = format!(
+                        "box GPS: {}",
+                        if on { "on" } else { "off (battery-save)" }
+                    );
+                    push_log(
+                        &self.log,
+                        format!("ble: box GPS = {}", if on { "on" } else { "off (battery-save)" }),
+                    );
                 }
                 BleEvent::DeleteDone { name } => {
                     self.ble_status = format!("deleted {name}");

@@ -53,6 +53,15 @@
 //!                               sends no reply → the GettingVersion op times out
 //!                               → FirmwareVersion(None). Same single-op/demux
 //!                               rules as GET_MODE (0x07).
+//!   0x11 GPS_POWER <u8>       — 1=on / 0=off; turns the u-blox receiver on/off
+//!                               to save battery (off → UBX-RXM-PMREQ backup,
+//!                               ~tens of µA vs ~25 mA). Persisted on the box +
+//!                               re-applied at boot. Reply = 1 status byte
+//!                               (0x00 OK), exactly like SET_MODE (0x06).
+//!   0x12 GPS_GET_POWER        — replies one byte 1=on / 0=off. Twin of
+//!                               GET_MODE (0x07). Firmware v0.0.35+; legacy
+//!                               firmware ignores both → the op times out and
+//!                               the toggle stays "unknown".
 //!
 //!   Status bytes: 0x00 OK, 0xB0 BUSY, 0xE1 NOT_FOUND, 0xE2 IO_ERROR, 0xE3 BAD_REQ.
 
@@ -398,6 +407,19 @@ pub enum BleCmd {
     /// The survey loop sends UBX poll frames this way; the box writes them
     /// straight to the GPS UART. No-op unless a bridge is active.
     GpsTx { bytes: Vec<u8> },
+    /// GPS_POWER opcode `0x11` + `<u8>` (1 = on, 0 = off). Turns the box's
+    /// u-blox receiver on/off to save battery when GPS is faulty/unused (off →
+    /// UBX-RXM-PMREQ backup, ~tens of µA vs ~25 mA). Persisted on the box and
+    /// re-applied at boot. Box replies one status byte over FileData (0x00 OK →
+    /// the box is now in the requested state) → `BleEvent::GpsPower`. Demuxed by
+    /// the single-op `GpsPowerReq` slot, exactly like `SetLogMode`/`GetLogMode`.
+    /// Firmware v0.0.35+; legacy firmware silently ignores it (op times out).
+    SetGpsPower { on: bool },
+    /// GPS_GET_POWER opcode `0x12`. Box replies with a single byte over
+    /// FileData (1 = on, 0 = off) → `BleEvent::GpsPower`. Twin of `GetLogMode`;
+    /// legacy firmware never replies (the `GpsPowerReq` op times out and drops
+    /// to Idle, leaving the toggle "unknown").
+    GetGpsPower,
 }
 
 #[derive(Clone, Debug)]
@@ -446,6 +468,11 @@ pub enum BleEvent {
     /// query got no reply (legacy firmware ≤ v0.0.28) and timed out — the
     /// "Check FW" flow treats `None` as "older than latest → update".
     FirmwareVersion(Option<String>),
+    /// The box's GPS power state, from a GPS_GET_POWER (0x12) reply or a
+    /// confirmed GPS_POWER (0x11) round-trip. `on = true` → u-blox receiver
+    /// active; `false` → in backup mode to save battery. Never emitted on
+    /// legacy firmware (< v0.0.35, no reply) — the toggle stays "unknown".
+    GpsPower { on: bool },
     /// User-facing error — display in the log panel.
     Error(String),
     /// One decoded SensorStream snapshot (0.5 Hz). Only emitted while
@@ -875,6 +902,14 @@ enum CurrentOp {
     /// it emits `FirmwareVersion(None)` (legacy box = unknown → "update"),
     /// where GettingMode stays silent.
     GettingVersion { last_progress: Instant },
+    /// GPS_POWER (SET 0x11) or GPS_GET_POWER (GET 0x12) in flight — waiting for
+    /// the single-byte reply, demuxed by `is_set`. For a SET the reply is a
+    /// status byte (0x00 OK → the box is now in the `on` state); for a GET it's
+    /// the current state (1 = on, 0 = off). Twin of `GettingMode`: a stall just
+    /// drops to Idle without reconnecting (legacy firmware < v0.0.35 never
+    /// replies → the toggle stays "unknown"). `on` carries the requested state
+    /// so the SET reply knows what to confirm.
+    GpsPowerReq { is_set: bool, on: bool, last_progress: Instant },
     /// Firmware upload in flight. Unlike the other ops, the flash is
     /// driven *inline* by `flash_firmware` (it owns the notification
     /// stream for its whole duration and reads each reply with its own
@@ -1163,6 +1198,8 @@ impl WorkerState {
             BleCmd::FlashFirmware { bytes } => self.flash_firmware(bytes).await,
             BleCmd::GpsBridge { on } => self.gps_bridge(on).await,
             BleCmd::GpsTx { bytes } => self.gps_tx(bytes).await,
+            BleCmd::SetGpsPower { on } => self.set_gps_power(on).await,
+            BleCmd::GetGpsPower => self.get_gps_power().await,
         }
     }
 
@@ -1775,6 +1812,11 @@ impl WorkerState {
                 // will never come (the Disconnected handler also resets it).
                 self.emit(BleEvent::FirmwareVersion(None));
             }
+            CurrentOp::GpsPowerReq { .. } => {
+                // The link dropped mid GPS_POWER/GPS_GET_POWER — nothing to
+                // report; the Disconnected handler clears ble_gps_power, so the
+                // toggle re-queries on the next Connect (mirrors GettingMode).
+            }
             CurrentOp::Flashing { .. } => {
                 self.emit(BleEvent::FlashError {
                     msg: "firmware upload aborted by disconnect".into(),
@@ -2171,6 +2213,57 @@ impl WorkerState {
             return;
         }
         self.op = CurrentOp::GettingVersion { last_progress: Instant::now() };
+    }
+
+    /// GPS_POWER (0x11 `<u8>`). Turns the box's u-blox on/off (persisted on the
+    /// box) to save battery when GPS is faulty/unused. Unlike SET_MODE (which is
+    /// fire-and-forget, since re-reading would consume its OK byte), we DO track
+    /// the reply: the box answers with one status byte (0x00 OK) and the
+    /// `GpsPowerReq` op demuxes it → `BleEvent::GpsPower { on }` on OK. The GUI
+    /// reflects the target optimistically the moment it's clicked; this reply
+    /// reconciles it. Needs an idle worker (the reply is demuxed by `op`); a
+    /// click during a LIST/READ is rejected with "another op is in flight".
+    async fn set_gps_power(&mut self, on: bool) {
+        if self.peripheral.is_none() {
+            self.emit_err("not connected");
+            return;
+        }
+        if !matches!(self.op, CurrentOp::Idle) {
+            self.emit_err("another op is in flight — wait or Disconnect");
+            return;
+        }
+        if let Err(e) = self.write_cmd(&[0x11, on as u8]).await {
+            self.emit_err(e);
+            return;
+        }
+        self.emit(BleEvent::Status(format!(
+            "GPS_POWER {} sent",
+            if on { "on" } else { "off" }
+        )));
+        self.op = CurrentOp::GpsPowerReq { is_set: true, on, last_progress: Instant::now() };
+    }
+
+    /// GPS_GET_POWER (0x12). Box replies with one byte over FileData
+    /// (1 = on, 0 = off); handled in the `GpsPowerReq` op arm. Exact twin of
+    /// `get_log_mode`: self-guards on `op == Idle` (the reply is demuxed by
+    /// `op`, so it must not race a LIST/READ), writes the single opcode byte,
+    /// and parks the op. Legacy firmware (< v0.0.35) never replies → the
+    /// `GpsPowerReq` watchdog drops to Idle and the toggle stays "unknown".
+    async fn get_gps_power(&mut self) {
+        if !matches!(self.op, CurrentOp::Idle) {
+            // Don't trample an in-flight LIST/READ — GPS_GET_POWER is
+            // best-effort; the caller re-tries when idle.
+            return;
+        }
+        if self.peripheral.is_none() {
+            self.emit_err("not connected");
+            return;
+        }
+        if let Err(e) = self.write_cmd(&[0x12]).await {
+            self.emit_err(e);
+            return;
+        }
+        self.op = CurrentOp::GpsPowerReq { is_set: false, on: false, last_progress: Instant::now() };
     }
 
     // ---------------- Firmware upload (OTA) --------------------------------
@@ -2618,6 +2711,39 @@ impl WorkerState {
                 self.op = CurrentOp::Idle;
                 return;
             }
+            CurrentOp::GpsPowerReq { is_set, on, .. } => {
+                /* One-byte reply, demuxed by `is_set`:
+                   - SET (0x11): a status byte. 0x00 OK ⇒ the box is now in the
+                     requested `on` state → emit GpsPower { on }. Any other byte
+                     is an error (surfaced, toggle left as-is).
+                   - GET (0x12): the current state (1 = on, 0 = off) → emit
+                     GpsPower { on: b != 0 }. */
+                let (is_set, requested) = (*is_set, *on);
+                if let Some(&b) = n.value.first() {
+                    if is_set {
+                        if b == 0x00 {
+                            self.emit(BleEvent::GpsPower { on: requested });
+                            self.emit(BleEvent::Status(format!(
+                                "GPS turned {}",
+                                if requested { "on" } else { "off" }
+                            )));
+                        } else {
+                            let msg = match b {
+                                0xB0 => "BUSY (logging in progress, send STOP_LOG first)",
+                                0xE1 => "NOT_FOUND",
+                                0xE2 => "IO_ERROR",
+                                0xE3 => "BAD_REQUEST",
+                                _    => "unknown error",
+                            };
+                            self.emit_err(format!("GPS_POWER: {msg} (0x{b:02X})"));
+                        }
+                    } else {
+                        self.emit(BleEvent::GpsPower { on: b != 0 });
+                    }
+                }
+                self.op = CurrentOp::Idle;
+                return;
+            }
             CurrentOp::Flashing { .. } => {
                 /* The flash drives the stream inline (see `flash_firmware`
                    / `next_filedata`), so a FileData reply never reaches
@@ -2756,6 +2882,7 @@ impl WorkerState {
             CurrentOp::Deleting { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingMode { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingVersion { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
+            CurrentOp::GpsPowerReq { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             // A flash is driven inline and never yields to the watchdog
             // (its own per-step timeouts cover stalls), so it's never
             // "stale" here.
@@ -2817,6 +2944,12 @@ impl WorkerState {
                 // instead of waiting forever. Never reconnect (the link is
                 // fine); op already dropped to Idle above.
                 self.emit(BleEvent::FirmwareVersion(None));
+                false
+            }
+            CurrentOp::GpsPowerReq { .. } => {
+                // Legacy firmware (< v0.0.35) never replies to GPS_POWER /
+                // GPS_GET_POWER. Silently drop to Idle (toggle stays
+                // "unknown"); never reconnect — the link is fine.
                 false
             }
             // Unreachable in practice (the flash never yields here), but

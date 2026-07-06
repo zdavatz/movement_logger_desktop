@@ -218,6 +218,15 @@ struct AppState {
     /// "USB-C end is UP — confirm" tap.
     nose_plus_y: Option<bool>,
 
+    /// Calibrated board-angle zero reference `[pitch, roll, yaw]`° captured
+    /// at the Live tab's "Zero here" tap (yaw at bias 0). `None` = not zeroed
+    /// (calibrated readout shows a prompt instead). iOS
+    /// `FileSyncViewModel.angleZeroRef` parity; persisted in config.
+    angle_zero_ref: Option<[f64; 3]>,
+    /// Wall-clock (epoch seconds) of the last "Zero here" tap — drives the
+    /// "zeroed N ago" note. `None` when never zeroed / after Clear.
+    angle_zero_at: Option<f64>,
+
     /// Gyro + accel complementary attitude filter — the 3D preview's
     /// attitude source (mag-independent; iOS `OrientationFilter` parity).
     /// STATEFUL across samples: fed once per received `LiveSample` in
@@ -802,6 +811,8 @@ impl AppState {
             mag_off_persisted: agent_config::AgentConfig::load().mag_offset_mg,
             heading_bias_deg: agent_config::AgentConfig::load().heading_bias_deg.unwrap_or(0.0),
             nose_plus_y: agent_config::AgentConfig::load().nose_plus_y,
+            angle_zero_ref: agent_config::AgentConfig::load().angle_zero_ref,
+            angle_zero_at: agent_config::AgentConfig::load().angle_zero_at,
             gps_dbg_baud: "38400".to_string(),
             gps_dbg_label: "antenna".to_string(),
             // Pre-fill the serial port from a one-shot scan so the common
@@ -1552,6 +1563,57 @@ impl AppState {
                             None => "(unknown)",
                             Some(false) => "records on power-on",
                             Some(true) => "idle until Start session",
+                        })
+                        .weak(),
+                    );
+                    /* Box GPS on/off (firmware v0.0.35+) — iOS/Android parity.
+                       OFF drops the u-blox receiver into UBX-RXM-PMREQ backup
+                       (~tens of µA vs ~25 mA) to save battery when GPS is
+                       faulty/unused; logging (IMU + baro) keeps running and
+                       Replay still time-aligns via the phone-clock `# SYNC`
+                       anchor. Persisted on the box. The click sends GPS_POWER
+                       and reflects the target optimistically; the box's OK
+                       reply (GpsPower event) reconciles it. `None` (legacy
+                       firmware < v0.0.35 or not yet answered) = neither lit. */
+                    ui.separator();
+                    ui.label("GPS:");
+                    let gps = self.sync.ble_gps_power;
+                    if ui
+                        .add_enabled(
+                            connected,
+                            egui::SelectableLabel::new(gps == Some(true), "On"),
+                        )
+                        .on_hover_text("Turn the box's u-blox GPS receiver on. Needed for speed + GPS-track panels in Replay. Persisted on the box.")
+                        .clicked()
+                        && gps != Some(true)
+                    {
+                        if let Some(b) = self.sync.ble.as_ref() {
+                            b.send(BleCmd::SetGpsPower { on: true });
+                        }
+                        // Optimistic — the box's GpsPower reply reconciles.
+                        self.sync.ble_gps_power = Some(true);
+                        push_log(&self.log, "ble: GPS_POWER on sent".into());
+                    }
+                    if ui
+                        .add_enabled(
+                            connected,
+                            egui::SelectableLabel::new(gps == Some(false), "Off"),
+                        )
+                        .on_hover_text("Turn the box's GPS off to save battery (~tens of µA vs ~25 mA) when GPS is faulty/unused. IMU + baro keep logging; Replay still time-aligns via the # SYNC anchor. Persisted on the box.")
+                        .clicked()
+                        && gps != Some(false)
+                    {
+                        if let Some(b) = self.sync.ble.as_ref() {
+                            b.send(BleCmd::SetGpsPower { on: false });
+                        }
+                        self.sync.ble_gps_power = Some(false);
+                        push_log(&self.log, "ble: GPS_POWER off sent".into());
+                    }
+                    ui.label(
+                        egui::RichText::new(match gps {
+                            None => "(unknown)",
+                            Some(true) => "receiver on",
+                            Some(false) => "off — saving battery",
                         })
                         .weak(),
                     );
@@ -2944,23 +3006,6 @@ impl AppState {
             }
         }
 
-        let (pitch_deg, roll_deg, heading_deg) = {
-            let ax = acc_g(0) as f64;
-            let ay = acc_g(1) as f64;
-            let az = acc_g(2) as f64;
-            let roll  = ay.atan2(az);
-            let pitch = (-ax).atan2((ay * ay + az * az).sqrt());
-            // Heading = the gyro+accel filter's nose azimuth (matches the
-            // preview arrow). Pure gyro carry (mag only seeds it), so the
-            // absolute value is anchored by the "USB-C south" tap and drifts
-            // slowly. `0.0` until the filter seeds.
-            let heading = self
-                .orientation_filter
-                .nose_azimuth(self.nose_plus_y.unwrap_or(false), self.heading_bias_deg)
-                .unwrap_or(0.0);
-            (pitch.to_degrees(), roll.to_degrees(), heading)
-        };
-
         egui::Grid::new("live-readouts")
             .num_columns(4)
             .spacing([16.0, 8.0])
@@ -2991,11 +3036,11 @@ impl AppState {
                 ui.label(format!("Z {:+}", s.mag_mg[2]));
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Orient (°)").strong());
-                ui.label(format!("pitch {:+6.1}", pitch_deg));
-                ui.label(format!("roll {:+6.1}",  roll_deg));
-                ui.label(format!("hdg {:6.1}",    heading_deg));
-                ui.end_row();
+                // NOTE: the old "Orient (°)" row here showed accel-only
+                // pitch/roll that assumed a phone frame (long axis = X) and so
+                // SWAPPED pitch/roll on this box (nose = Y). It was removed;
+                // the correct decoupled attitude is the "Board angles" card
+                // below (Absolute + Calibrated), mirroring the iOS Live tab.
 
                 ui.label(egui::RichText::new("Baro").strong());
                 ui.label(format!("{:.2} hPa", pres_hpa));
@@ -3060,6 +3105,108 @@ impl AppState {
                 ui.colored_label(flag_col(s.low_battery),    "low_batt");
                 ui.end_row();
             });
+
+        // ----- Board angles (pitch / roll / yaw, absolute + zeroable) --
+        // Prominent decoupled attitude readout from the drift-free gyro+accel
+        // filter — replaces the old accel-only "Orient (°)" row that assumed a
+        // phone frame (long axis = X) and so SWAPPED pitch/roll on this box
+        // (nose = Y). Two sets: Absolute (vs level & north, yaw = compass
+        // heading) and Calibrated (tared to a "Zero here" reference pose). The
+        // tared yaw is sampled at bias 0 so "turn since zero" is independent of
+        // the direction calibration. Mirrors iOS `BoardAnglesCard`.
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(egui::RichText::new("Board angles").strong());
+            let ori_rows = self.ori_rows;
+            let nose_plus_y = self.nose_plus_y.unwrap_or(false);
+            let bias = self.heading_bias_deg;
+            match ori_rows {
+                None => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Move the box a little to seed the orientation filter…",
+                        )
+                        .weak(),
+                    );
+                }
+                Some(rows) => {
+                    let abs = board_angles(rows, nose_plus_y, bias);
+                    let rel = board_angles(rows, nose_plus_y, 0.0);
+
+                    // --- Absolute (vs level & north) ---
+                    ui.label(egui::RichText::new("Absolute — vs level & north").weak());
+                    board_angle_row(
+                        ui,
+                        abs.pitch_deg,
+                        abs.roll_deg,
+                        format!("{:5.1}°", abs.yaw_deg),
+                    );
+
+                    ui.separator();
+
+                    // --- Calibrated (tared to the zero pose) ---
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Calibrated — vs zero pose").weak());
+                        if ui.button("Zero here").clicked() {
+                            // Yaw at bias 0: "turn since zero" is direction-cal
+                            // independent (pitch/roll are bias-invariant).
+                            let r = [rel.pitch_deg, rel.roll_deg, rel.yaw_deg];
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs_f64())
+                                .unwrap_or(0.0);
+                            self.angle_zero_ref = Some(r);
+                            self.angle_zero_at = Some(now);
+                            let mut cfg = agent_config::AgentConfig::load();
+                            cfg.angle_zero_ref = Some(r);
+                            cfg.angle_zero_at = Some(now);
+                            let _ = cfg.save();
+                            push_log(&self.log, "board angles: zeroed".to_string());
+                        }
+                    });
+
+                    if let Some(rf) = self.angle_zero_ref {
+                        board_angle_row(
+                            ui,
+                            rel.pitch_deg - rf[0],
+                            rel.roll_deg - rf[1],
+                            format!("{:+5.1}°", norm_delta_deg(rel.yaw_deg - rf[2])),
+                        );
+                        ui.horizontal(|ui| {
+                            if let Some(at) = self.angle_zero_at {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs_f64())
+                                    .unwrap_or(at);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "zeroed {} ago",
+                                        ago_text(now - at)
+                                    ))
+                                    .weak(),
+                                );
+                            }
+                            if ui.small_button("Clear").clicked() {
+                                self.angle_zero_ref = None;
+                                self.angle_zero_at = None;
+                                let mut cfg = agent_config::AgentConfig::load();
+                                cfg.angle_zero_ref = None;
+                                cfg.angle_zero_at = None;
+                                let _ = cfg.save();
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "Tap “Zero here” with the board in its reference pose \
+                                 (e.g. sitting level) to read deviation from it.",
+                            )
+                            .weak(),
+                        );
+                    }
+                }
+            }
+        });
 
         // ----- Battery (dedicated BatteryStatus characteristic) --------
         // Desktop-only super-set: iOS/Android show only the low_batt flag
@@ -3171,11 +3318,17 @@ impl AppState {
                 self.auto_buf.clear();
                 self.orientation_filter.reset();
                 self.ori_rows = None;
+                // A tare captured under the old nose end / frame is now
+                // meaningless — drop it too.
+                self.angle_zero_ref = None;
+                self.angle_zero_at = None;
                 let mut cfg = agent_config::AgentConfig::load();
                 cfg.mag_offset_mg = None;
                 cfg.heading_bias_deg = None;
                 cfg.nose_plus_y = None;
                 cfg.lateral_sign = None;   // clear any stale stored value
+                cfg.angle_zero_ref = None;
+                cfg.angle_zero_at = None;
                 let _ = cfg.save();
                 push_log(&self.log, "compass calibration reset".to_string());
             }
@@ -4049,6 +4202,106 @@ fn triad_world(p: [f64; 3], rows: ([f64; 3], [f64; 3], [f64; 3]), bias_deg: f64)
     let n1 = n0 * b.cos() + e0 * b.sin();
     let e1 = -n0 * b.sin() + e0 * b.cos();
     (n1, e1, d0)
+}
+
+// --- Board angles (pitch / roll / yaw in degrees, for the Live readout) ---
+// Intuitive board attitude in degrees, derived from the gyro+accel filter's
+// `OriRows` (drift-free tilt from the accelerometer, heading carried by the
+// gyroscope) and expressed about the box's PHYSICAL axes as the 3D preview
+// defines them — nose = long axis (Y), up = out of the lid (Z):
+//
+//   • pitch — nose up (+) / down (−): elevation of the nose above horizontal.
+//   • roll  — bank right/starboard (+) / left (−) about the nose axis.
+//   • yaw   — compass azimuth [0,360) the nose points to (render bias applied).
+//
+// Each is a single decoupled physical quantity — NOT a coupled Euler triple —
+// so the signs are individually predictable and the numbers stay intuitive at
+// the modest angles a foil sees (side-stepping the gimbal / axis-order pitfalls
+// a matrix→Euler decomposition would reintroduce). The old accel-only pitch/roll
+// formulas assumed a phone-style frame (long axis = X), so on this box (nose =
+// Y) they SWAPPED pitch and roll — `board_angles` fixes that. Mirrors iOS
+// `BoardAngles.from`.
+#[derive(Clone, Copy)]
+struct BoardAngles {
+    pitch_deg: f64,
+    roll_deg: f64,
+    yaw_deg: f64,
+}
+
+fn board_angles(rows: OriRows, nose_plus_y: bool, bias_deg: f64) -> BoardAngles {
+    let s = if nose_plus_y { 1.0 } else { -1.0 };
+    let world = |p: [f64; 3]| -> [f64; 3] {
+        let (n, e, d) = triad_world(p, (rows.n, rows.e, rows.d), bias_deg);
+        [n, e, d]
+    };
+    let nose = world([0.0, s, 0.0]); // nose axis in world (north, east, down)
+    let up = world([0.0, 0.0, 1.0]); // lid-up axis in world
+
+    // Pitch: elevation of the nose above the horizon (−Down is up).
+    let pitch = (-nose[2]).clamp(-1.0, 1.0).asin().to_degrees();
+
+    // Yaw: compass azimuth of the nose, [0, 360).
+    let mut yaw = nose[1].atan2(nose[0]).to_degrees();
+    if yaw < 0.0 { yaw += 360.0; }
+
+    // Roll (bank about the nose): angle of the box-up axis away from the
+    // vertical plane through the nose. Reference frame in the plane ⟂ nose:
+    // level_up = world-up projected ⟂ nose; right = nose × level_up (starboard).
+    let world_up = [0.0, 0.0, -1.0]; // up = −Down
+    let n_hat = ba_normalize(nose);
+    let dun = tri_dot(world_up, n_hat);
+    let level_up = ba_normalize([
+        world_up[0] - dun * n_hat[0],
+        world_up[1] - dun * n_hat[1],
+        world_up[2] - dun * n_hat[2],
+    ]);
+    let right = tri_cross(n_hat, level_up);
+    let roll = tri_dot(up, right).atan2(tri_dot(up, level_up)).to_degrees();
+
+    BoardAngles { pitch_deg: pitch, roll_deg: roll, yaw_deg: yaw }
+}
+
+/// Normalize a 3-vector; returns `[0,0,1]` if the magnitude is ~0.
+fn ba_normalize(v: [f64; 3]) -> [f64; 3] {
+    let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if m > 1e-9 { [v[0] / m, v[1] / m, v[2] / m] } else { [0.0, 0.0, 1.0] }
+}
+
+/// Wrap a signed degree delta into (−180, 180] — used for the tared yaw.
+/// Mirrors iOS `normDeltaDeg`.
+fn norm_delta_deg(d: f64) -> f64 {
+    let mut v = d % 360.0;
+    if v > 180.0 { v -= 360.0; }
+    if v <= -180.0 { v += 360.0; }
+    v
+}
+
+/// One Pitch / Roll / Yaw line with big monospaced values and the
+/// plain-language axis hints underneath (iOS `angleRow` parity).
+fn board_angle_row(ui: &mut egui::Ui, pitch: f64, roll: f64, yaw: String) {
+    ui.columns(3, |c| {
+        board_angle_cell(&mut c[0], "Pitch", format!("{:+5.1}°", pitch), "up / down hill");
+        board_angle_cell(&mut c[1], "Roll", format!("{:+5.1}°", roll), "lean L / R");
+        board_angle_cell(&mut c[2], "Yaw", yaw, "heading");
+    });
+}
+
+fn board_angle_cell(ui: &mut egui::Ui, name: &str, value: String, hint: &str) {
+    ui.vertical(|ui| {
+        ui.label(egui::RichText::new(name).small().weak());
+        ui.label(egui::RichText::new(value).monospace().strong().size(18.0));
+        ui.label(egui::RichText::new(hint).weak().size(9.0));
+    });
+}
+
+/// "M:SS" elapsed-time text for the "zeroed N ago" note (iOS `agoText`).
+fn ago_text(secs: f64) -> String {
+    let t = secs.max(0.0) as i64;
+    if t < 60 {
+        format!("0:{:02}", t)
+    } else {
+        format!("{}:{:02}", t / 60, t % 60)
+    }
 }
 
 /// Wireframe cuboid rendered from the gyro+accel filter attitude. Fixed

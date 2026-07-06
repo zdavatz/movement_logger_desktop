@@ -67,6 +67,18 @@ pub struct AgentConfig {
     /// Lateral render mirror (+1/-1) from the right-side confirm tap.
     #[serde(default)]
     pub lateral_sign: Option<f64>,
+    /// Calibrated board-angle zero reference `[pitch, roll, yaw]` in
+    /// degrees, captured at the Live tab's "Zero here" tap (yaw sampled at
+    /// bias 0 so the tared heading is direction-cal independent). `None` =
+    /// not zeroed. Persisted so a mounted-box tare survives reconnect / app
+    /// restart. iOS `AgentConfig.angleZeroRef` parity.
+    #[serde(default)]
+    pub angle_zero_ref: Option<[f64; 3]>,
+    /// Wall-clock (epoch seconds) of the last "Zero here" tap — drives the
+    /// "zeroed N ago" note. `None` when never zeroed / after Clear. iOS
+    /// `AgentConfig.angleZeroAtEpoch` parity.
+    #[serde(default)]
+    pub angle_zero_at: Option<f64>,
 }
 
 impl AgentConfig {
