@@ -48,6 +48,15 @@ pub trait SyncHost {
     /// A file finished downloading — auto-route it into the Replay
     /// form slots (no-op for the agent).
     fn on_downloaded(&mut self, name: &str, path: &Path);
+    /// The box's calibration blob arrived (v0.0.37+ firmware, in reply to
+    /// the connect-time CAL_GET the sync engine issues after LIST). The
+    /// GUI merges the box's per-field values into its local
+    /// `AgentConfig` — bits set in the blob win (source of truth for
+    /// this hardware); bits clear leave the local value alone. `None`
+    /// means legacy firmware or a timeout — no-op, the local config
+    /// stays as loaded at startup. The headless agent has no calibration
+    /// state to merge into, so it's a no-op there too.
+    fn on_calibration(&mut self, blob: Option<&[u8; 32]>);
 }
 
 #[derive(Clone, Debug)]
@@ -922,6 +931,38 @@ impl SyncCore {
                         &self.log,
                         format!("ble: box GPS = {}", if on { "on" } else { "off (battery-save)" }),
                     );
+                    /* Chain the connect-time CAL_GET now that the GPS-power
+                       slot has freed: the connect flow is now GET_VERSION →
+                       GET_MODE → GET_GPS_POWER → GET_CAL, each self-guarding
+                       on an idle worker. One-shot per connect on v0.0.37+
+                       firmware and a harmless timeout on legacy (the
+                       CalibrationReq watchdog emits Calibration(None) and
+                       the client keeps its local AgentConfig). Only when
+                       no sync is queued so a live batch's LISTs don't get
+                       displaced. */
+                    if !self.ble_sync_pending {
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::GetCalibration);
+                        }
+                    }
+                }
+                BleEvent::Calibration(maybe_blob) => {
+                    /* Route to the SyncHost so main.rs's GUI impl can
+                       decode and merge into the AppState + AgentConfig.
+                       SyncCore itself doesn't own calibration state (the
+                       agent has none), so this is a pure fan-out here. */
+                    host.on_calibration(maybe_blob.as_ref());
+                    match maybe_blob {
+                        Some(blob) => push_log(
+                            &self.log,
+                            format!("ble: CAL_GET mask=0x{:02X}", blob[1]),
+                        ),
+                        None => push_log(
+                            &self.log,
+                            "ble: CAL_GET no reply (legacy firmware < v0.0.37, keeping local config)"
+                                .into(),
+                        ),
+                    }
                 }
                 BleEvent::DeleteDone { name } => {
                     self.ble_status = format!("deleted {name}");

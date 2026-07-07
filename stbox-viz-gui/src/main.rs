@@ -19,6 +19,7 @@ mod agent_config;
 mod autostart;
 mod ble;
 mod ble_debug;
+mod calibration;
 mod coord;
 mod errlog_check;
 mod installer;
@@ -710,7 +711,18 @@ struct GuiSyncHost<'a> {
     /// only SEEDS the filter's initial heading (iOS parity).
     orientation_filter: &'a mut OrientationFilter,
     ori_rows: &'a mut Option<OriRows>,
-    mag_offset: Option<[f64; 3]>,
+    /// Mag hard-iron offset — mutable so `on_calibration` can merge the
+    /// box's stored copy in on connect (v0.0.37+). `on_sample` clones it
+    /// before handing it to the OrientationFilter seed.
+    mag_offset: &'a mut Option<[f64; 3]>,
+    /// Board-orientation calibration mirrored from box `CAL.CFG` on
+    /// connect via `on_calibration`. All four (three from the desktop's
+    /// per-app UserDefaults + one from AgentConfig) are also mirrored
+    /// back to `AgentConfig` so an offline app-restart still has them.
+    nose_plus_y: &'a mut Option<bool>,
+    heading_bias_deg: &'a mut f64,
+    angle_zero_ref: &'a mut Option<[f64; 3]>,
+    angle_zero_at: &'a mut Option<f64>,
 }
 
 impl SyncHost for GuiSyncHost<'_> {
@@ -739,7 +751,7 @@ impl SyncHost for GuiSyncHost<'_> {
         // Gyro+accel attitude for the 3D preview (mag-independent). The
         // filter is stateful — updated once here per received sample; the
         // egui redraw reads the snapshotted `ori_rows`.
-        self.orientation_filter.update(s, self.mag_offset);
+        self.orientation_filter.update(s, *self.mag_offset);
         *self.ori_rows = self.orientation_filter.rows();
         // Rebase time axis on the first sample so the chart X starts at
         // 0 regardless of how long the box has been booted.
@@ -778,6 +790,61 @@ impl SyncHost for GuiSyncHost<'_> {
             if self.gps_csv.is_none() {
                 *self.gps_csv = guess_gps_for(path);
             }
+        }
+    }
+
+    /// Merge the box's calibration blob into local state + AgentConfig.
+    /// Per-field: bits set on the blob win over the local value (the box
+    /// is the source of truth for the specific hardware — the whole
+    /// point of CAL_GET); bits clear leave the local value alone (host
+    /// keeps whatever's in AgentConfig from a prior offline calibration
+    /// or the app default). On legacy firmware `blob` is `None` and this
+    /// is a no-op.
+    fn on_calibration(&mut self, blob: Option<&[u8; 32]>) {
+        let Some(blob) = blob else { return; };
+        let d = match crate::calibration::decode(blob) {
+            Ok(d) => d,
+            Err(_) => return, // malformed — treat as legacy silence
+        };
+        let mut cfg = crate::agent_config::AgentConfig::load();
+        let mut changed = false;
+        if let Some(pos) = d.nose_plus_y {
+            if *self.nose_plus_y != Some(pos) {
+                *self.nose_plus_y = Some(pos);
+                cfg.nose_plus_y = Some(pos);
+                changed = true;
+            }
+        }
+        if let Some(mo) = d.mag_offset_mg {
+            if *self.mag_offset != Some(mo) {
+                *self.mag_offset = Some(mo);
+                cfg.mag_offset_mg = Some(mo);
+                changed = true;
+            }
+        }
+        if let Some(zr) = d.angle_zero_ref {
+            if *self.angle_zero_ref != Some(zr) {
+                *self.angle_zero_ref = Some(zr);
+                cfg.angle_zero_ref = Some(zr);
+                changed = true;
+            }
+            // Wire format is ms since epoch; AgentConfig stores seconds.
+            let at_s = d.angle_zero_at_epoch_ms.map(|ms| ms as f64 / 1000.0);
+            if *self.angle_zero_at != at_s {
+                *self.angle_zero_at = at_s;
+                cfg.angle_zero_at = at_s;
+                changed = true;
+            }
+        }
+        if let Some(bd) = d.heading_bias_deg {
+            if (*self.heading_bias_deg - bd).abs() > 0.05 {
+                *self.heading_bias_deg = bd;
+                cfg.heading_bias_deg = Some(bd);
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = cfg.save();
         }
     }
 }
@@ -889,6 +956,20 @@ fn spawn_update_check() -> mpsc::Receiver<Option<update::UpdateInfo>> {
 }
 
 impl AppState {
+    /// Push a partial calibration update to the connected box's `CAL.CFG`
+    /// via `CAL_SET` (v0.0.37+ firmware). Called from every local UI tap
+    /// that mutates one of the calibration fields (Zero here / Clear /
+    /// nosePlusY toggle / USB-C south / Wipe compass cal) — only the
+    /// touched field's bit is set in the encoded blob, so the box's
+    /// per-field merge leaves everything else alone. No-op when not
+    /// connected (the UI still mutates local + AgentConfig, and the next
+    /// connect's CAL_GET reconciles the two directions). Legacy firmware
+    /// (< v0.0.37) silently ignores the write.
+    fn push_cal_to_box(&self, input: crate::calibration::EncodeInput) {
+        let Some(b) = self.sync.ble.as_ref() else { return; };
+        let blob = crate::calibration::encode(&input);
+        b.send(ble::BleCmd::SetCalibration { blob });
+    }
 
     fn ensure_ble(&mut self) -> &BleBackend {
         if self.sync.ble.is_none() {
@@ -933,6 +1014,10 @@ impl AppState {
             orientation_filter,
             ori_rows,
             mag_offset,
+            nose_plus_y,
+            heading_bias_deg,
+            angle_zero_ref,
+            angle_zero_at,
             ..
         } = self;
         let mut host = GuiSyncHost {
@@ -948,7 +1033,11 @@ impl AppState {
             gps_csv,
             orientation_filter,
             ori_rows,
-            mag_offset: *mag_offset,
+            mag_offset,
+            nose_plus_y,
+            heading_bias_deg,
+            angle_zero_ref,
+            angle_zero_at,
         };
         sync.pump_ble_events(&mut host);
     }
@@ -3258,6 +3347,19 @@ impl AppState {
                             cfg.angle_zero_ref = Some(r);
                             cfg.angle_zero_at = Some(now);
                             let _ = cfg.save();
+                            /* Also push to the box's CAL.CFG so a "Zero
+                               here" done on the desktop is visible from
+                               iPhone/Android on their next connect (box
+                               is source of truth per DESIGN.md). Only the
+                               angle-zero bit is set, so the box's merge
+                               leaves the other calibration fields alone.
+                               Wire epoch is ms, we store seconds — × 1000
+                               fits comfortably in the u64 slot. */
+                            self.push_cal_to_box(crate::calibration::EncodeInput {
+                                angle_zero_ref: Some(r),
+                                angle_zero_at_epoch_ms: Some((now * 1000.0) as i64),
+                                ..Default::default()
+                            });
                             push_log(&self.log, "board angles: zeroed".to_string());
                         }
                     });
@@ -3290,6 +3392,19 @@ impl AppState {
                                 cfg.angle_zero_ref = None;
                                 cfg.angle_zero_at = None;
                                 let _ = cfg.save();
+                                /* Push a zeros-with-mask-set to the box —
+                                   the merge stores all-zero for the tare
+                                   fields (angleZeroAtEpoch=0 is the
+                                   "never zeroed" sentinel; the ref
+                                   itself reads back as [0,0,0]° via
+                                   `decode`). Any host reading afterwards
+                                   sees no tare, which matches the local
+                                   Clear semantics. */
+                                self.push_cal_to_box(crate::calibration::EncodeInput {
+                                    angle_zero_ref: Some([0.0; 3]),
+                                    angle_zero_at_epoch_ms: Some(0),
+                                    ..Default::default()
+                                });
                             }
                         });
                     } else {
@@ -3407,6 +3522,10 @@ impl AppState {
                 let mut cfg = agent_config::AgentConfig::load();
                 cfg.heading_bias_deg = Some(self.heading_bias_deg);
                 let _ = cfg.save();
+                self.push_cal_to_box(crate::calibration::EncodeInput {
+                    heading_bias_deg: Some(self.heading_bias_deg),
+                    ..Default::default()
+                });
                 push_log(&self.log, "compass: direction set (USB-C = south)".to_string());
             }
         }
@@ -3429,6 +3548,11 @@ impl AppState {
             cfg.nose_plus_y = self.nose_plus_y;
             cfg.heading_bias_deg = Some(self.heading_bias_deg);
             let _ = cfg.save();
+            self.push_cal_to_box(crate::calibration::EncodeInput {
+                nose_plus_y: Some(now),
+                heading_bias_deg: Some(self.heading_bias_deg),
+                ..Default::default()
+            });
         }
 
         ui.horizontal(|ui| {
@@ -3452,6 +3576,20 @@ impl AppState {
                 cfg.angle_zero_ref = None;
                 cfg.angle_zero_at = None;
                 let _ = cfg.save();
+                /* Also wipe the box's copy so a fresh calibration on this
+                   or any other host starts from a clean slate. All four
+                   mask bits are set with all-zero payloads — the merge
+                   overwrites each field to zero, which decode()s back as
+                   the "not calibrated" sentinel (nose=false, offset=0,
+                   ref=[0,0,0]°, epoch=0 → None, bias=0°). Legacy firmware
+                   ignores this silently. */
+                self.push_cal_to_box(crate::calibration::EncodeInput {
+                    nose_plus_y: Some(false),
+                    mag_offset_mg: Some([0.0; 3]),
+                    angle_zero_ref: Some([0.0; 3]),
+                    angle_zero_at_epoch_ms: Some(0),
+                    heading_bias_deg: Some(0.0),
+                });
                 push_log(&self.log, "compass calibration reset".to_string());
             }
             if let Some(off) = self.mag_offset {

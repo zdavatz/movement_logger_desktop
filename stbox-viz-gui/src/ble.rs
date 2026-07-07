@@ -420,6 +420,23 @@ pub enum BleCmd {
     /// legacy firmware never replies (the `GpsPowerReq` op times out and drops
     /// to Idle, leaving the toggle "unknown").
     GetGpsPower,
+    /// CAL_GET opcode `0x13` (firmware v0.0.37+). Box replies with a 32-byte
+    /// calibration blob (nosePlusY, magOffsetMg, angleZeroRef + epoch,
+    /// headingBiasDeg — see `calibration.rs`) → `BleEvent::Calibration(Some)`.
+    /// Twin of `GetLogMode`; legacy firmware silently ignores it, in which
+    /// case the `CalibrationReq` op times out and emits `Calibration(None)`
+    /// so the client falls back to its local `AgentConfig` copy.
+    GetCalibration,
+    /// CAL_SET opcode `0x14` + the 32-byte blob (firmware v0.0.37+). Box
+    /// merges per-field into `CAL.CFG` and replies one status byte → the
+    /// `CalibrationReq` op emits `Calibration(Some(blob))` on OK (with the
+    /// stored copy = what the box will report on next `CAL_GET`) so the
+    /// client can mirror it locally without an extra roundtrip. Legacy
+    /// firmware silently ignores it; the op times out and the client keeps
+    /// its optimistic local update. The caller composes the blob via
+    /// `calibration::encode` — only fields whose `valid_mask` bit is set
+    /// overwrite the stored ones.
+    SetCalibration { blob: [u8; 32] },
 }
 
 #[derive(Clone, Debug)]
@@ -473,6 +490,14 @@ pub enum BleEvent {
     /// active; `false` → in backup mode to save battery. Never emitted on
     /// legacy firmware (< v0.0.35, no reply) — the toggle stays "unknown".
     GpsPower { on: bool },
+    /// Box's calibration blob, from a CAL_GET (0x13) reply or a confirmed
+    /// CAL_SET (0x14) round-trip. `Some(blob)` = the box's current 32-byte
+    /// blob; the receiver should `calibration::decode` it to drive the local
+    /// `AgentConfig` merge (per-field: bits set on the blob win over local,
+    /// bits clear leave the local value alone). `None` = legacy firmware
+    /// (< v0.0.37) didn't reply → op timed out; the client keeps its local
+    /// `AgentConfig` as before, no cross-device sync available.
+    Calibration(Option<[u8; 32]>),
     /// User-facing error — display in the log panel.
     Error(String),
     /// One decoded SensorStream snapshot (0.5 Hz). Only emitted while
@@ -937,6 +962,15 @@ enum CurrentOp {
     /// replies → the toggle stays "unknown"). `on` carries the requested state
     /// so the SET reply knows what to confirm.
     GpsPowerReq { is_set: bool, on: bool, last_progress: Instant },
+    /// CAL_GET (0x13) or CAL_SET (0x14) in flight — waiting for the FileData
+    /// reply (a 32-byte blob for GET, a single status byte for SET). Twin of
+    /// `GettingMode` / `GpsPowerReq`. Legacy firmware (< v0.0.37) never
+    /// replies to either; a stall drops to Idle without reconnecting and
+    /// the client falls back to its local `AgentConfig` copy. `is_set`
+    /// disambiguates the two demux paths; on a SET, `blob` carries the
+    /// payload so it can be re-emitted as `Calibration` (the box's new
+    /// authoritative copy) when the status is OK.
+    CalibrationReq { is_set: bool, blob: [u8; 32], last_progress: Instant },
     /// Firmware upload in flight. Unlike the other ops, the flash is
     /// driven *inline* by `flash_firmware` (it owns the notification
     /// stream for its whole duration and reads each reply with its own
@@ -1227,6 +1261,8 @@ impl WorkerState {
             BleCmd::GpsTx { bytes } => self.gps_tx(bytes).await,
             BleCmd::SetGpsPower { on } => self.set_gps_power(on).await,
             BleCmd::GetGpsPower => self.get_gps_power().await,
+            BleCmd::GetCalibration => self.get_calibration().await,
+            BleCmd::SetCalibration { blob } => self.set_calibration(blob).await,
         }
     }
 
@@ -1844,6 +1880,14 @@ impl WorkerState {
                 // report; the Disconnected handler clears ble_gps_power, so the
                 // toggle re-queries on the next Connect (mirrors GettingMode).
             }
+            CurrentOp::CalibrationReq { .. } => {
+                // Link dropped mid CAL_GET/CAL_SET — the client keeps its local
+                // AgentConfig unchanged. The next Connect re-fetches via
+                // GET_CAL and any queued SET (from a local calibration change
+                // that raced this disconnect) gets sent then. Nothing to
+                // report — a status banner about a mid-teardown calibration
+                // request would just be noise.
+            }
             CurrentOp::Flashing { .. } => {
                 self.emit(BleEvent::FlashError {
                     msg: "firmware upload aborted by disconnect".into(),
@@ -2291,6 +2335,66 @@ impl WorkerState {
             return;
         }
         self.op = CurrentOp::GpsPowerReq { is_set: false, on: false, last_progress: Instant::now() };
+    }
+
+    /// CAL_GET (0x13). Fetch the box's persisted calibration blob so a
+    /// "Zero here" / nosePlusY set on ANY host is visible to this one on
+    /// the next connect. Firmware v0.0.37+; legacy silently ignores it →
+    /// `CalibrationReq` op times out and emits `Calibration(None)`. Best-
+    /// effort like `get_gps_power`: self-guards on `op == Idle`, never
+    /// trampling a LIST/READ; the caller re-queues after the current op
+    /// completes.
+    async fn get_calibration(&mut self) {
+        if !matches!(self.op, CurrentOp::Idle) {
+            return;
+        }
+        if self.peripheral.is_none() {
+            self.emit_err("not connected");
+            return;
+        }
+        if let Err(e) = self.write_cmd(&[0x13]).await {
+            self.emit_err(e);
+            return;
+        }
+        self.op = CurrentOp::CalibrationReq {
+            is_set: false,
+            blob: [0u8; 32],
+            last_progress: Instant::now(),
+        };
+    }
+
+    /// CAL_SET (0x14 + 32-byte blob). Push the per-field-encoded blob
+    /// (see `calibration::encode`) to the box for merge into `CAL.CFG`.
+    /// Box replies one status byte; the `CalibrationReq` op demuxes it
+    /// and, on OK, re-emits `Calibration(Some(blob))` so the client can
+    /// mirror the just-pushed values as authoritative without a second
+    /// GET roundtrip. Rejected while another op is in flight — same as
+    /// `set_gps_power`.
+    async fn set_calibration(&mut self, blob: [u8; 32]) {
+        if self.peripheral.is_none() {
+            self.emit_err("not connected");
+            return;
+        }
+        if !matches!(self.op, CurrentOp::Idle) {
+            self.emit_err("another op is in flight — wait or Disconnect");
+            return;
+        }
+        let mut payload = Vec::with_capacity(1 + blob.len());
+        payload.push(0x14);
+        payload.extend_from_slice(&blob);
+        if let Err(e) = self.write_cmd(&payload).await {
+            self.emit_err(e);
+            return;
+        }
+        self.emit(BleEvent::Status(format!(
+            "CAL_SET sent (mask=0x{:02X})",
+            blob[1]
+        )));
+        self.op = CurrentOp::CalibrationReq {
+            is_set: true,
+            blob,
+            last_progress: Instant::now(),
+        };
     }
 
     // ---------------- Firmware upload (OTA) --------------------------------
@@ -2771,6 +2875,49 @@ impl WorkerState {
                 self.op = CurrentOp::Idle;
                 return;
             }
+            CurrentOp::CalibrationReq { is_set, blob, .. } => {
+                /* Demuxed by `is_set`:
+                   - GET (0x13): 32-byte blob → emit Calibration(Some).
+                     Anything shorter/longer → ignore + drop to Idle so a
+                     stray notify doesn't lock the toggle.
+                   - SET (0x14): 1-byte status. 0x00 OK ⇒ re-emit
+                     Calibration(Some(blob)) with the just-pushed blob so
+                     the receiver mirrors it as authoritative without a
+                     second GET roundtrip. Anything else surfaces as an
+                     error and the client keeps its optimistic local
+                     update (the state on the box is unchanged). */
+                let (is_set, sent) = (*is_set, *blob);
+                if is_set {
+                    if let Some(&b) = n.value.first() {
+                        if b == 0x00 {
+                            self.emit(BleEvent::Calibration(Some(sent)));
+                            self.emit(BleEvent::Status(
+                                format!("CAL_SET OK (mask=0x{:02X})", sent[1])
+                            ));
+                        } else {
+                            let msg = match b {
+                                0xE2 => "IO_ERROR (SD write failed)",
+                                0xE3 => "BAD_REQUEST (wrong-size or wrong-version blob)",
+                                _    => "unknown error",
+                            };
+                            self.emit_err(format!("CAL_SET: {msg} (0x{b:02X})"));
+                        }
+                    }
+                } else {
+                    if n.value.len() == 32 {
+                        let mut out = [0u8; 32];
+                        out.copy_from_slice(&n.value);
+                        self.emit(BleEvent::Calibration(Some(out)));
+                    } else {
+                        // A firmware bug or wire desync — treat as if
+                        // the timeout fired (client falls back to local
+                        // AgentConfig).
+                        self.emit(BleEvent::Calibration(None));
+                    }
+                }
+                self.op = CurrentOp::Idle;
+                return;
+            }
             CurrentOp::Flashing { .. } => {
                 /* The flash drives the stream inline (see `flash_firmware`
                    / `next_filedata`), so a FileData reply never reaches
@@ -2910,6 +3057,7 @@ impl WorkerState {
             CurrentOp::GettingMode { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingVersion { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GpsPowerReq { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
+            CurrentOp::CalibrationReq { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             // A flash is driven inline and never yields to the watchdog
             // (its own per-step timeouts cover stalls), so it's never
             // "stale" here.
@@ -2977,6 +3125,18 @@ impl WorkerState {
                 // Legacy firmware (< v0.0.35) never replies to GPS_POWER /
                 // GPS_GET_POWER. Silently drop to Idle (toggle stays
                 // "unknown"); never reconnect — the link is fine.
+                false
+            }
+            CurrentOp::CalibrationReq { is_set, .. } => {
+                // Legacy firmware (< v0.0.37) never replies to CAL_GET / CAL_SET.
+                // Drop to Idle without reconnecting; on a GET-side timeout emit
+                // Calibration(None) so the client stops waiting and falls back
+                // to its local AgentConfig. On a SET-side timeout stay silent —
+                // the client keeps its optimistic local update, and re-sending
+                // it later is a normal path (not an error to surface).
+                if !is_set {
+                    self.emit(BleEvent::Calibration(None));
+                }
                 false
             }
             // Unreachable in practice (the flash never yields here), but
