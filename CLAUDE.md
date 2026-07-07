@@ -205,6 +205,42 @@ mirror and/or confirmed by adversarial review — don't simplify them away):
   (which IS the csv dir — the agent assigns it to `ble_out_dir` verbatim)
   over the cwd-derived save base.
 
+## Box-sourced board-orientation calibration (v0.0.61+) — `calibration.rs`
+
+The four calibration fields (`nose_plus_y`, `mag_offset_mg`, `angle_zero_ref`
++ `angle_zero_at`, `heading_bias_deg`) live on the BOX in `CAL.CFG`
+(firmware v0.0.37+) — no longer just in `~/.movementlogger/config.toml`.
+Three of them are physical facts of the specific box (which end is the
+nose, hard-iron of *this* magnetometer, the pose the user picked as level
+for *this* board), so the box is the source of truth and every host that
+connects gets the same values.
+
+- **Wire format** (32-byte blob, per-field `valid_mask`, tenths-of-degree
+  fixed point, LE u64 epoch ms): `stbox-viz-gui/src/calibration.rs`
+  (`encode` / `decode`). Byte-for-byte matched by iOS
+  `MovementLogger/BLE/Calibration.swift` and Android
+  `.../ble/Calibration.kt` — the module is the ONLY spec; do not
+  re-derive per-field offsets elsewhere.
+- **On connect**: `SyncCore` chains `BleCmd::GetCalibration` after
+  `GET_GPS_POWER` completes (same self-guarded slot pattern as
+  `GET_MODE` / `GET_VERSION`). Reply → `BleEvent::Calibration(Some(blob))`
+  → `SyncHost::on_calibration` in `main.rs` merges each Some-field into
+  `AppState` + `AgentConfig` (fields the box hasn't set leave the local
+  value alone). Legacy firmware (< v0.0.37) times out silently and
+  emits `Calibration(None)` — the app keeps its local `config.toml`.
+- **On any user-driven tap**: `AppState::push_cal_to_box(EncodeInput)`
+  fires `BleCmd::SetCalibration` with ONLY the touched field's bit set,
+  so the box's per-field merge leaves the other stored fields alone.
+  Call sites: `Zero here` / `Clear` (angle-zero), `USB-C points SOUTH`
+  (heading bias), nose-up confirm (nose + nudged bias in one atomic
+  blob), `Reset calibration` (all four bits with zero payloads =
+  wipe).
+
+**Deliberately not synced**: continuous mag-offset auto-cal. Each host's
+convergence loop would push on every tick and churn `CAL.CFG`. Only the
+explicit `Reset calibration` tap pushes zeros. iOS + Android make the
+same tradeoff.
+
 ## In-app updater — sharp edge
 
 `stbox-viz-gui/src/update.rs` hardcodes the repo it polls for new releases. When importing fixes from `fp-sns-stbox1/Utilities/rust`, the upstream version of this file has `const REPO: &str = "zdavatz/fp-sns-stbox1"` — that is the **firmware** repo, not this one. **Always check this constant after a pull from upstream**:
