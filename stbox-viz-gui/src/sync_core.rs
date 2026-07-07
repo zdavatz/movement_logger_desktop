@@ -207,6 +207,33 @@ pub struct SyncCore {
     /// delete isn't only buried in the log. Cleared on a successful
     /// delete, a new delete attempt, or disconnect.
     pub ble_delete_err: Option<String>,
+    /// Serial DELETE queue. Trash-icon clicks push `(name, attempts_left)`
+    /// here; the head is sent to the worker and the next entry is popped on
+    /// DeleteDone or a DELETE-side error. Required because the worker has
+    /// a single in-flight op slot and rapid clicks otherwise blast the
+    /// "another op in flight" reject storm (log burst → confusion → an
+    /// unanswered notify made the in-flight DELETE look like a hang).
+    /// `attempts_left` = 1 on the initial enqueue, decremented and re-queued
+    /// AT THE FRONT on a 20 s no-notify timeout — that failure mode is
+    /// almost always a lost status notify (the SDFat_Delete on the box did
+    /// succeed), and a second attempt gets NOT_FOUND back cleanly instead
+    /// of leaving the user staring at a "deleting…" row for 20 s and
+    /// nothing to show for it.
+    pub ble_delete_queue: VecDeque<(String, u8)>,
+    /// Name of the DELETE currently sent to the worker (`None` while idle).
+    /// All trash buttons are disabled while `Some(_)` so the user gets clear
+    /// "one at a time" feedback and can't over-queue mid-flight.
+    pub ble_delete_in_flight: Option<String>,
+    /// Attempts remaining on the currently-in-flight DELETE, mirrored from
+    /// the queue tuple so a `DELETE … timed out` error can decide whether
+    /// to retry (attempts_left > 0 → requeue at front, decrement) or bubble
+    /// the failure. Meaningless while `ble_delete_in_flight` is `None`.
+    pub ble_delete_attempts_left: u8,
+    /// When the currently-in-flight DELETE was sent. Backs the `⏳ deleting…
+    /// Xs` counter next to the affected row — makes it obvious the app is
+    /// alive and the box is just slow, instead of the user assuming the GUI
+    /// froze. `None` iff no DELETE is in flight.
+    pub ble_delete_started_at: Option<std::time::Instant>,
     /// Per-boot health report of the mirrored `ERRLOG.LOG`, refreshed
     /// automatically by [`Self::run_errlog_check`] after every sync
     /// pass that touches the errlog and once at startup — so each new
@@ -591,6 +618,9 @@ impl SyncCore {
                     }
                     self.ble_dl_queue.clear();
                     self.ble_dl_in_flight = false;
+                    self.ble_delete_queue.clear();
+                    self.ble_delete_in_flight = None;
+                    self.ble_delete_started_at = None;
                     self.sync_in_flight_name = None;
                     self.sync_pass_total = 0;
                     self.sync_pass_total_bytes = 0;
@@ -897,7 +927,12 @@ impl SyncCore {
                     self.ble_status = format!("deleted {name}");
                     self.ble_files.retain(|f| f.name != name);
                     self.ble_delete_err = None;
+                    if self.ble_delete_in_flight.as_deref() == Some(name.as_str()) {
+                        self.ble_delete_in_flight = None;
+                        self.ble_delete_started_at = None;
+                    }
                     push_log(&self.log, format!("ble: deleted {name}"));
+                    self.advance_delete_queue();
                 }
                 BleEvent::Sample(s) => {
                     host.on_sample(&s);
@@ -958,7 +993,66 @@ impl SyncCore {
                        active → BUSY); without this it only shows in the
                        log and looks like the click did nothing. */
                     if msg.starts_with("DELETE ") {
-                        self.ble_delete_err = Some(msg.clone());
+                        // Classify the failure so we can decide between retry,
+                        // silent-success, and hard-fail. The worker's op slot
+                        // is Idle by the time we get here on all three paths.
+                        let is_timeout   = msg.contains("timed out");
+                        let is_not_found = msg.contains("NOT_FOUND");
+                        // On advance_delete_queue we always decrement:
+                        // INITIAL_ATTEMPTS=2 → first attempt in-flight
+                        // carries attempts_left=1, a retry in-flight carries
+                        // attempts_left=0. So attempts_left==0 == "we are
+                        // currently the retry attempt".
+                        let is_retry_in_flight = self.ble_delete_attempts_left == 0;
+                        let name_in_flight = self.ble_delete_in_flight.clone();
+
+                        if is_timeout && !is_retry_in_flight {
+                            // Almost always a lost status notify — the box's
+                            // SDFat_Delete already ran. Requeue at FRONT so
+                            // the retry beats any pending clicks; a NOT_FOUND
+                            // on that second attempt is the confirmation the
+                            // first one silently succeeded and clears the row.
+                            if let Some(name) = name_in_flight {
+                                self.ble_delete_queue.push_front(
+                                    (name.clone(), self.ble_delete_attempts_left),
+                                );
+                                push_log(
+                                    &self.log,
+                                    format!(
+                                        "ble: DELETE {name} timed out — retrying (notify likely lost)"
+                                    ),
+                                );
+                            }
+                            // Don't set ble_delete_err yet — the retry may
+                            // still succeed. Only bubble the failure after
+                            // the retry also fails.
+                        } else if is_not_found && is_retry_in_flight {
+                            // The retry raced a successful first attempt: the
+                            // file is genuinely gone. Treat as success —
+                            // retain-out the row so the user isn't left with
+                            // a red banner for an operation that actually
+                            // worked. Mirror the DeleteDone housekeeping.
+                            if let Some(name) = name_in_flight.as_deref() {
+                                self.ble_files.retain(|f| f.name != name);
+                                push_log(
+                                    &self.log,
+                                    format!(
+                                        "ble: DELETE {name} confirmed via retry NOT_FOUND (first attempt succeeded)"
+                                    ),
+                                );
+                            }
+                            self.ble_status = "deleted (via retry NOT_FOUND)".into();
+                            self.ble_delete_err = None;
+                        } else {
+                            // Hard failure: real NOT_FOUND on first attempt,
+                            // BAD_REQUEST, BUSY, IO_ERROR, aborted-by-
+                            // disconnect, or a retry that also timed out.
+                            // Surface prominently.
+                            self.ble_delete_err = Some(msg.clone());
+                        }
+                        self.ble_delete_in_flight = None;
+                        self.ble_delete_started_at = None;
+                        self.advance_delete_queue();
                     }
                     /* A READ-side error (NOT_FOUND, BUSY, IO_ERROR, BAD_REQUEST,
                        timeout, disconnect mid-op) ends the in-flight read. Advance
@@ -1084,6 +1178,52 @@ impl SyncCore {
             }
             return;
         }
+    }
+
+    /// Enqueue a DELETE (trash-button click). If the worker is currently
+    /// idle w.r.t. DELETE, kicks off `advance_delete_queue` in the same
+    /// call — otherwise the click will drain naturally when the current
+    /// in-flight DELETE finishes. De-dupes: two rapid clicks on the same
+    /// row won't stack. Trash buttons are disabled globally while
+    /// `ble_delete_in_flight.is_some()`, but this belt-and-braces guard
+    /// also catches a click that raced with a still-rendering frame.
+    /// Attempts granted on a fresh trash-button click: 1 = original attempt,
+    /// then 1 retry on a 20 s no-notify timeout (see `ble_delete_queue`).
+    /// One retry is enough — the almost-always cause of a timeout is a
+    /// lost status notify (the SDFat_Delete on the box did succeed), and
+    /// the second attempt clears the row via NOT_FOUND. A stuck-firmware
+    /// case fails the second attempt the same way and surfaces normally.
+    const INITIAL_DELETE_ATTEMPTS: u8 = 2;
+
+    pub fn enqueue_delete(&mut self, name: String) {
+        if self.ble_delete_in_flight.as_deref() == Some(name.as_str()) { return; }
+        if self.ble_delete_queue.iter().any(|(n, _)| n == &name) { return; }
+        self.ble_delete_queue.push_back((name, Self::INITIAL_DELETE_ATTEMPTS));
+        self.advance_delete_queue();
+    }
+
+    /// Pop the next name off the DELETE queue and send it to the worker.
+    /// No-op if a DELETE is already in flight or the queue is empty. Called
+    /// from `enqueue_delete`, DeleteDone, and the DELETE-side error handler
+    /// so a completed / failed delete triggers the next automatically —
+    /// same shape as `advance_download_queue`.
+    pub fn advance_delete_queue(&mut self) {
+        if self.ble_delete_in_flight.is_some() { return; }
+        let Some((name, attempts_left)) = self.ble_delete_queue.pop_front() else { return; };
+        let Some(b) = self.ble.as_ref() else { return; };
+        b.send(BleCmd::Delete { name: name.clone() });
+        self.ble_delete_in_flight = Some(name.clone());
+        self.ble_delete_attempts_left = attempts_left.saturating_sub(1);
+        self.ble_delete_started_at = Some(std::time::Instant::now());
+        self.ble_delete_err = None;
+        let attempt_num = Self::INITIAL_DELETE_ATTEMPTS - self.ble_delete_attempts_left;
+        push_log(
+            &self.log,
+            format!(
+                "ble: deleting {name} (attempt {attempt_num}/{})",
+                Self::INITIAL_DELETE_ATTEMPTS,
+            ),
+        );
     }
 
     /// Lazily open the sync DB. Returns None (and sets `ble_sync_msg`)

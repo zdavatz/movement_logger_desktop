@@ -1215,6 +1215,25 @@ fn render_file_group(
     indices: &[usize],
     files: &mut [BleFile],
     delete_target: &mut Option<String>,
+    // Serial-DELETE state, snapshotted for the whole file list this frame.
+    // `delete_busy` disables every trash button while a DELETE is anywhere
+    // in the pipeline; `delete_active_name` / `delete_queued_names` tag the
+    // affected rows so the user sees which one is running and which are
+    // waiting instead of the previous "click keeps failing silently" UX.
+    delete_busy: bool,
+    delete_active_name: Option<&str>,
+    delete_queued_names: &std::collections::HashSet<String>,
+    // Elapsed seconds since the in-flight DELETE was sent to the worker
+    // (`None` if no delete is in flight). Rendered as "⏳ deleting… Xs";
+    // ambient timer that reassures the user the app isn't frozen while
+    // the box grinds on a slow SDFat_Delete.
+    delete_elapsed_s: Option<u64>,
+    // True iff the currently-in-flight DELETE is a retry after a 20 s
+    // timeout on the first attempt. Changes the tag from "deleting…" to
+    // "retrying delete…" so the user sees the app is actively recovering
+    // (almost always the second attempt succeeds via NOT_FOUND — the box
+    // did delete the file the first time, we just lost the status notify).
+    delete_is_retry: bool,
 ) {
     if indices.is_empty() { return; }
     /* Header strip with a "Select all" toggle right next to the title —
@@ -1247,6 +1266,8 @@ fn render_file_group(
             ui.label(egui::RichText::new(format!("{:>10} B", f.size)).monospace());
             ui.label(&f.name);
             let busy = f.bytes_done > 0 && !f.downloaded;
+            let is_active_delete  = delete_active_name == Some(f.name.as_str());
+            let is_queued_delete  = delete_queued_names.contains(&f.name);
             match delete_unsupported(&f.name) {
                 Some(reason) => {
                     // Greyed out: the firmware would just reply
@@ -1256,14 +1277,51 @@ fn render_file_group(
                         .on_disabled_hover_text(format!("Can't delete: {reason}"));
                 }
                 None => {
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("🗑").small())
-                        .on_hover_text("Delete this file from the SD card")
-                        .clicked()
-                    {
+                    let enable = !busy && !delete_busy;
+                    let btn = ui
+                        .add_enabled(enable, egui::Button::new("🗑").small());
+                    let btn = if is_active_delete {
+                        btn.on_disabled_hover_text("Deleting this file now…")
+                    } else if is_queued_delete {
+                        btn.on_disabled_hover_text("Queued — will delete after the current one finishes")
+                    } else if delete_busy {
+                        btn.on_disabled_hover_text("Another delete is in flight — one at a time")
+                    } else {
+                        btn.on_hover_text("Delete this file from the SD card")
+                    };
+                    if btn.clicked() {
                         *delete_target = Some(f.name.clone());
                     }
                 }
+            }
+            // Visible in-flight tag for the file whose DELETE the worker
+            // is currently running. Includes a live elapsed-seconds
+            // counter + attempt indicator so the user sees the app is
+            // alive (a static "deleting…" was reliably misread as "hung")
+            // AND that a retry is happening automatically after a 20 s
+            // no-notify timeout — no dumb "Skip" button, the DELETE is
+            // actually going to succeed. Colour ramp:
+            //   <5 s : amber      — normal
+            //  5–9 s : orange     — slow but plausible
+            //  ≥10 s : red        — timeout approaching; auto-retry
+            //                       will fire at 20 s
+            if is_active_delete {
+                let secs = delete_elapsed_s.unwrap_or(0);
+                let colour = if secs >= 10 {
+                    egui::Color32::from_rgb(220, 80, 70)
+                } else if secs >= 5 {
+                    egui::Color32::from_rgb(230, 140, 50)
+                } else {
+                    egui::Color32::from_rgb(210, 170, 60)
+                };
+                let label = if delete_is_retry {
+                    format!("⏳ retrying delete… {secs}s")
+                } else {
+                    format!("⏳ deleting… {secs}s")
+                };
+                ui.colored_label(colour, egui::RichText::new(label).strong());
+            } else if is_queued_delete {
+                ui.weak(egui::RichText::new("queued"));
             }
             if f.downloaded {
                 /* Clear "downloaded" badge. Earlier code used `✓` U+2713,
@@ -1906,6 +1964,36 @@ impl AppState {
                         // button below. Adapts to window height; a floor keeps
                         // it usable when the window is very short.
                         let list_height = (ui.available_height() - 40.0).max(120.0);
+                        // Snapshot the DELETE queue state for the row renderer:
+                        // any in-flight or queued name disables ALL trash
+                        // buttons + tags the affected rows. Prevents the click
+                        // storm that produced 8× "another op is in flight"
+                        // errors + one 20-s DELETE timeout on the last run.
+                        let delete_active_name: Option<String> =
+                            self.sync.ble_delete_in_flight.clone();
+                        let delete_queued_names: std::collections::HashSet<String> =
+                            self.sync.ble_delete_queue
+                                .iter()
+                                .map(|(n, _)| n.clone())
+                                .collect();
+                        let delete_busy = delete_active_name.is_some()
+                            || !delete_queued_names.is_empty();
+                        // Elapsed seconds for the in-flight DELETE (rendered
+                        // next to its row as "⏳ deleting… Xs"). Makes it
+                        // obvious the app is alive while the box is chewing
+                        // on a slow DELETE — the same static ⏳ next to a
+                        // 12-file batch was reliably misread as "hung".
+                        let delete_elapsed_s: Option<u64> =
+                            self.sync.ble_delete_started_at
+                                .map(|t| t.elapsed().as_secs());
+                        // Retry indicator: `advance_delete_queue` sets
+                        // `ble_delete_attempts_left = 0` when the current
+                        // in-flight is the auto-retry after a timeout (see
+                        // INITIAL_DELETE_ATTEMPTS=2). Row tag then reads
+                        // "retrying delete…" instead of "deleting…".
+                        let delete_is_retry =
+                            self.sync.ble_delete_in_flight.is_some()
+                                && self.sync.ble_delete_attempts_left == 0;
                         egui::ScrollArea::vertical()
                             .max_height(list_height)
                             // Use the full window width for the list (don't
@@ -1920,6 +2008,11 @@ impl AppState {
                                     &sensor_idx,
                                     &mut self.sync.ble_files,
                                     &mut delete_target,
+                                    delete_busy,
+                                    delete_active_name.as_deref(),
+                                    &delete_queued_names,
+                                    delete_elapsed_s,
+                                    delete_is_retry,
                                 );
                                 ui.add_space(4.0);
                                 render_file_group(
@@ -1928,18 +2021,22 @@ impl AppState {
                                     &debug_idx,
                                     &mut self.sync.ble_files,
                                     &mut delete_target,
+                                    delete_busy,
+                                    delete_active_name.as_deref(),
+                                    &delete_queued_names,
+                                    delete_elapsed_s,
+                                    delete_is_retry,
                                 );
                             });
-                        /* Defer the BLE send out of the row closure to keep
-                           the borrow of self.sync.ble_files local. The firmware
-                           rejects DELETE while logging is active (BUSY); the
-                           error surfaces via BleEvent::Error in the log. */
+                        /* Trash-click → enqueue on the serial DELETE queue.
+                           `enqueue_delete` de-dupes, sends immediately if the
+                           worker is idle, otherwise drains on DeleteDone /
+                           DELETE-error. The firmware rejects DELETE while
+                           logging is active (BUSY); the error surfaces via
+                           BleEvent::Error in the log AND clears the in-flight
+                           slot so the next queued entry gets its turn. */
                         if let Some(name) = delete_target {
-                            if let Some(b) = self.sync.ble.as_ref() {
-                                b.send(BleCmd::Delete { name: name.clone() });
-                                self.sync.ble_delete_err = None; // clear stale failure on a fresh attempt
-                                push_log(&self.log, format!("ble: deleting {name}"));
-                            }
+                            self.sync.enqueue_delete(name);
                         }
 
                         ui.add_space(4.0);
@@ -3224,28 +3321,53 @@ impl AppState {
                 .unwrap_or(true);
             ui.add_space(8.0);
             let pct = b.soc_pct();
+            // Charging = current flowing INTO the pack. 50 mA threshold so
+            // a discharging box under near-idle load doesn't false-positive
+            // on measurement noise around 0.
+            let charging = b.amps() > 0.05;
             // Same red<20 / yellow<40 / green ramp as the C/N0 row above.
             let fill = if pct < 20 { egui::Color32::from_rgb(200, 70, 70) }
                        else if pct < 40 { egui::Color32::from_rgb(210, 170, 60) }
                        else { egui::Color32::from_rgb(70, 170, 90) };
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Battery").strong());
+                // Prominent charging bolt right next to the label so
+                // "is the box charging?" is answerable at a glance,
+                // without parsing the "+0.28 A" sign in the meter text.
+                if charging {
+                    ui.label(
+                        egui::RichText::new("⚡")
+                            .size(18.0)
+                            .color(egui::Color32::from_rgb(255, 200, 60))
+                            .strong(),
+                    )
+                    .on_hover_text("Charging — current flowing INTO the pack");
+                }
                 ui.add(
                     egui::ProgressBar::new(b.soc_frac())
                         .desired_width(360.0)
                         .fill(fill)
                         .text(format!(
-                            "{}%  ·  {:.2} V  ·  {:+.2} A{}",
+                            "{}%  ·  {:.2} V  ·  {:+.2} A{}{}",
                             pct,
                             b.volts(),
                             b.amps(),
+                            if charging { "  ·  ⚡ charging" } else { "" },
                             if stale { "  · stale" } else { "" },
                         )),
                 );
             });
             if b.low_batt {
-                ui.colored_label(egui::Color32::LIGHT_RED,
-                    "⚠ low battery (< 10 %) — charge the box; GPS may lose fix");
+                // While a wireless charger is on the pad, telling the operator
+                // to "charge the box" is nonsense — they already are. Keep the
+                // still-below-10 % warning (GPS may brown out until it's up)
+                // but reword it so the message matches the physics.
+                let msg = if charging {
+                    "⚡ low battery (< 10 %) — charging; keep it on the pad until above 10 %"
+                } else {
+                    "⚠ low battery (< 10 %) — charge the box; GPS may lose fix"
+                };
+                ui.colored_label(egui::Color32::LIGHT_RED, msg);
             }
         }
 
@@ -3425,12 +3547,19 @@ impl eframe::App for AppState {
             // stuck in an (Auto Mode: unbounded) reconnect loop.
             b.request_abort();
             b.send(BleCmd::Disconnect);
-            /* Give the worker thread ~250 ms to actually emit the
-               disconnect over the air before the process exits. Not
-               a guarantee — btleplug's per-platform stack may need
-               longer — but enough on macOS Core Bluetooth in
-               practice. */
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            /* Wait for the worker to actually finish disconnect_inner
+               and emit BleEvent::Disconnected — that is, `0x0F WithResponse`
+               to the box + the local `p.disconnect()`. The old 250 ms
+               fixed sleep was reliably too short: on a loaded CoreBluetooth
+               stack the 0x0F round-trip alone can take longer, so app-quit
+               (and therefore app-restart) routinely left the box stranded
+               connected-in-limbo. 3 s is the sum of the two 3 s worst-case
+               timeouts inside disconnect_inner; healthy paths return in a
+               couple hundred ms and we exit early. */
+            let clean = b.await_disconnected(std::time::Duration::from_millis(3000));
+            eprintln!(
+                "[on_exit] clean disconnect confirmed={clean} — process exiting"
+            );
         }
         /* Release adapter ownership so a background agent can resume
            the mirror as soon as the GUI is gone. Dropping the guards

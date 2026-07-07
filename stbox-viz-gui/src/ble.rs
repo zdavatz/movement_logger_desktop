@@ -725,6 +725,33 @@ impl BleBackend {
         }
         out
     }
+
+    /// Block up to `timeout` for the worker to emit `BleEvent::Disconnected`
+    /// (or for the worker channel to close). Any other events that arrive in
+    /// the meantime are drained silently — the caller is presumed to be on
+    /// the shutdown/relaunch path where the UI can't consume them anyway.
+    /// Returns `true` if we observed a clean disconnect, `false` if we timed
+    /// out (in which case the box is likely still connected-in-limbo and only
+    /// its 90 s peer-gone watchdog will free it).
+    ///
+    /// Used by `on_exit` in place of a blind sleep: the fixed 250 ms wait was
+    /// too short for a healthy `0x0F WithResponse` round-trip on a loaded
+    /// CoreBluetooth stack, so app-quit / app-relaunch routinely left the box
+    /// stranded — the exact "still no clean disconnect on restart" symptom.
+    pub fn await_disconnected(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(d) if !d.is_zero() => d,
+                _ => return false,
+            };
+            match self.evt_rx.recv_timeout(remaining) {
+                Ok(BleEvent::Disconnected) => return true,
+                Ok(_) => continue,
+                Err(_) => return false, // timeout or worker gone
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
