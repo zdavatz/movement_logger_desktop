@@ -193,6 +193,14 @@ pub struct SyncCore {
     /// Set when the supervisor forces a teardown; the `Disconnected`
     /// handler consumes it to fire the follow-up re-Connect.
     pub supervisor_reconnect_id: Option<String>,
+    /// A GPS-power toggle clicked while a sync pass / download was busy
+    /// (v0.0.65). Sending 0x11 mid-pass grabs the single-op slot in the gap
+    /// between two files, bounces the next queued READ ("another op is in
+    /// flight") and wedges the pass — "clicking GPS off while file sync
+    /// kills the file sync". Parked here instead and sent by
+    /// `tick_pending_gps` only once the pass has fully drained. The GUI
+    /// keeps its optimistic toggle; the box's status reply reconciles.
+    pub pending_gps_power: Option<bool>,
     /// One-line sync result/status ("Sync: 3 new, 12 already synced —
     /// downloading…"), shown in the Sync tab. Empty = no sync yet.
     pub ble_sync_msg: String,
@@ -597,6 +605,36 @@ impl SyncCore {
         if let Some(b) = self.ble.as_ref() {
             b.request_abort();
             b.send(BleCmd::Disconnect);
+        }
+    }
+
+    /// Send a parked GPS-power toggle (see `pending_gps_power`) once the
+    /// sync engine is fully drained — connected, nothing in flight, nothing
+    /// queued, no pass pending. Called from the same ~1 Hz ticks as the
+    /// transfer supervisor (GUI update + agent loop).
+    pub fn tick_pending_gps(&mut self) {
+        if self.pending_gps_power.is_none() {
+            return;
+        }
+        if !matches!(self.ble_state, BleState::Connected) {
+            return; // keep it parked; re-sent after the reconnect drains
+        }
+        let busy = self.ble_dl_in_flight
+            || self.ble_sync_pending
+            || !self.ble_dl_queue.is_empty()
+            || self.ble_delete_in_flight.is_some();
+        if busy {
+            return;
+        }
+        if let (Some(on), Some(b)) = (self.pending_gps_power.take(), self.ble.as_ref()) {
+            b.send(BleCmd::SetGpsPower { on });
+            push_log(
+                &self.log,
+                format!(
+                    "ble: sending queued GPS_POWER {} (sync drained)",
+                    if on { "on" } else { "off" }
+                ),
+            );
         }
     }
 

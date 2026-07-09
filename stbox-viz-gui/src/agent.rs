@@ -185,6 +185,7 @@ fn run_session(
         // in the headless agent too, or it mirrors nothing until the
         // next login.
         sc.tick_transfer_supervisor();
+        sc.tick_pending_gps();
 
         match sc.ble_state {
             BleState::Idle | BleState::Scanning if sc.ble.is_some() => {

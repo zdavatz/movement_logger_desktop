@@ -1752,12 +1752,14 @@ impl AppState {
                         .clicked()
                         && gps != Some(true)
                     {
-                        if let Some(b) = self.sync.ble.as_ref() {
-                            b.send(BleCmd::SetGpsPower { on: true });
-                        }
+                        // Park behind the sync engine (v0.0.65): a 0x11 sent
+                        // mid-pass grabs the op slot between two queued files
+                        // and wedges the pass. tick_pending_gps sends it the
+                        // moment the pass drains.
+                        self.sync.pending_gps_power = Some(true);
                         // Optimistic — the box's GpsPower reply reconciles.
                         self.sync.ble_gps_power = Some(true);
-                        push_log(&self.log, "ble: GPS_POWER on sent".into());
+                        push_log(&self.log, "ble: GPS_POWER on queued".into());
                     }
                     if ui
                         .add_enabled(
@@ -1768,11 +1770,10 @@ impl AppState {
                         .clicked()
                         && gps != Some(false)
                     {
-                        if let Some(b) = self.sync.ble.as_ref() {
-                            b.send(BleCmd::SetGpsPower { on: false });
-                        }
+                        // Same parking as the On button — see tick_pending_gps.
+                        self.sync.pending_gps_power = Some(false);
                         self.sync.ble_gps_power = Some(false);
-                        push_log(&self.log, "ble: GPS_POWER off sent".into());
+                        push_log(&self.log, "ble: GPS_POWER off queued".into());
                     }
                     ui.label(
                         egui::RichText::new(match gps {
@@ -3789,6 +3790,8 @@ impl eframe::App for AppState {
         // Outer transfer safety net (see tick_transfer_supervisor): runs
         // ~1 Hz via the repaint timer below while connected.
         self.sync.tick_transfer_supervisor();
+        // Parked GPS-power toggle — sent once the sync engine drains.
+        self.sync.tick_pending_gps();
         if matches!(self.sync.ble_state, BleState::Connected) {
             // Keep ticking so the Keep-synced poll fires without user
             // input — and so the worker's auto-reconnect Status lines

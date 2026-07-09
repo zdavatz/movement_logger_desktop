@@ -940,6 +940,16 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
                     state.write_set_mode(manual).await;
                 }
             }
+            // Same deferral for a GPS-power click that landed mid-transfer
+            // (v0.0.65). Applied only when the op slot is free — set_gps_power
+            // takes the GpsPowerReq slot for the box's status reply, so this
+            // naturally waits its turn behind the SET_MODE write above.
+            if let Some(on) = state.pending_set_gps {
+                if matches!(state.op, CurrentOp::Idle) && state.peripheral.is_some() {
+                    state.pending_set_gps = None;
+                    state.set_gps_power(on).await;
+                }
+            }
         } else {
             // Not connected: only commands matter. arx.recv() returns
             // None when every BleBackend handle is dropped → process
@@ -1085,6 +1095,11 @@ struct WorkerState {
     /// appended into the in-flight download; applied by the worker loop once
     /// `op` returns to Idle.
     pending_set_mode: Option<bool>,
+    /// A GPS-power change (0x11) requested while the worker was mid-LIST/READ.
+    /// Deferred exactly like `pending_set_mode` — a rejected click was silently
+    /// lost behind the GUI's optimistic toggle (v0.0.65). Applied by the worker
+    /// loop once `op` returns to Idle (takes the GpsPowerReq slot then).
+    pending_set_gps: Option<bool>,
     /// OS "stay awake / no App Nap" assertion, held for the whole connected
     /// session **including** auto-reconnect windows (mirrors iOS's
     /// background-task assertion / Android's foreground service). `Some`
@@ -1122,6 +1137,7 @@ impl WorkerState {
             last_id: None,
             shared,
             pending_set_mode: None,
+            pending_set_gps: None,
             power: None,
             read_ride_out_logged: false,
             read_rate_mark: None,
@@ -2349,7 +2365,19 @@ impl WorkerState {
             return;
         }
         if !matches!(self.op, CurrentOp::Idle) {
-            self.emit_err("another op is in flight — wait or Disconnect");
+            // Mid-LIST/READ: defer like SET_MODE (v0.0.65). Rejecting here
+            // silently LOST the click during an active sync (READs are
+            // nearly always in flight then): the GUI had already flipped
+            // the toggle optimistically, so "GPS Off" looked set but the
+            // box never received 0x11 — after an app restart the re-query
+            // showed the truth ("GPS off does not survive a restart").
+            // The worker loop applies this the moment `op` returns to
+            // Idle; the box's status reply then reconciles the GUI.
+            self.pending_set_gps = Some(on);
+            self.emit(BleEvent::Status(format!(
+                "GPS_POWER {} queued — applies when the current transfer finishes",
+                if on { "on" } else { "off" }
+            )));
             return;
         }
         if let Err(e) = self.write_cmd(&[0x11, on as u8]).await {
