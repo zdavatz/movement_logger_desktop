@@ -3908,9 +3908,26 @@ impl eframe::App for AppState {
             self.render_fw_banner(ui);
 
             match self.current_tab {
-                Tab::Live     => { self.ui_live_tab(ui);     return; }
+                Tab::Live     => {
+                    // The Live tab stacks readouts + Board angles + Battery +
+                    // Box orientation + the 3D cube, which together outgrow a
+                    // short window (the cube clipped off-screen). Scroll the
+                    // whole tab so nothing is unreachable — mirrors the Debug
+                    // tab's wrapper.
+                    egui::ScrollArea::vertical()
+                        .id_salt("live_tab_scroll")
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| self.ui_live_tab(ui));
+                    return;
+                }
                 Tab::Sync     => { self.ui_sync_tab(ui);     return; }
-                Tab::Firmware => { self.ui_firmware_tab(ui); return; }
+                Tab::Firmware => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("firmware_tab_scroll")
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| self.ui_firmware_tab(ui));
+                    return;
+                }
                 Tab::Debug    => { self.ui_debug_tab(ui);    return; }
                 Tab::Replay   => { /* fall through to original layout */ }
             }

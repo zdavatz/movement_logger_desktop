@@ -114,26 +114,35 @@ const BATTERY_UUID:  Uuid = Uuid::from_u128(0x00000200_0010_11e1_ac36_0002a5d5c5
 /// left staring at "running…" forever (e.g. after a drop-out the box
 /// reconnects but our subscription went stale).
 const OP_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
-/// READ-specific stall tolerance. A file READ streams thousands of notifies
-/// over minutes; macOS CoreBluetooth legitimately *pauses* delivery for many
-/// seconds under sustained load (BT power-nap, the app briefly backpressured
-/// while flushing the growing mirror to disk). The old shared 20 s tore the
-/// link down mid-pause — the box saw `reason=0x13` (WE disconnected), the
-/// transfer churned, and large files never converged (evidence: firmware
-/// errlog `SENS012.CSV aborted why=stall` at varying offsets, `disconnected
-/// reason=0x13` — recorded with retrieve-by-id + byte-resume ALREADY shipped,
-/// so "fast lossless reconnect" does not make 20 s safe; a briefly-tried
-/// 20 s revert on 2026-07-02 was rolled back for exactly that history).
-/// Ride the pause out instead: 45 s matches the firmware's own READ-stall
-/// deadline (`FSM_READ_STALL_DEADLINE_MS` = 45 000 — NOT the 15 s
-/// `FSM_STALL_DEADLINE_MS`, which applies only to FW_RECV), so a transient
-/// pause resumes on the SAME link while a genuinely dead peer is still
-/// caught. A real *remote* disconnect no longer waits this long at all: the
-/// CentralEvent::DeviceDisconnected sweep fires within ~200 ms of macOS
-/// reporting it (see `central_rx`) — this timeout only covers the silent
-/// both-sides-think-connected stall. LIST keeps the tighter 20 s
-/// (OP_IDLE_TIMEOUT); its stall handling is tuned separately.
+/// READ ride-out: how long a READ may go with ZERO notify progress before we
+/// *note* it (a macOS notify pause). We do NOT tear the link down here — see
+/// `READ_RIDE_OUT_LIMIT`. A file READ streams thousands of notifies over
+/// minutes; macOS CoreBluetooth routinely *parks* delivery for tens of seconds
+/// under sustained load while keeping the LL link fully alive (it time-shares
+/// the 2.4 GHz radio across Wi-Fi + every other BLE peripheral and
+/// deprioritises a "background" box). iOS/Android don't park like this, so
+/// they sync straight through — this is a macOS-only artefact.
+///
+/// v0.0.62 — RIDE OUT, don't reconnect. The old design tore the link down when
+/// this elapsed (the box then saw `reason=0x13`, re-adv=211, minute-long
+/// gaps). But the link is NOT dead during a park: the box (fw v0.0.39) holds
+/// the segment and resumes the instant macOS drains again, so the SAME stream
+/// just continues — no teardown, no reconnect, no 211. A genuinely dead peer
+/// is signalled by the `CentralEvent::DeviceDisconnected` sweep (`central_rx`
+/// → `lost_link_recover`, ~200 ms after macOS reports it), NOT by silence.
+/// This value is now only the point at which we emit a one-shot "riding out"
+/// status line for visibility; teardown happens only at `READ_RIDE_OUT_LIMIT`.
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// READ last-resort: absolute cap on a notify-parked READ before we give up on
+/// the live link and fall back to teardown + auto-reconnect (byte-resume from
+/// the mirror). Sits ABOVE the box's own 180 s READ-stall deadline
+/// (`FSM_READ_STALL_DEADLINE_MS`, fw v0.0.39), so in the normal case the box
+/// recovers first and macOS reports `DeviceDisconnected` — which reconnects us
+/// via `central_rx` well before this fires. This only covers the pathological
+/// "LL link stays up but data never resumes AND the box never reports a
+/// disconnect" corner; without it a wedged READ could hang forever.
+const READ_RIDE_OUT_LIMIT: Duration = Duration::from_secs(200);
 
 /// Chunk a long file READ into fixed-size segments instead of one to-EOF
 /// stream (v0.0.48). Each segment is a separate capped READ opcode
@@ -882,15 +891,17 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
                 }
                 _ = &mut watchdog => {
                     if state.tick_watchdog() {
-                        // A READ stalled but CoreBluetooth still thinks
-                        // it's connected (no stream close). Tear the
-                        // half-dead link down ourselves (0x0F best-effort
-                        // frees the box if the ACL is only app-dead) and
-                        // auto-reconnect so the mirror resume continues —
-                        // the box never saw a formal disconnect here.
-                        // tick_watchdog already emitted ReadAborted
-                        // (partial saved) + the timeout error, op = Idle.
-                        state.lost_link_recover("READ stalled — reconnecting").await;
+                        // v0.0.62: tick_watchdog returns true ONLY at the READ
+                        // last-resort (READ_RIDE_OUT_LIMIT, 200 s) — a shorter
+                        // notify-park is now ridden out on the live link (see
+                        // tick_watchdog). Reaching here means data never
+                        // resumed AND macOS never surfaced a DeviceDisconnected,
+                        // so we tear the half-dead link down ourselves (0x0F
+                        // best-effort frees the box if the ACL is only app-dead)
+                        // and auto-reconnect so the mirror resume continues.
+                        // tick_watchdog already emitted ReadAborted (partial
+                        // saved) + the error, op = Idle.
+                        state.lost_link_recover("READ ride-out limit — reconnecting").await;
                     }
                 }
             }
@@ -1058,6 +1069,11 @@ struct WorkerState {
     /// `disconnect_inner`, or the Mac could sleep during a reconnect gap.
     /// See `power.rs`.
     power: Option<crate::power::PowerGuard>,
+    /// One-shot guard so the "READ notify-parked — riding out" status line is
+    /// emitted once per pause, not every 200 ms watchdog tick. Reset when a
+    /// READ makes progress (idle drops below `READ_STALL_TIMEOUT`) or a new
+    /// READ starts. See `tick_watchdog`.
+    read_ride_out_logged: bool,
 }
 
 impl WorkerState {
@@ -1078,6 +1094,7 @@ impl WorkerState {
             shared,
             pending_set_mode: None,
             power: None,
+            read_ride_out_logged: false,
         }
     }
 
@@ -2090,6 +2107,7 @@ impl WorkerState {
             last_progress: Instant::now(),
             first_packet: true,
         };
+        self.read_ride_out_logged = false;
         self.emit(BleEvent::ReadStarted { name, size });
     }
 
@@ -3050,9 +3068,50 @@ impl WorkerState {
             }
         }
 
+        // READ ride-out (v0.0.62). A notify-parked READ is NOT torn down on
+        // silence. macOS routinely parks the notify drain for tens of seconds
+        // while keeping the LL link fully alive; the box (fw v0.0.39) holds the
+        // in-flight segment and resumes the instant macOS drains again, so the
+        // SAME stream just continues — no teardown, no reconnect, no
+        // re-adv=211. A REAL remote disconnect is caught by the
+        // DeviceDisconnected sweep (`central_rx` → `lost_link_recover`), NOT by
+        // silence. We only *note* the pause once (for visibility) and keep the
+        // Reading op alive; only `READ_RIDE_OUT_LIMIT` (200 s, above the box's
+        // 180 s) falls through to the teardown+reconnect below, for the
+        // pathological "link up but data dead AND box never reports a
+        // disconnect". `read_idle` is Copy so no self.op borrow is held.
+        let read_idle: Option<Duration> =
+            if let CurrentOp::Reading { last_progress, .. } = &self.op {
+                Some(now.duration_since(*last_progress))
+            } else {
+                None
+            };
+        if let Some(idle) = read_idle {
+            if idle < READ_STALL_TIMEOUT {
+                self.read_ride_out_logged = false; // fresh / progressing
+                return false;
+            }
+            if idle < READ_RIDE_OUT_LIMIT {
+                if !self.read_ride_out_logged {
+                    self.read_ride_out_logged = true;
+                    let name = if let CurrentOp::Reading { name, .. } = &self.op {
+                        name.clone()
+                    } else {
+                        String::new()
+                    };
+                    self.emit(BleEvent::Status(format!(
+                        "READ {name}: macOS paused the notify drain — riding out on the live link (no reconnect)"
+                    )));
+                }
+                return false;
+            }
+            // idle >= READ_RIDE_OUT_LIMIT → last resort: fall through to the
+            // teardown below (the box's 180 s should already have recovered).
+        }
+
         let stale = match &self.op {
             CurrentOp::Listing  { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
-            CurrentOp::Reading  { last_progress, .. } => now.duration_since(*last_progress) > READ_STALL_TIMEOUT,
+            CurrentOp::Reading  { last_progress, .. } => now.duration_since(*last_progress) > READ_RIDE_OUT_LIMIT,
             CurrentOp::Deleting { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingMode { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingVersion { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
@@ -3097,10 +3156,15 @@ impl WorkerState {
                     content,
                     base,
                 });
+                // Last resort only: we rode the pause out for READ_RIDE_OUT_LIMIT
+                // (200 s) on a still-"connected" link and data never resumed —
+                // the box's own 180 s recovery didn't surface a DeviceDisconnected
+                // either. Give up on the live link and reconnect + byte-resume.
                 self.emit_err(format!(
-                    "READ {name} timed out at {got}/{expected} B — no notifies for 45 s"
+                    "READ {name} parked at {got}/{expected} B for {}s — giving up on the live link, reconnecting",
+                    READ_RIDE_OUT_LIMIT.as_secs()
                 ));
-                true // stalled READ → caller reconnects + resumes
+                true // wedged READ → caller reconnects + resumes
             }
             CurrentOp::Deleting { name, .. } => {
                 self.emit_err(format!("DELETE {name} timed out — no notify for 20 s"));
