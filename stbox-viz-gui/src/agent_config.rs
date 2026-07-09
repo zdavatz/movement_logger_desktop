@@ -79,6 +79,13 @@ pub struct AgentConfig {
     /// `AgentConfig.angleZeroAtEpoch` parity.
     #[serde(default)]
     pub angle_zero_at: Option<f64>,
+    /// Last box-confirmed GPS power state (`Some(false)` = the user
+    /// deliberately runs the box with GPS off). Used at launch — before a
+    /// box has answered GET_GPS_POWER — to keep suppressing the "GPS gave
+    /// no signal at power-on" health badge across app restarts. Updated
+    /// whenever the box's GpsPower reply arrives.
+    #[serde(default)]
+    pub gps_power: Option<bool>,
     /// UI zoom factor from the top-bar A+/A− font-size buttons (1.0 =
     /// default). Persisted so the user's chosen size survives a restart.
     /// Clamped to [0.6, 3.0] on both write (button handlers) and read

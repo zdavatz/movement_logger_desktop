@@ -186,6 +186,7 @@ fn run_session(
         // next login.
         sc.tick_transfer_supervisor();
         sc.tick_pending_gps();
+        sc.tick_read_retry();
 
         match sc.ble_state {
             BleState::Idle | BleState::Scanning if sc.ble.is_some() => {

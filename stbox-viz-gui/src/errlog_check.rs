@@ -134,6 +134,75 @@ impl BootReport {
             Severity::Fail => "FAIL",
         }
     }
+
+    /// True when EVERY finding at the boot's worst severity is the
+    /// "GPS silent at power-on" pattern (no baud lock / gps init FAIL).
+    /// Used to suppress the health badge while the box reports its GPS
+    /// deliberately powered off — expected silence is not a fault. Any
+    /// other co-occurring finding at the same severity (watchdog reset,
+    /// BLE trouble, …) keeps the badge visible.
+    pub fn fail_is_only_gps_silence(&self) -> bool {
+        let v = self.verdict();
+        if v == Severity::Info {
+            return false;
+        }
+        self.findings
+            .iter()
+            .filter(|f| f.severity == v)
+            .all(|f| {
+                let l = f.msg.to_lowercase();
+                // The GPS-init failure path emits a FAMILY of markers, two of
+                // which never mention "gps" ("factory-reset the module via
+                // u-center…", "module is sending, we can't decode — check
+                // UART baud/wiring") — they must count as GPS-silence too or
+                // this all() can never be true on a real silent-GPS boot.
+                l.contains("gps")
+                    || l.contains("no baud lock")
+                    || l.contains("nmea")
+                    || l.contains("u-center")
+                    || l.contains("module is sending")
+            })
+    }
+
+    /// One-line human-readable reason for a non-OK verdict — what actually
+    /// failed, in words a user can act on, not a checker-internal marker
+    /// string ("Box health: latest boot FAIL" alone had no value). Maps the
+    /// worst finding onto plain language; falls back to the finding's raw
+    /// message for cases without a mapping. `None` when the boot is healthy.
+    pub fn human_reason(&self) -> Option<String> {
+        let worst = self
+            .findings
+            .iter()
+            .filter(|f| f.severity == self.verdict())
+            .map(|f| f.msg.as_str())
+            .next()?;
+        if self.verdict() == Severity::Info {
+            return None;
+        }
+        let lower = worst.to_lowercase();
+        let human = if lower.contains("no baud lock")
+            || (lower.contains("gps") && lower.contains("init fail"))
+        {
+            "GPS gave no signal at power-on (receiver off/asleep, or check the GPS wiring)"
+                .to_string()
+        } else if lower.contains("iwdg") || lower.contains("wwdg") {
+            "the box firmware hung and the watchdog auto-restarted it".to_string()
+        } else if lower.contains("9600") && lower.contains("fallback") {
+            "GPS stuck at its fallback baud rate (box→GPS wire suspect)".to_string()
+        } else if lower.contains("checksum") || lower.contains("uart") {
+            "GPS data arriving corrupted (wiring/interference suspect)".to_string()
+        } else if lower.contains("cut short") || lower.contains("power removed") {
+            "the box lost power during startup (battery/magnet?)".to_string()
+        } else if lower.contains("re-adv") || lower.contains("ble") {
+            "Bluetooth radio had trouble re-advertising".to_string()
+        } else if lower.contains("fota") || lower.contains("trial") {
+            "a firmware update is still in its unconfirmed trial boot".to_string()
+        } else {
+            // No mapping — the raw finding is still better than nothing.
+            worst.to_string()
+        };
+        Some(human)
+    }
 }
 
 #[derive(Clone, Debug, Default)]

@@ -877,6 +877,10 @@ impl AppState {
                 // gave up on the box's post-drop recovery window instead of
                 // outwaiting it (2026-07-09).
                 ble_keep_synced: agent_config::AgentConfig::load().keep_synced,
+                // Last box-confirmed GPS state — keeps the health badge's
+                // "GPS deliberately off" suppression alive across restarts
+                // (the live query needs a connected box).
+                gps_power_last_known: agent_config::AgentConfig::load().gps_power,
                 log: log.clone(),
                 ..Default::default()
             },
@@ -1905,24 +1909,48 @@ impl AppState {
                    regardless of connection state — the report also
                    exists offline (startup check on the local mirror).
                    Quiet when the latest boot is healthy. */
+                // Live box answer wins; before a box has answered this
+                // session, fall back to the persisted last-known state so
+                // the suppression survives an app restart.
+                let gps_deliberately_off = self
+                    .sync
+                    .ble_gps_power
+                    .or(self.sync.gps_power_last_known)
+                    == Some(false);
                 if let Some(last) = self
                     .sync
                     .errlog_report
                     .as_ref()
                     .and_then(|r| r.latest())
                     .filter(|b| b.verdict() != errlog_check::Severity::Info)
+                    // A boot whose ONLY failure is "GPS silent at power-on"
+                    // is expected — not a fault — while the box reports its
+                    // GPS deliberately powered off. Suppress the badge; any
+                    // other co-occurring finding still shows it.
+                    .filter(|b| !(gps_deliberately_off && b.fail_is_only_gps_silence()))
                 {
                     ui.add_space(2.0);
                     let col = match last.verdict() {
                         errlog_check::Severity::Fail => egui::Color32::from_rgb(235, 90, 90),
                         _ => egui::Color32::from_rgb(230, 175, 60),
                     };
+                    // Say WHAT failed right in the badge — a bare verdict
+                    // ("latest boot FAIL") carried no value; the user had
+                    // to dig through the Debug tab to learn it was e.g.
+                    // just the GPS being asleep at power-on.
                     ui.colored_label(
                         col,
-                        format!(
-                            "Box health: latest boot {} — see Debug tab",
-                            last.verdict_label()
-                        ),
+                        match last.human_reason() {
+                            Some(why) => format!(
+                                "Box health: last boot {} — {} (details: Debug tab)",
+                                last.verdict_label(),
+                                why
+                            ),
+                            None => format!(
+                                "Box health: last boot {} — see Debug tab",
+                                last.verdict_label()
+                            ),
+                        },
                     );
                 }
 
@@ -3792,13 +3820,20 @@ impl eframe::App for AppState {
         self.sync.tick_transfer_supervisor();
         // Parked GPS-power toggle — sent once the sync engine drains.
         self.sync.tick_pending_gps();
-        if matches!(self.sync.ble_state, BleState::Connected) {
-            // Keep ticking so the Keep-synced poll fires without user
-            // input — and so the worker's auto-reconnect Status lines
-            // (the loop emits one per attempt) render live. ble_state
-            // stays Connected for the whole reconnect window in both
-            // modes (no Disconnected until the bounded budget is spent),
-            // so this one condition covers active sync + reconnecting.
+        // Bounced-READ retry — re-drives the queue seconds after a READ
+        // lost the single-op slot race (connect-chain queries).
+        self.sync.tick_read_retry();
+        if self.sync.ble.is_some() {
+            // Keep ticking whenever a BLE backend exists at all (v0.0.66;
+            // was gated on ble_state == Connected). egui only runs update()
+            // on repaints, and pump_ble_events only runs inside update() —
+            // so with no repaint timer armed, worker events sit UNREAD in
+            // the channel until the user happens to move the mouse. The
+            // Connected-only gate starved exactly the states that need the
+            // pump most: a supervisor re-Connect (state = Connecting) whose
+            // Connected event was never consumed — the app sat "hung" after
+            // "Connect OK" until any UI input (observed 19:59–20:00). One
+            // repaint per second while BLE is initialised is negligible.
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
 

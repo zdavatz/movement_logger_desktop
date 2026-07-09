@@ -193,6 +193,16 @@ pub struct SyncCore {
     /// Set when the supervisor forces a teardown; the `Disconnected`
     /// handler consumes it to fire the follow-up re-Connect.
     pub supervisor_reconnect_id: Option<String>,
+    /// Last box-confirmed GPS power state from config.toml, seeded at
+    /// launch (the live `ble_gps_power` is None until a box answers).
+    /// Fallback for the health badge's "GPS deliberately off" suppression
+    /// so it survives an app restart.
+    pub gps_power_last_known: Option<bool>,
+    /// When set, `tick_read_retry` re-drives the download queue at/after
+    /// this instant — armed when a dispatched READ bounces off the worker's
+    /// busy single-op slot (see the "another op is in flight" arm of the
+    /// Error handler). v0.0.66.
+    pub read_retry_at: Option<std::time::Instant>,
     /// A GPS-power toggle clicked while a sync pass / download was busy
     /// (v0.0.65). Sending 0x11 mid-pass grabs the single-op slot in the gap
     /// between two files, bounces the next queued READ ("another op is in
@@ -608,6 +618,26 @@ impl SyncCore {
         }
     }
 
+    /// Re-drive the download queue after a bounced READ (see
+    /// `read_retry_at`). Called from the same ~1 Hz ticks as the transfer
+    /// supervisor. No-op unless armed, due, connected, and genuinely idle.
+    pub fn tick_read_retry(&mut self) {
+        let Some(at) = self.read_retry_at else { return };
+        if std::time::Instant::now() < at {
+            return;
+        }
+        if !matches!(self.ble_state, BleState::Connected)
+            || self.ble_dl_in_flight
+            || self.ble_dl_queue.is_empty()
+        {
+            self.read_retry_at = None;
+            return;
+        }
+        self.read_retry_at = None;
+        push_log(&self.log, "ble: retrying bounced READ".into());
+        self.advance_download_queue();
+    }
+
     /// Send a parked GPS-power toggle (see `pending_gps_power`) once the
     /// sync engine is fully drained — connected, nothing in flight, nothing
     /// queued, no pass pending. Called from the same ~1 Hz ticks as the
@@ -622,7 +652,16 @@ impl SyncCore {
         let busy = self.ble_dl_in_flight
             || self.ble_sync_pending
             || !self.ble_dl_queue.is_empty()
-            || self.ble_delete_in_flight.is_some();
+            || self.ble_delete_in_flight.is_some()
+            // Mid-recovery is NOT "drained": arm_sync_resume clears the
+            // queue+in-flight flags for the resume, which briefly looks
+            // idle — a 0x11 released in that window dies with the link
+            // being torn down (observed: released between "transfer
+            // interrupted" and the supervisor's Disconnect). Wait until
+            // the resume has actually run.
+            || self.ble_resume_box.is_some()
+            || self.supervisor_reconnect_id.is_some()
+            || self.read_retry_at.is_some();
         if busy {
             return;
         }
@@ -855,6 +894,12 @@ impl SyncCore {
                         );
                         self.ble_state = BleState::Connecting;
                         self.ble_status = "supervisor: reconnecting…".into();
+                        // Restore the connected-id (the reset above cleared
+                        // it): the Connected handler's is_reconnect check
+                        // compares it against ble_resume_box — without this
+                        // the supervisor's reconnect never armed the sync
+                        // resume and relied entirely on the Keep-synced tick.
+                        self.ble_connected_id = Some(id.clone());
                         if let Some(b) = self.ble.as_ref() {
                             b.send(BleCmd::Connect(id));
                         }
@@ -1119,6 +1164,14 @@ impl SyncCore {
                 }
                 BleEvent::GpsPower { on } => {
                     self.ble_gps_power = Some(on);
+                    // Persist the box-confirmed state so the health badge's
+                    // "GPS deliberately off" suppression survives an app
+                    // restart (before a box answers, only this is known).
+                    let mut cfg = AgentConfig::load();
+                    if cfg.gps_power != Some(on) {
+                        cfg.gps_power = Some(on);
+                        let _ = cfg.save();
+                    }
                     self.ble_status = format!(
                         "box GPS: {}",
                         if on { "on" } else { "off (battery-save)" }
@@ -1231,6 +1284,34 @@ impl SyncCore {
                         self.ble_status = "connected".into();
                     } else if matches!(self.ble_state, BleState::Scanning | BleState::Connecting) {
                         self.ble_state = BleState::Idle;
+                    }
+                    /* A dispatched READ bounced off the single-op slot (the
+                       connect-chain GET_MODE/GET_GPS_POWER/CAL_GET race, or
+                       any other op that won the slot). Without this, the
+                       queue believed a transfer was running and NOTHING
+                       re-drove it until the 90 s supervisor — the "sync not
+                       working at all" wedge (v0.0.66). Put the file back at
+                       the FRONT of the queue and let tick_read_retry
+                       re-dispatch it in a couple of seconds, by which time
+                       the colliding one-byte query has resolved. */
+                    if msg.starts_with("another op is in flight") && self.ble_dl_in_flight {
+                        if let Some(name) = self.sync_in_flight_name.take() {
+                            let size = self
+                                .ble_files
+                                .iter()
+                                .find(|f| f.name == name)
+                                .map(|f| f.size)
+                                .unwrap_or(0);
+                            self.ble_dl_queue.push_front((name.clone(), size));
+                            push_log(
+                                &self.log,
+                                format!("ble: READ {name} bounced off a busy op — retrying shortly"),
+                            );
+                        }
+                        self.ble_dl_in_flight = false;
+                        self.read_retry_at = Some(
+                            std::time::Instant::now() + std::time::Duration::from_secs(2),
+                        );
                     }
                     /* Surface DELETE rejections as a prominent banner.
                        The box refuses some Debug rows (8.3-name miss →
@@ -1861,6 +1942,17 @@ impl SyncCore {
                 self.ble_dl_queue.push_back((f.name.clone(), f.size));
             }
         }
+        // Session data first, box-log treadmill last (v0.0.66): ERRLOG.LOG
+        // grows on EVERY connect/recovery (the box logs them), so each pass
+        // re-fetches its new tail — putting it ahead of the queue meant every
+        // recovery-heavy session paid the ERRLOG toll before resuming the
+        // sensor file the user is actually waiting for. Stable sort: sensor
+        // files keep their LIST order up front, ERRLOG (+ other debug files)
+        // move to the back. The treadmill is by design (append-only box log,
+        // "complete" is never final) — this just stops it blocking sessions.
+        self.ble_dl_queue
+            .make_contiguous()
+            .sort_by_key(|(name, _)| !is_sensor_data_name(name));
         // Seed the cumulative progress card (iOS/Android parity). Both
         // totals zero if there's nothing to fetch — UI hides the line.
         self.sync_pass_total = fetch;
