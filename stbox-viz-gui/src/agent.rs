@@ -180,6 +180,11 @@ fn run_session(
         }
 
         sc.pump_ble_events(&mut host);
+        // Same outer transfer safety net as the GUI (see
+        // tick_transfer_supervisor) — a zombied transfer must self-heal
+        // in the headless agent too, or it mirrors nothing until the
+        // next login.
+        sc.tick_transfer_supervisor();
 
         match sc.ble_state {
             BleState::Idle | BleState::Scanning if sc.ble.is_some() => {

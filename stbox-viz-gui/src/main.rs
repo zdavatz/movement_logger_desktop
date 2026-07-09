@@ -869,6 +869,14 @@ impl AppState {
                 // "Reconnect (last box)" button works right after launch,
                 // before any connect this session.
                 ble_last_box_id: agent_config::AgentConfig::load().box_id,
+                // Seed "Keep synced" from the config too (v0.0.64). It was
+                // persisted (the agent reads it) but never RESTORED into the
+                // GUI, so every launch started unchecked — the user had to
+                // re-click it each session, and a launch where they didn't
+                // ran reconnects in bounded Manual mode (10 attempts) that
+                // gave up on the box's post-drop recovery window instead of
+                // outwaiting it (2026-07-09).
+                ble_keep_synced: agent_config::AgentConfig::load().keep_synced,
                 log: log.clone(),
                 ..Default::default()
             },
@@ -1483,9 +1491,19 @@ impl AppState {
                         .show(ui, |ui| {
                             ui.colored_label(
                                 egui::Color32::from_rgb(120, 80, 20),
-                                "Transfer interrupted (BLE link lost). Scan and \
-                                 reconnect to the same box — the sync resumes \
-                                 automatically and skips files already saved.",
+                                // Keep-synced = the worker is reconnecting on
+                                // its own; only the manual path needs the user
+                                // to act. Same rationale as arm_sync_resume's
+                                // ble_sync_msg wording.
+                                if self.sync.ble_keep_synced {
+                                    "Link lost — reconnecting automatically… \
+                                     The sync resumes by itself and skips files \
+                                     already saved."
+                                } else {
+                                    "Transfer interrupted (BLE link lost). Scan and \
+                                     reconnect to the same box — the sync resumes \
+                                     automatically and skips files already saved."
+                                },
                             );
                         });
                     ui.add_space(4.0);
@@ -3768,6 +3786,9 @@ impl eframe::App for AppState {
                 self.sync.start_sync_pass();
             }
         }
+        // Outer transfer safety net (see tick_transfer_supervisor): runs
+        // ~1 Hz via the repaint timer below while connected.
+        self.sync.tick_transfer_supervisor();
         if matches!(self.sync.ble_state, BleState::Connected) {
             // Keep ticking so the Keep-synced poll fires without user
             // input — and so the worker's auto-reconnect Status lines
@@ -3816,6 +3837,36 @@ impl eframe::App for AppState {
                                 "mailto:zdavatz@ywesee.com",
                             ));
                         }
+                    }
+                    // Font size A+/A- to the LEFT of the logo (in a right-to-left
+                    // layout, items added after the logo sit to its left). Scales
+                    // the WHOLE UI via egui's zoom factor — one lever, every font
+                    // and widget grows/shrinks together. Clamped [0.6, 3.0] so it
+                    // can't be zoomed into uselessness. Persists for the session.
+                    ui.add_space(8.0);
+                    let zoom = ui.ctx().zoom_factor();
+                    let mut new_zoom = None;
+                    if ui
+                        .add_enabled(zoom < 3.0 - f32::EPSILON, egui::Button::new(egui::RichText::new("A+").size(15.0)))
+                        .on_hover_text("Increase font size")
+                        .clicked()
+                    {
+                        new_zoom = Some((zoom + 0.1).min(3.0));
+                    }
+                    if ui
+                        .add_enabled(zoom > 0.6 + f32::EPSILON, egui::Button::new(egui::RichText::new("A\u{2212}").size(12.0)))
+                        .on_hover_text("Decrease font size")
+                        .clicked()
+                    {
+                        new_zoom = Some((zoom - 0.1).max(0.6));
+                    }
+                    if let Some(z) = new_zoom {
+                        ui.ctx().set_zoom_factor(z);
+                        // Persist so the chosen size survives a restart
+                        // (load-modify-save: don't clobber sync fields).
+                        let mut cfg = agent_config::AgentConfig::load();
+                        cfg.ui_zoom = Some(z);
+                        let _ = cfg.save();
                     }
                 });
             });
@@ -4886,6 +4937,13 @@ fn main() -> eframe::Result<()> {
                 font.size = (font.size * 1.2).round();
             }
             cc.egui_ctx.set_style(style);
+            // Restore the persisted A+/A− font-size choice (top-bar
+            // buttons write it to config.toml on every click). Clamped
+            // the same way the buttons clamp, so a hand-edited config
+            // can't render the UI unusable.
+            if let Some(z) = agent_config::AgentConfig::load().ui_zoom {
+                cc.egui_ctx.set_zoom_factor(z.clamp(0.6, 3.0));
+            }
             Ok(Box::new(AppState::new()))
         }),
     )

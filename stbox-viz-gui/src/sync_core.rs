@@ -175,6 +175,24 @@ pub struct SyncCore {
     /// busy backlog runs back-to-back while an idle box is polled
     /// every 30 s, not hammered.
     pub ble_last_sync_at: Option<std::time::Instant>,
+    /// GUI-side transfer supervisor (v0.0.64): wall-clock of the last
+    /// transfer progress OBSERVED AT THE EVENT LEVEL (ReadStarted /
+    /// ReadProgress / ReadChunk / ReadDone / ReadAborted reaching this
+    /// client). The worker has its own silence + min-throughput watchdogs,
+    /// but those all assume the worker's state machine is healthy — a
+    /// worker that silently landed in its disconnected branch (or any other
+    /// state desync between worker and client) produces exactly ZERO events
+    /// while the client shows a transfer in flight, and nothing recovers
+    /// (observed 2026-07-09: bytes frozen, no watchdog, no reconnect, no
+    /// log line — permanent zombie until app restart). This outer net
+    /// watches the pipe itself: in-flight + no event for
+    /// `TRANSFER_SUPERVISOR_TIMEOUT` → force the full clean recycle
+    /// (abort → Disconnect → auto re-Connect → resume from mirror),
+    /// which is the by-hand recovery that always worked.
+    pub transfer_last_progress: Option<std::time::Instant>,
+    /// Set when the supervisor forces a teardown; the `Disconnected`
+    /// handler consumes it to fire the follow-up re-Connect.
+    pub supervisor_reconnect_id: Option<String>,
     /// One-line sync result/status ("Sync: 3 new, 12 already synced —
     /// downloading…"), shown in the Sync tab. Empty = no sync yet.
     pub ble_sync_msg: String,
@@ -283,6 +301,15 @@ pub struct SyncCore {
     /// not queried yet; inner `None` = queried but legacy/no-reply (→ treat
     /// as older than latest); `Some(Some(v))` = the parsed box version.
     pub fw_box_version: Option<Option<String>>,
+    /// True once a firmware check has completed (box version received) at least
+    /// once this app session. Gates the auto fw-check so it runs ONLY on the
+    /// first connect, never on the many macOS auto-reconnects — on a link that
+    /// drops every ~30 s the fw-check's box GET_VERSION was firing every
+    /// reconnect and sitting through its full 30 s timeout (it loses the op
+    /// slot to the resume READ), spamming the log and wasting the window. The
+    /// box version can't change without a flash (a deliberate, rare action),
+    /// so once is enough. v0.0.64.
+    pub fw_checked_once: bool,
     /// Status line for the "Check FW" flow ("Checking…", "Firmware up to
     /// date (vX.Y.Z)", "Updating box to vX.Y.Z…", or an error).
     pub fw_check_msg: String,
@@ -517,6 +544,62 @@ impl SyncCore {
         }
     }
 
+    /// GUI-side transfer supervisor — the OUTER safety net above the
+    /// worker's own silence (30 s) and min-throughput (30 s window)
+    /// watchdogs. Those live inside the worker's state machine; if the
+    /// worker itself is in a bad state (silently disconnected, op desync),
+    /// they never run and the transfer zombifies with zero log output
+    /// (observed 2026-07-09). This check needs nothing from the worker:
+    /// a transfer is in flight at the client level and no read event has
+    /// arrived for 90 s (comfortably above every worker-side recovery,
+    /// so it only fires when they all failed) → force the full clean
+    /// recycle a human would do: abort + Disconnect (teardown incl. 0x0F
+    /// so the box is freed), then auto re-Connect on the Disconnected
+    /// event, then the normal resume-from-mirror. Call ~1 Hz while
+    /// connected (GUI update tick / agent loop).
+    pub fn tick_transfer_supervisor(&mut self) {
+        const TRANSFER_SUPERVISOR_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(90);
+        if !matches!(self.ble_state, BleState::Connected) {
+            return;
+        }
+        if !self.ble_dl_in_flight {
+            self.transfer_last_progress = None;
+            return;
+        }
+        let Some(last) = self.transfer_last_progress else {
+            // In-flight but never stamped (shouldn't happen — Read dispatch
+            // stamps it); open the window now instead of firing blind.
+            self.transfer_last_progress = Some(std::time::Instant::now());
+            return;
+        };
+        if last.elapsed() < TRANSFER_SUPERVISOR_TIMEOUT {
+            return;
+        }
+        push_log(
+            &self.log,
+            format!(
+                "supervisor: transfer dead for {} s (no read events) — forcing disconnect + reconnect",
+                TRANSFER_SUPERVISOR_TIMEOUT.as_secs()
+            ),
+        );
+        self.ble_status = "transfer stalled — recycling the connection…".into();
+        // Remember where to reconnect, arm the resume, and recycle. The
+        // Disconnected handler consumes supervisor_reconnect_id to fire the
+        // follow-up Connect. Re-stamp so this doesn't refire every tick
+        // while the teardown runs.
+        self.supervisor_reconnect_id = self
+            .ble_connected_id
+            .clone()
+            .or_else(|| self.ble_last_box_id.clone());
+        self.transfer_last_progress = Some(std::time::Instant::now());
+        self.arm_sync_resume();
+        if let Some(b) = self.ble.as_ref() {
+            b.request_abort();
+            b.send(BleCmd::Disconnect);
+        }
+    }
+
     /// Drain pending BLE events into the visible state. Called once per
     /// frame; egui repaints on a timer while a BLE op is in progress so
     /// events don't sit in the channel for long.
@@ -524,6 +607,19 @@ impl SyncCore {
         let Some(b) = self.ble.as_ref() else { return; };
         let events = b.try_recv_all();
         for e in events {
+            // Feed the GUI-side transfer supervisor: ANY read-related event
+            // reaching this client proves the worker→client pipe is alive.
+            // See `transfer_last_progress`.
+            if matches!(
+                e,
+                BleEvent::ReadStarted { .. }
+                    | BleEvent::ReadProgress { .. }
+                    | BleEvent::ReadChunk { .. }
+                    | BleEvent::ReadDone { .. }
+                    | BleEvent::ReadAborted { .. }
+            ) {
+                self.transfer_last_progress = Some(std::time::Instant::now());
+            }
             match e {
                 BleEvent::Status(s) => {
                     /* Mirror Status events into the Log so the user has a
@@ -545,7 +641,18 @@ impl SyncCore {
                     }
                 }
                 BleEvent::ScanStopped => {
-                    self.ble_state = BleState::Idle;
+                    /* Only fall back to Idle if we haven't connected in the
+                       meantime (v0.0.64): a Scan click quickly followed by
+                       Connect made the scan's terminal event land AFTER
+                       Connected, flipping the UI to Idle while the worker
+                       held a live link — Connect clicks then bounced with
+                       "already connected", and the Keep-synced tick +
+                       transfer supervisor (both gated on Connected) went
+                       dead. The worker is authoritative about the link;
+                       a stray ScanStopped must not override it. */
+                    if !matches!(self.ble_state, BleState::Connected) {
+                        self.ble_state = BleState::Idle;
+                    }
                     self.ble_status = format!("scan done ({} found)", self.ble_devices.len());
                 }
                 BleEvent::Connected => {
@@ -559,6 +666,24 @@ impl SyncCore {
                        Refresh." which looked like a transient state. */
                     self.ble_files.clear();
                     self.ble_sync_msg.clear();
+                    /* Auto-reconnect (Auto Mode) never emits `Disconnected`, so
+                       the stale download state from the interrupted transfer
+                       survives into this handler. Reset it BEFORE the fresh
+                       SET_TIME/LIST below so the resume runs cleanly off the
+                       re-LIST + sync diff (which re-queues from the mirror).
+                       Otherwise the leftover in-flight READ is re-driven and
+                       collides with the connect-chain LIST — "another op is in
+                       flight" — and the download queue is left thinking a READ
+                       is in flight with nothing to recover it (v0.0.64: Peter's
+                       macOS fast-reconnect race — with fw 0.0.39 the box
+                       re-advertises so fast it's STILL streaming when we
+                       reconnect, e.g. "drained 19 stale FileData notifs", and
+                       the sync silently wedged there). Harmless on an initial
+                       connect: both are already empty. The `Disconnected`
+                       handler does the same reset for the Manual-mode path. */
+                    self.ble_dl_queue.clear();
+                    self.ble_dl_in_flight = false;
+                    self.sync_in_flight_name = None;
                     /* Resume an interrupted transfer/sync. If we just
                        reconnected to the same box that was cut off mid-
                        batch, arm a sync: the auto-LIST below produces a
@@ -568,9 +693,9 @@ impl SyncCore {
                        file the drop interrupted. Resume only for the
                        same box; a different box clears the flag so a
                        stale resume can't fire later. */
-                    if self.ble_resume_box.is_some()
-                        && self.ble_resume_box == self.ble_connected_id
-                    {
+                    let is_reconnect = self.ble_resume_box.is_some()
+                        && self.ble_resume_box == self.ble_connected_id;
+                    if is_reconnect {
                         self.ble_sync_pending = true;
                         self.ble_sync_msg =
                             "Reconnected — resuming sync (skipping files already saved)…"
@@ -604,8 +729,23 @@ impl SyncCore {
                        sync). The direct GET_VERSION it sends here loses the
                        single-op slot to the LIST above and is dropped by the
                        worker's op-busy guard; the ListDone handler re-issues
-                       it once the worker is idle, so the query still lands. */
-                    self.start_fw_check();
+                       it once the worker is idle, so the query still lands.
+
+                       SKIP on an auto-reconnect (v0.0.64): the box version is
+                       already known from the initial connect, and on a macOS
+                       Mac that drops the link every ~30 s the fw-check's box
+                       GET_VERSION was firing on EVERY reconnect and, losing the
+                       op-slot to the resume READ, sitting through its full 30 s
+                       timeout — so each reconnect window was spent on handshake
+                       chatter + "another op is in flight" collisions instead of
+                       pulling bytes, starving the transfer. Gate on
+                       `fw_checked_once` (run once per app session): the
+                       `is_reconnect` flag alone missed the Keep-synced reconnect
+                       path (`ble_resume_box` isn't set there), so the fw-check
+                       kept firing + timing out on every 30 s reconnect. */
+                    if !self.fw_checked_once {
+                        self.start_fw_check();
+                    }
                 }
                 BleEvent::Disconnected => {
                     /* If a transfer/sync was live when the link dropped,
@@ -664,6 +804,23 @@ impl SyncCore {
                     self.fw_latest = None;
                     self.fw_box_version = None;
                     self.fw_update_available = None;
+                    /* Supervisor-forced recycle: this Disconnected is the
+                       teardown half; fire the re-Connect half now. The
+                       resume was armed before the teardown, so the
+                       Connected handler picks the sync back up from the
+                       mirror. Consumed here so a user-initiated
+                       Disconnect never auto-reconnects. */
+                    if let Some(id) = self.supervisor_reconnect_id.take() {
+                        push_log(
+                            &self.log,
+                            "supervisor: teardown done — reconnecting".into(),
+                        );
+                        self.ble_state = BleState::Connecting;
+                        self.ble_status = "supervisor: reconnecting…".into();
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::Connect(id));
+                        }
+                    }
                 }
                 BleEvent::ListEntry { name, size } => {
                     /* Default-tick only sensor-data rows (Sens*.csv,
@@ -907,6 +1064,7 @@ impl SyncCore {
                     // (outer Some = queried; inner mirrors the reply). Then
                     // try to decide — the GitHub half may already be in.
                     self.fw_box_version = Some(v);
+                    self.fw_checked_once = true;
                     self.fw_maybe_decide();
                     /* Chain the connect-time GET_MODE query now that the
                        version slot has freed. On the auto fw-check path the
@@ -1025,7 +1183,15 @@ impl SyncCore {
                 BleEvent::Error(msg) => {
                     self.ble_status = format!("error: {msg}");
                     push_log(&self.log, format!("ble error: {msg}"));
-                    if matches!(self.ble_state, BleState::Scanning | BleState::Connecting) {
+                    /* The worker is authoritative about the link: if it
+                       rejects a Connect with "already connected", the UI's
+                       state drifted (e.g. a stray ScanStopped overrode
+                       Connected) — snap back to Connected so the sync tick
+                       and supervisor resume instead of staying dead. */
+                    if msg.starts_with("already connected") {
+                        self.ble_state = BleState::Connected;
+                        self.ble_status = "connected".into();
+                    } else if matches!(self.ble_state, BleState::Scanning | BleState::Connecting) {
                         self.ble_state = BleState::Idle;
                     }
                     /* Surface DELETE rejections as a prominent banner.
@@ -1209,6 +1375,10 @@ impl SyncCore {
             b.send(BleCmd::Read { name: name.clone(), size, offset });
             self.sync_in_flight_name = Some(name.clone());
             self.ble_dl_in_flight = true;
+            // Open a fresh supervisor window: if this READ produces zero
+            // events (e.g. silently rejected / worker state desync), the
+            // supervisor recycles the link instead of hanging forever.
+            self.transfer_last_progress = Some(std::time::Instant::now());
             if offset > 0 {
                 push_log(
                     &self.log,
@@ -1338,9 +1508,19 @@ impl SyncCore {
         self.sync_pass_total = 0;
         self.sync_pass_total_bytes = 0;
         self.sync_pass_completed_bytes = 0;
-        self.ble_sync_msg = "⚠ Transfer interrupted (BLE link lost). Reconnect to \
-             the box — the sync resumes automatically and skips files already saved."
-            .into();
+        // Status wording depends on who has to act: with Keep synced on the
+        // worker auto-reconnects (unbounded), so the banner is pure status —
+        // telling the user to reconnect there read as a demand for action on
+        // every routine macOS link drop ("why is this always showing?").
+        self.ble_sync_msg = if self.ble_keep_synced {
+            "Link lost — reconnecting automatically… (sync resumes by itself, \
+             already-saved files are skipped)"
+                .into()
+        } else {
+            "⚠ Transfer interrupted (BLE link lost). Reconnect to the box — \
+             the sync resumes automatically and skips files already saved."
+                .into()
+        };
         push_log(
             &self.log,
             "ble: transfer interrupted — armed to resume on reconnect".into(),

@@ -132,17 +132,41 @@ const OP_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// → `lost_link_recover`, ~200 ms after macOS reports it), NOT by silence.
 /// This value is now only the point at which we emit a one-shot "riding out"
 /// status line for visibility; teardown happens only at `READ_RIDE_OUT_LIMIT`.
-const READ_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+const READ_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// READ last-resort: absolute cap on a notify-parked READ before we give up on
-/// the live link and fall back to teardown + auto-reconnect (byte-resume from
-/// the mirror). Sits ABOVE the box's own 180 s READ-stall deadline
-/// (`FSM_READ_STALL_DEADLINE_MS`, fw v0.0.39), so in the normal case the box
-/// recovers first and macOS reports `DeviceDisconnected` — which reconnects us
-/// via `central_rx` well before this fires. This only covers the pathological
-/// "LL link stays up but data never resumes AND the box never reports a
-/// disconnect" corner; without it a wedged READ could hang forever.
-const READ_RIDE_OUT_LIMIT: Duration = Duration::from_secs(200);
+/// READ reconnect deadline: how long a notify-parked READ may go before we give
+/// up on the live link and reconnect (byte-resume from the mirror).
+///
+/// v0.0.63 — 200 s → 30 s. Field evidence on Peter's Mac (macOS 26.5.2): the
+/// "parks" here do NOT resume — they are effectively *silent disconnects*
+/// (macOS kills the link and never delivers `DeviceDisconnected`, so
+/// `central_rx` stays quiet). Riding out 200 s hoping macOS drains again just
+/// wasted 200 s before the last-resort reconnected anyway (monitor: every park
+/// ran the full ride-out then `ride-out limit — reconnecting`). Meanwhile the
+/// box already re-advertises within ~4 s (its own LL-supervision timeout), and
+/// with fw v0.0.39 that recovery no longer wedges in `re-adv=211` — so a fast
+/// reconnect resumes cleanly. 30 s gives a genuinely-brief park (if one ever
+/// happens) a chance to resume on the live link, then reconnects promptly.
+/// The `READ_STALL_TIMEOUT` (15 s) ride-out window below it is the short "hold
+/// and hope macOS drains" band; past 30 s we stop hoping and reconnect.
+const READ_RIDE_OUT_LIMIT: Duration = Duration::from_secs(30);
+
+/// READ minimum-throughput watchdog (v0.0.64). The zero-progress watchdog
+/// above is blind to a *trickle*: macOS sometimes leaves the link in a
+/// slow-drain state where a lone notify dribbles in every few seconds — each
+/// one resets `last_progress`, so neither the 15 s ride-out nor the 30 s
+/// reconnect ever fires, and the transfer crawls at a few hundred B/s
+/// indefinitely (observed: < 4 KB in 6 minutes, watchdog silent the whole
+/// time). Track bytes over a rolling window instead: if a READ moves fewer
+/// than `READ_MIN_RATE_BYTES` in `READ_MIN_RATE_WINDOW`, give up on this
+/// link and reconnect — a fresh connection gets a fresh scheduling slot from
+/// macOS and returns to the normal ~9 KB/s. 10 KB / 30 s ≈ 340 B/s floor:
+/// far below any usable rate, comfortably above zero, and a reconnect
+/// (~10-15 s) always pays for itself against a link this starved. Also
+/// subsumes the zero-progress case (0 < 10 KB), making this the primary READ
+/// health check; the `last_progress`-based limit stays as belt-and-braces.
+const READ_MIN_RATE_WINDOW: Duration = Duration::from_secs(30);
+const READ_MIN_RATE_BYTES: u64 = 10 * 1024;
 
 /// Chunk a long file READ into fixed-size segments instead of one to-EOF
 /// stream (v0.0.48). Each segment is a separate capped READ opcode
@@ -1074,6 +1098,11 @@ struct WorkerState {
     /// READ makes progress (idle drops below `READ_STALL_TIMEOUT`) or a new
     /// READ starts. See `tick_watchdog`.
     read_ride_out_logged: bool,
+    /// Rolling-window anchor for the READ minimum-throughput watchdog:
+    /// (window start, absolute bytes done at window start). `None` when no
+    /// READ is in flight; re-anchored every `READ_MIN_RATE_WINDOW` when the
+    /// rate is healthy. See `READ_MIN_RATE_BYTES`.
+    read_rate_mark: Option<(Instant, u64)>,
 }
 
 impl WorkerState {
@@ -1095,6 +1124,7 @@ impl WorkerState {
             pending_set_mode: None,
             power: None,
             read_ride_out_logged: false,
+            read_rate_mark: None,
         }
     }
 
@@ -2108,6 +2138,7 @@ impl WorkerState {
             first_packet: true,
         };
         self.read_ride_out_logged = false;
+        self.read_rate_mark = None; // fresh throughput window per READ
         self.emit(BleEvent::ReadStarted { name, size });
     }
 
@@ -3068,6 +3099,29 @@ impl WorkerState {
             }
         }
 
+        // READ minimum-throughput watchdog (v0.0.64) — see READ_MIN_RATE_BYTES.
+        // Runs BEFORE the ride-out early-returns because it must fire even when
+        // notifies are trickling in (each trickle notify resets `last_progress`,
+        // so the silence-based checks below never see the starvation).
+        let mut read_trickle = false;
+        if let CurrentOp::Reading { base, content, .. } = &self.op {
+            let done = *base + content.len() as u64;
+            match self.read_rate_mark {
+                None => self.read_rate_mark = Some((now, done)),
+                Some((t0, d0)) => {
+                    if now.duration_since(t0) >= READ_MIN_RATE_WINDOW {
+                        if done.saturating_sub(d0) < READ_MIN_RATE_BYTES {
+                            read_trickle = true; // starved → force reconnect below
+                        } else {
+                            self.read_rate_mark = Some((now, done)); // healthy — re-anchor
+                        }
+                    }
+                }
+            }
+        } else {
+            self.read_rate_mark = None;
+        }
+
         // READ ride-out (v0.0.62). A notify-parked READ is NOT torn down on
         // silence. macOS routinely parks the notify drain for tens of seconds
         // while keeping the LL link fully alive; the box (fw v0.0.39) holds the
@@ -3076,17 +3130,18 @@ impl WorkerState {
         // re-adv=211. A REAL remote disconnect is caught by the
         // DeviceDisconnected sweep (`central_rx` → `lost_link_recover`), NOT by
         // silence. We only *note* the pause once (for visibility) and keep the
-        // Reading op alive; only `READ_RIDE_OUT_LIMIT` (200 s, above the box's
-        // 180 s) falls through to the teardown+reconnect below, for the
-        // pathological "link up but data dead AND box never reports a
-        // disconnect". `read_idle` is Copy so no self.op borrow is held.
+        // Reading op alive; only `READ_RIDE_OUT_LIMIT` (30 s) or the
+        // min-throughput trickle check above falls through to the
+        // teardown+reconnect below. `read_idle` is Copy so no self.op borrow is
+        // held. Skipped entirely when the trickle watchdog fired — a starved
+        // link must not keep early-returning its way past the teardown.
         let read_idle: Option<Duration> =
             if let CurrentOp::Reading { last_progress, .. } = &self.op {
                 Some(now.duration_since(*last_progress))
             } else {
                 None
             };
-        if let Some(idle) = read_idle {
+        if let (Some(idle), false) = (read_idle, read_trickle) {
             if idle < READ_STALL_TIMEOUT {
                 self.read_ride_out_logged = false; // fresh / progressing
                 return false;
@@ -3111,7 +3166,8 @@ impl WorkerState {
 
         let stale = match &self.op {
             CurrentOp::Listing  { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
-            CurrentOp::Reading  { last_progress, .. } => now.duration_since(*last_progress) > READ_RIDE_OUT_LIMIT,
+            CurrentOp::Reading  { last_progress, .. } =>
+                read_trickle || now.duration_since(*last_progress) > READ_RIDE_OUT_LIMIT,
             CurrentOp::Deleting { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingMode { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingVersion { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
@@ -3156,15 +3212,17 @@ impl WorkerState {
                     content,
                     base,
                 });
-                // Last resort only: we rode the pause out for READ_RIDE_OUT_LIMIT
-                // (200 s) on a still-"connected" link and data never resumed —
-                // the box's own 180 s recovery didn't surface a DeviceDisconnected
-                // either. Give up on the live link and reconnect + byte-resume.
+                // Two ways here: the link went fully silent past
+                // READ_RIDE_OUT_LIMIT, or the min-throughput watchdog caught a
+                // trickle (notifies arriving but < READ_MIN_RATE_BYTES per
+                // window — macOS slow-drain starvation). Either way this link
+                // is useless: reconnect for a fresh scheduling slot and
+                // byte-resume from the mirror.
                 self.emit_err(format!(
-                    "READ {name} parked at {got}/{expected} B for {}s — giving up on the live link, reconnecting",
-                    READ_RIDE_OUT_LIMIT.as_secs()
+                    "READ {name} starved at {got}/{expected} B ({}) — reconnecting for a fresh link",
+                    if read_trickle { "trickle: <10 KB in 30 s" } else { "silent 30 s" }
                 ));
-                true // wedged READ → caller reconnects + resumes
+                true // starved READ → caller reconnects + resumes
             }
             CurrentOp::Deleting { name, .. } => {
                 self.emit_err(format!("DELETE {name} timed out — no notify for 20 s"));

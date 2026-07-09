@@ -79,6 +79,13 @@ pub struct AgentConfig {
     /// `AgentConfig.angleZeroAtEpoch` parity.
     #[serde(default)]
     pub angle_zero_at: Option<f64>,
+    /// UI zoom factor from the top-bar A+/A− font-size buttons (1.0 =
+    /// default). Persisted so the user's chosen size survives a restart.
+    /// Clamped to [0.6, 3.0] on both write (button handlers) and read
+    /// (startup apply) so a hand-edited config can't render the UI
+    /// unusable. GUI-only; the headless agent ignores it.
+    #[serde(default)]
+    pub ui_zoom: Option<f32>,
 }
 
 impl AgentConfig {
