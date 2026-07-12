@@ -164,6 +164,11 @@ pub struct RaceFix {
     /// Satellites used in the fix, -1 = unknown (iOS doesn't expose it).
     #[serde(default = "batt_unknown")]
     pub sat: i32,
+    /// Optional race token — riders and viewer must agree on it; the
+    /// relay only forwards matching traffic and this listener drops
+    /// mismatches, so strangers can neither watch nor inject.
+    #[serde(default)]
+    pub race: String,
 }
 
 fn nan() -> f64 {
@@ -212,6 +217,8 @@ pub struct RaceState {
     via_relay: bool,
     /// Relay `host:port` (or bare host — the race port is appended).
     relay_text: String,
+    /// Optional shared race token (see [`RaceFix::race`]).
+    token_text: String,
     listener: Option<Listener>,
     riders: BTreeMap<String, Rider>,
     /// Follow mode: keep the camera centred on the riders' centroid.
@@ -245,6 +252,7 @@ impl Default for RaceState {
             port_text: DEFAULT_PORT.to_string(),
             via_relay: false,
             relay_text: String::new(),
+            token_text: String::new(),
             listener: None,
             riders: BTreeMap::new(),
             follow: true,
@@ -324,6 +332,7 @@ fn dist_m(a: Position, b: Position) -> f64 {
 /// anywhere.
 fn spawn_relay_listener(
     relay: String,
+    token: String,
     ctx: egui::Context,
 ) -> Result<Listener, std::io::Error> {
     use std::net::ToSocketAddrs;
@@ -340,13 +349,15 @@ fn spawn_relay_listener(
         .name("race-relay-sub".into())
         .spawn(move || {
             let mut buf = [0u8; 2048];
+            let keepalive =
+                serde_json::json!({"v": 1, "sub": true, "race": token}).to_string();
             let mut last_keepalive = Instant::now() - Duration::from_secs(60);
             loop {
                 if stop_thread.load(Ordering::Relaxed) {
                     return;
                 }
                 if last_keepalive.elapsed() >= Duration::from_secs(10) {
-                    let _ = socket.send_to(br#"{"v":1,"sub":true}"#, relay_addr);
+                    let _ = socket.send_to(keepalive.as_bytes(), relay_addr);
                     last_keepalive = Instant::now();
                 }
                 match socket.recv_from(&mut buf) {
@@ -469,7 +480,7 @@ impl RaceState {
             if !relay.contains(':') {
                 relay = format!("{relay}:{port}");
             }
-            spawn_relay_listener(relay, ctx.clone())
+            spawn_relay_listener(relay, self.token_text.trim().to_string(), ctx.clone())
         } else {
             spawn_listener(port, ctx.clone())
         };
@@ -523,7 +534,13 @@ impl RaceState {
                 RaceEvent::Bad => self.bad_datagrams += 1,
             }
         }
+        let expected_token = self.token_text.trim().to_string();
         for fix in fixes {
+            // Token filtering also applies on the LAN path, where no
+            // relay pre-filters for us (open venue WiFi = open port).
+            if !expected_token.is_empty() && fix.race != expected_token {
+                continue;
+            }
             self.datagrams += 1;
             if let Some(w) = self.log.as_mut() {
                 let _ = writeln!(
@@ -642,6 +659,17 @@ impl RaceState {
                 egui::TextEdit::singleline(&mut self.port_text).desired_width(60.0),
             );
             ui.add_enabled_ui(self.listener.is_none(), |ui| {
+                ui.label("Token:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.token_text)
+                        .hint_text("optional")
+                        .desired_width(80.0),
+                )
+                .on_hover_text(
+                    "Optional shared race token: riders enter the same \
+                     token in their Race card. Mismatching traffic is \
+                     ignored, so strangers can neither watch nor inject.",
+                );
                 ui.checkbox(&mut self.via_relay, "Via relay")
                     .on_hover_text(
                         "Subscribe to a public race-relay instead of listening \
@@ -943,13 +971,15 @@ mod tests {
             .unwrap();
         let relay_addr = fake_relay.local_addr().unwrap();
 
-        let l = spawn_relay_listener(relay_addr.to_string(), egui::Context::default())
+        let l = spawn_relay_listener(relay_addr.to_string(), String::new(), egui::Context::default())
             .expect("subscribe");
 
         // The listener's first keepalive reveals its address.
         let mut buf = [0u8; 512];
         let (n, subscriber) = fake_relay.recv_from(&mut buf).unwrap();
-        assert_eq!(&buf[..n], br#"{"v":1,"sub":true}"#);
+        let sub: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+        assert_eq!(sub["sub"], true);
+        assert_eq!(sub["race"], "");
 
         let fix = br#"{"v":1,"rider":"Zeno","src":"phone","lat":47.37,"lon":8.54,"kmh":12.0}"#;
         fake_relay.send_to(fix, subscriber).unwrap();

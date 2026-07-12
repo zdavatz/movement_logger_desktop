@@ -138,19 +138,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     p.body("     start a recording in the watch app. With the iPhone around, fixes relay through it; without");
     p.body("     it, the watch sends directly over the venue WiFi — watch-only riders work.");
 
+    // --- Relay (cellular) ---------------------------------------------------
+    p.heading("4 — Over the internet: the race relay (cellular race days)");
+    p.body("WiFi only reaches ~50 m. For a real course, riders use mobile data and the organizer runs the");
+    p.body("relay (in every desktop release: race-relay-...-linux-musl.tar.gz) on any Linux server:");
+    p.body("   cp race-relay /usr/local/bin/  ·  cp race-relay.service /etc/systemd/system/");
+    p.body("   systemctl enable --now race-relay  ·  open UDP 47777  ·  point a DNS name at the server.");
+    p.body("Riders then enter the relay's host + 47777 instead of the desktop IP; the desktop ticks");
+    p.body("\"Via relay\". Set the same \"Race token\" on the desktop and every rider so strangers can");
+    p.body("neither watch nor appear on your map.");
+
     // --- Reading the map ----------------------------------------------------
     p.heading("Reading the map");
     p.body("- Dot = the rider's latest position; the translucent circle around it is the receiver's own accuracy");
     p.body("  estimate (bigger circle = less precise fix). The coloured trail is the recently travelled path.");
     p.body("- The rider list shows: name, speed, source (ublox / phone / watch), +-accuracy, satellites, battery.");
-    p.body("- A rider greyed out has sent nothing for 5 s (out of range, capsized, app closed) — the last");
-    p.body("  position stays on the map on purpose.");
+    p.body("- A rider greyed out has sent nothing for 5 s — the last position stays on the map on purpose.");
 
     // --- Troubleshooting ----------------------------------------------------
     p.heading("Troubleshooting");
     p.body("- No dot appears: same WiFi? IP and port typed exactly as the desktop shows? GPS fix yet (sky view)?");
-    p.body("- Everything jumps or looks imprecise near buildings: watch the accuracy circle — GPS is a 2-5 m");
-    p.body("  instrument; on open water it is at its best.");
+    p.body("- Imprecise near buildings? Watch the accuracy circle — GPS is a 2-5 m instrument; open water is best.");
     p.body("- Two riders must not use the same rider name on the same source type.");
 
     // --- Screenshots strip ----------------------------------------------
@@ -160,9 +168,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     p.heading("What it looks like");
     let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
     let shots: [(&str, &str, f32); 3] = [
-        ("desktop.jpg", "Desktop — Race tab", 86.0),
-        ("android.jpg", "Android — Race mode card", 46.0),
-        ("iphone.jpg", "iPhone — Race mode card", 46.0),
+        ("desktop.jpg", "Desktop — Race tab", 76.0),
+        ("android.jpg", "Android — Race mode card", 42.0),
+        ("iphone.jpg", "iPhone — Race mode card", 42.0),
     ];
     let strip_top = p.y - 1.5; // top edge for every image in the row
     let mut x = MARGIN;

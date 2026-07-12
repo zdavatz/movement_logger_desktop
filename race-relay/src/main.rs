@@ -34,6 +34,11 @@ const DEFAULT_PORT: u16 = 47777;
 /// A viewer that hasn't sent a keepalive for this long is dropped.
 const EXPIRY: Duration = Duration::from_secs(30);
 
+/// Hard cap on registered viewers — bounds the memory and the traffic
+/// a spoofed-subscription attack could redirect. Real races have a
+/// handful of viewers, not dozens.
+const MAX_VIEWERS: usize = 32;
+
 /// The only parsing the relay does. Unknown fields are ignored, so the
 /// wire format can grow without touching the relay.
 #[derive(Deserialize)]
@@ -73,6 +78,15 @@ impl Relay {
             return;
         };
         if probe.sub {
+            let known = self.viewers.contains_key(&from);
+            if !known && self.viewers.len() >= MAX_VIEWERS {
+                // Expire stale entries first, then re-check the cap.
+                self.viewers.retain(|_, (_, seen)| seen.elapsed() < EXPIRY);
+                if self.viewers.len() >= MAX_VIEWERS {
+                    self.dropped += 1;
+                    return;
+                }
+            }
             if self
                 .viewers
                 .insert(from, (probe.race.clone(), Instant::now()))
