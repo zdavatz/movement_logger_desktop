@@ -11,7 +11,8 @@
 
 use printpdf::image_crate::codecs::jpeg::JpegDecoder;
 use printpdf::{
-    BuiltinFont, Color, Image, ImageTransform, IndirectFontRef, Line, Mm, PdfDocument, Point, Rgb,
+    Actions, BorderArray, BuiltinFont, Color, Image, ImageTransform, IndirectFontRef,
+    LinkAnnotation, Line, Mm, PdfDocument, Point, Rgb,
 };
 use std::fs::File;
 use std::io::BufWriter;
@@ -203,17 +204,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     p.y = strip_bottom;
 
-    // --- Footer -------------------------------------------------------------
+    // --- Footer: three clickable download links --------------------------
     p.gap(4.0);
     p.rule(0.0);
     p.gap(3.0);
-    let regular = p.regular.clone();
-    p.text(
-        &regular,
-        8.0,
-        0.0,
-        "Desktop: github.com/zdavatz/movement_logger_desktop/releases   ·   Android: play.google.com/store/apps/details?id=ch.ywesee.movementlogger   ·   iPhone: apps.apple.com/app/id6769086271",
-    );
+    let link_font = p.bold.clone();
+    let sep_font = p.regular.clone();
+    let links: [(&str, &str); 3] = [
+        (
+            "Desktop",
+            "https://github.com/zdavatz/movement_logger_desktop/releases",
+        ),
+        (
+            "Android",
+            "https://play.google.com/store/apps/details?id=ch.ywesee.movementlogger",
+        ),
+        ("iPhone", "https://apps.apple.com/app/id6769086271"),
+    ];
+    p.y -= 10.0 * 0.42;
+    let mut x = MARGIN;
+    for (i, (title, url)) in links.iter().enumerate() {
+        p.layer
+            .set_fill_color(Color::Rgb(Rgb::new(0.05, 0.35, 0.75, None)));
+        p.layer.use_text(*title, 10.0, Mm(x), Mm(p.y), &link_font);
+        // Helvetica-Bold 10 pt ≈ 2.1 mm per character — generous rect so
+        // the whole word is a click target. Zero-width border: no box.
+        let w = *title as &str;
+        let w = w.len() as f32 * 2.1 + 1.0;
+        p.layer.add_link_annotation(LinkAnnotation::new(
+            printpdf::Rect::new(Mm(x - 0.5), Mm(p.y - 1.2), Mm(x + w), Mm(p.y + 4.0)),
+            Some(BorderArray::Solid([0.0, 0.0, 0.0])),
+            None,
+            Actions::uri(url.to_string()),
+            None,
+        ));
+        x += w + 4.0;
+        if i < links.len() - 1 {
+            p.layer
+                .set_fill_color(Color::Rgb(Rgb::new(0.4, 0.4, 0.4, None)));
+            p.layer.use_text("·", 10.0, Mm(x), Mm(p.y), &sep_font);
+            x += 4.5;
+        }
+    }
+    p.layer
+        .set_fill_color(Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)));
 
     doc.save(&mut BufWriter::new(File::create(&out)?))?;
     println!("wrote {out}");
