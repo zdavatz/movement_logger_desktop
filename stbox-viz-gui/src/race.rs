@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use walkers::{HttpOptions, HttpTiles, Map, MapMemory, Plugin, Position, Projector};
+use walkers::{HttpOptions, HttpTiles, Map, MapMemory, Plugin, Position, Projector, TileId};
 
 /// Default listen port — unassigned high port, same constant baked
 /// into the Android and iOS senders.
@@ -44,6 +44,60 @@ const STALE_AFTER: Duration = Duration::from_secs(5);
 
 /// Trail points kept per rider — 600 ≈ 5 min at the senders' 2 Hz cap.
 const TRAIL_LEN: usize = 600;
+
+/// A new trail point is recorded only when the rider moved at least
+/// this far from the previous one. The u-blox jitters ±2.7 m RMS when
+/// perfectly still — without the dead-band a parked phone scribbles a
+/// knot. The dot itself always shows the raw latest fix.
+const TRAIL_MIN_STEP_M: f64 = 3.0;
+
+/// OSM serves tiles up to z19; deeper zoom magnifies those via
+/// [`OverzoomTiles`], readable to about z22.
+const TILE_MAX_NATIVE_ZOOM: u8 = 19;
+const MAX_MAP_ZOOM: f64 = 22.0;
+
+/// Tile source wrapper that answers requests beyond the server's
+/// native maximum zoom with a magnified sub-rect of the deepest real
+/// tile — blurry but usable, instead of walkers' blank grey world.
+struct OverzoomTiles(HttpTiles);
+
+impl walkers::Tiles for OverzoomTiles {
+    fn at(&mut self, tile_id: TileId) -> Option<walkers::TextureWithUv> {
+        if tile_id.zoom <= TILE_MAX_NATIVE_ZOOM {
+            return self.0.at(tile_id);
+        }
+        let d = tile_id.zoom - TILE_MAX_NATIVE_ZOOM;
+        let parent = TileId {
+            x: tile_id.x >> d,
+            y: tile_id.y >> d,
+            zoom: TILE_MAX_NATIVE_ZOOM,
+        };
+        let tex = self.0.at(parent)?;
+        // This deep tile's sub-square, mapped through the parent's own
+        // UV rect (which may itself be a sub-rect when walkers served
+        // the parent by interpolating a shallower tile).
+        let n = 1u32 << d;
+        let fx = (tile_id.x & (n - 1)) as f32 / n as f32;
+        let fy = (tile_id.y & (n - 1)) as f32 / n as f32;
+        let min = egui::pos2(
+            tex.uv.min.x + fx * tex.uv.width(),
+            tex.uv.min.y + fy * tex.uv.height(),
+        );
+        let size = egui::vec2(tex.uv.width() / n as f32, tex.uv.height() / n as f32);
+        Some(walkers::TextureWithUv {
+            texture: tex.texture,
+            uv: egui::Rect::from_min_size(min, size),
+        })
+    }
+
+    fn attribution(&self) -> walkers::sources::Attribution {
+        self.0.attribution()
+    }
+
+    fn tile_size(&self) -> u32 {
+        self.0.tile_size()
+    }
+}
 
 // ---------------------------------------------------------------------------
 //  Wire format
@@ -123,7 +177,7 @@ pub struct RaceState {
     /// for post-race replay/analysis.
     log_path: Option<PathBuf>,
     log: Option<BufWriter<File>>,
-    tiles: Option<HttpTiles>,
+    tiles: Option<OverzoomTiles>,
     map_memory: MapMemory,
     /// First fix centres + zooms the map once; after that the camera
     /// belongs to the user (or the follow toggle).
@@ -191,6 +245,15 @@ fn spawn_listener(
             }
         })?;
     Ok(Listener { stop, rx, port })
+}
+
+/// Equirectangular metres between two positions — plenty at the
+/// few-metre scales the trail dead-band cares about.
+fn dist_m(a: Position, b: Position) -> f64 {
+    let m_per_deg = 111_320.0;
+    let dlat = (a.lat() - b.lat()) * m_per_deg;
+    let dlon = (a.lon() - b.lon()) * m_per_deg * a.lat().to_radians().cos();
+    (dlat * dlat + dlon * dlon).sqrt()
 }
 
 /// This machine's LAN IPv4, via the connected-UDP-socket trick (no
@@ -358,10 +421,17 @@ impl RaceState {
                 });
             rider.last = fix;
             rider.last_rx = Instant::now();
-            if rider.trail.len() == TRAIL_LEN {
-                rider.trail.pop_front();
+            // Dead-band: a parked phone's GPS jitter must not scribble.
+            let moved = rider
+                .trail
+                .back()
+                .map_or(true, |p| dist_m(*p, pos) >= TRAIL_MIN_STEP_M);
+            if moved {
+                if rider.trail.len() == TRAIL_LEN {
+                    rider.trail.pop_front();
+                }
+                rider.trail.push_back(pos);
             }
-            rider.trail.push_back(pos);
             if !self.centered_once {
                 self.map_memory.center_at(pos);
                 let _ = self.map_memory.set_zoom(16.0);
@@ -502,21 +572,20 @@ impl RaceState {
                     "MovementLogger-Desktop (github.com/zdavatz/movement_logger_desktop)",
                 )),
             };
-            self.tiles = Some(HttpTiles::with_options(
+            self.tiles = Some(OverzoomTiles(HttpTiles::with_options(
                 walkers::sources::OpenStreetMap,
                 opts,
                 ui.ctx().clone(),
-            ));
+            )));
         }
         if self.follow {
             if let Some(c) = self.centroid() {
                 self.map_memory.center_at(c);
             }
         }
-        // OSM has no tiles past z19 — deeper zoom renders a blank grey
-        // world, so clamp what the wheel/buttons can reach.
-        if self.map_memory.zoom() > 19.0 {
-            let _ = self.map_memory.set_zoom(19.0);
+        // Past MAX_MAP_ZOOM even magnified z19 pixels stop being useful.
+        if self.map_memory.zoom() > MAX_MAP_ZOOM {
+            let _ = self.map_memory.set_zoom(MAX_MAP_ZOOM);
         }
         // `my_position` is only the fallback camera anchor before the
         // first fix arrives; Ermioni harbour is as good a default as any.
