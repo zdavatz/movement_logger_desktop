@@ -1,0 +1,12 @@
+[package]
+name = "race-relay"
+version = "0.1.0"
+edition = "2021"
+description = "UDP fan-out relay for MovementLogger Race Mode — lets riders stream over cellular to a public server instead of venue WiFi."
+license = "GPL-3.0-only"
+
+[dependencies]
+# Only used to peek at two fields (sub / race) of each datagram; the
+# original bytes are forwarded untouched.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

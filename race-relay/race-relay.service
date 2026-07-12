@@ -1,0 +1,26 @@
+# systemd unit for the MovementLogger race relay.
+#
+#   sudo cp race-relay /usr/local/bin/
+#   sudo cp race-relay.service /etc/systemd/system/
+#   sudo systemctl enable --now race-relay
+#   sudo ufw allow 47777/udp        # or your firewall's equivalent
+#
+# Runs fine on the same machine as a web server — Apache/nginx own
+# TCP 80/443, the relay owns UDP 47777.
+
+[Unit]
+Description=MovementLogger Race Mode UDP relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/race-relay --port 47777
+Restart=always
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

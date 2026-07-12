@@ -6,6 +6,7 @@ members = [
     "usb-console",
     "gps-debug",
     "race-setup-pdf",
+    "race-relay",
 ]
 exclude = [
     # Vendored, patched winit fork pulled in via [patch.crates-io] from

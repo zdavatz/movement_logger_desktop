@@ -207,6 +207,11 @@ pub struct RaceState {
     /// Port text field (kept as text so a half-typed value doesn't
     /// fight the parser).
     port_text: String,
+    /// Listen through a public race-relay instead of the local port —
+    /// riders send over cellular to the same relay address.
+    via_relay: bool,
+    /// Relay `host:port` (or bare host — the race port is appended).
+    relay_text: String,
     listener: Option<Listener>,
     riders: BTreeMap<String, Rider>,
     /// Follow mode: keep the camera centred on the riders' centroid.
@@ -238,6 +243,8 @@ impl Default for RaceState {
     fn default() -> Self {
         Self {
             port_text: DEFAULT_PORT.to_string(),
+            via_relay: false,
+            relay_text: String::new(),
             listener: None,
             riders: BTreeMap::new(),
             follow: true,
@@ -306,6 +313,64 @@ fn dist_m(a: Position, b: Position) -> f64 {
     let dlat = (a.lat() - b.lat()) * m_per_deg;
     let dlon = (a.lon() - b.lon()) * m_per_deg * a.lat().to_radians().cos();
     (dlat * dlat + dlon * dlon).sqrt()
+}
+
+/// Viewer-side relay listener: instead of binding the race port
+/// locally, subscribe to a public `race-relay` (see the race-relay
+/// crate) and receive the riders' datagrams forwarded from there —
+/// riders send to the SAME relay address over cellular. The keepalive
+/// (every 10 s) both refreshes the subscription and holds this
+/// machine's NAT pinhole open, so no port forwarding is needed
+/// anywhere.
+fn spawn_relay_listener(
+    relay: String,
+    ctx: egui::Context,
+) -> Result<Listener, std::io::Error> {
+    use std::net::ToSocketAddrs;
+    let relay_addr = relay
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "relay not resolvable"))?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx): (Sender<RaceEvent>, Receiver<RaceEvent>) = std::sync::mpsc::channel();
+    let stop_thread = stop.clone();
+    std::thread::Builder::new()
+        .name("race-relay-sub".into())
+        .spawn(move || {
+            let mut buf = [0u8; 2048];
+            let mut last_keepalive = Instant::now() - Duration::from_secs(60);
+            loop {
+                if stop_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                if last_keepalive.elapsed() >= Duration::from_secs(10) {
+                    let _ = socket.send_to(br#"{"v":1,"sub":true}"#, relay_addr);
+                    last_keepalive = Instant::now();
+                }
+                match socket.recv_from(&mut buf) {
+                    Ok((n, _from)) => {
+                        let ev = match serde_json::from_slice::<RaceFix>(&buf[..n]) {
+                            Ok(fix) if fix.lat.is_finite() && fix.lon.is_finite() => {
+                                RaceEvent::Fix(fix)
+                            }
+                            _ => RaceEvent::Bad,
+                        };
+                        if tx.send(ev).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                    }
+                    Err(_) => {}
+                }
+            }
+        })?;
+    Ok(Listener {
+        stop,
+        rx,
+        port: relay_addr.port(),
+    })
 }
 
 /// This machine's LAN IPv4, via the connected-UDP-socket trick (no
@@ -399,7 +464,16 @@ impl RaceState {
     fn start(&mut self, ctx: &egui::Context) {
         let port: u16 = self.port_text.trim().parse().unwrap_or(DEFAULT_PORT);
         self.port_text = port.to_string();
-        match spawn_listener(port, ctx.clone()) {
+        let result = if self.via_relay {
+            let mut relay = self.relay_text.trim().to_string();
+            if !relay.contains(':') {
+                relay = format!("{relay}:{port}");
+            }
+            spawn_relay_listener(relay, ctx.clone())
+        } else {
+            spawn_listener(port, ctx.clone())
+        };
+        match result {
             Ok(l) => {
                 self.local_ip = local_lan_ip();
                 // New race log per listen session.
@@ -552,6 +626,21 @@ impl RaceState {
                 self.listener.is_none(),
                 egui::TextEdit::singleline(&mut self.port_text).desired_width(60.0),
             );
+            ui.add_enabled_ui(self.listener.is_none(), |ui| {
+                ui.checkbox(&mut self.via_relay, "Via relay")
+                    .on_hover_text(
+                        "Subscribe to a public race-relay instead of listening \
+                         locally — riders send over cellular to the same relay \
+                         address (see the race-relay binary in the release).",
+                    );
+                if self.via_relay {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.relay_text)
+                            .hint_text("relay.example.ch")
+                            .desired_width(160.0),
+                    );
+                }
+            });
             if self.listener.is_none() {
                 if ui.button("Start listening").clicked() {
                     self.start(&ui.ctx().clone());
@@ -578,8 +667,15 @@ impl RaceState {
         });
         ui.horizontal(|ui| {
             if let Some(l) = &self.listener {
-                let ip = self.local_ip.as_deref().unwrap_or("this machine's IP");
-                ui.label(format!("Phones send to  {ip}:{}", l.port));
+                if self.via_relay {
+                    ui.label(format!(
+                        "Riders send to the relay:  {}",
+                        self.relay_text.trim()
+                    ));
+                } else {
+                    let ip = self.local_ip.as_deref().unwrap_or("this machine's IP");
+                    ui.label(format!("Phones send to  {ip}:{}", l.port));
+                }
                 ui.separator();
                 ui.label(format!("{} datagrams", self.datagrams));
                 if self.bad_datagrams > 0 {
@@ -819,6 +915,41 @@ mod tests {
         assert!(painted_tile_meshes(22.0, None) > 0, "no tile meshes at z22");
     }
 
+
+    /// Relay-mode round trip: the subscriber sends its keepalive to a
+    /// fake relay, which answers with a rider datagram back through the
+    /// same NAT path — the listener must surface it as a normal fix.
+    #[test]
+    fn relay_subscriber_receives_forwarded_fixes() {
+        let fake_relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        fake_relay
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let relay_addr = fake_relay.local_addr().unwrap();
+
+        let l = spawn_relay_listener(relay_addr.to_string(), egui::Context::default())
+            .expect("subscribe");
+
+        // The listener's first keepalive reveals its address.
+        let mut buf = [0u8; 512];
+        let (n, subscriber) = fake_relay.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], br#"{"v":1,"sub":true}"#);
+
+        let fix = br#"{"v":1,"rider":"Zeno","src":"phone","lat":47.37,"lon":8.54,"kmh":12.0}"#;
+        fake_relay.send_to(fix, subscriber).unwrap();
+
+        let got = l
+            .rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("forwarded fix");
+        match got {
+            RaceEvent::Fix(f) => {
+                assert_eq!(f.rider, "Zeno");
+                assert!((f.lat - 47.37).abs() < 1e-9);
+            }
+            RaceEvent::Bad => panic!("fix failed to parse"),
+        }
+    }
 
     /// Network test: the overzoom wrapper must serve a magnified z19
     /// tile for a z22 request (Ermioni harbour). Proves download +

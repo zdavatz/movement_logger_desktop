@@ -171,6 +171,18 @@ source, battery, staleness) and appends every datagram to
   timeout honouring a stop flag; events cross to the UI over `mpsc` +
   `request_repaint`. OSM tiles cached at `~/.movementlogger/tiles-cache`
   with an identifying UA (tile policy).
+- **Cellular races — `race-relay` (own workspace crate)**: a ~150-line
+  UDP fan-out relay for a public Linux server (static musl binary +
+  systemd unit shipped with every release; runs fine next to Apache —
+  TCP vs UDP 47777). Riders enter the relay's `host:port` in the same
+  Race card (zero app changes); the relay forwards rider datagrams
+  byte-for-byte to every subscribed viewer. Viewers = the Race tab's
+  **"Via relay"** mode (`spawn_relay_listener`): binds an ephemeral
+  socket and sends `{"v":1,"sub":true}` keepalives every 10 s — which
+  both refresh the 30 s subscription and hold the viewer's NAT pinhole
+  open, so no port forwarding is needed anywhere. Optional `race`
+  token in subscribe + datagrams separates concurrent races (empty
+  matches empty, so token-less setups just work).
 
 ## ERRLOG auto-check — `errlog_check.rs` + `--check-errlog`
 

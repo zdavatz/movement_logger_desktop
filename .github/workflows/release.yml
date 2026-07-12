@@ -313,9 +313,59 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  # The race relay is a server-side tool: one static musl binary that
+  # runs on any Linux box (see race-relay/). Shipped with every release
+  # so an organizer can scp it onto their server without a toolchain.
+  relay:
+    name: build race-relay (linux server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: cargo build race-relay
+        run: cargo build --release --target x86_64-unknown-linux-musl -p race-relay
+
+      - name: resolve version
+        id: vars
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "stem=race-relay-${tag}-x86_64-unknown-linux-musl" >> "$GITHUB_OUTPUT"
+
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stem="${{ steps.vars.outputs.stem }}"
+          mkdir -p "dist/$stem"
+          cp target/x86_64-unknown-linux-musl/release/race-relay "dist/$stem/"
+          cp race-relay/race-relay.service "dist/$stem/"
+          cd dist
+          tar czf "$stem.tar.gz" "$stem"
+          sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.vars.outputs.stem }}
+          path: |
+            dist/${{ steps.vars.outputs.stem }}.tar.gz
+            dist/${{ steps.vars.outputs.stem }}.tar.gz.sha256
+          retention-days: 30
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, relay]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
