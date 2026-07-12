@@ -221,8 +221,10 @@ struct RidersPlugin<'r> {
 }
 
 impl Plugin for RidersPlugin<'_> {
-    fn run(self: Box<Self>, ui: &mut egui::Ui, _response: &egui::Response, projector: &Projector) {
-        let painter = ui.painter();
+    fn run(self: Box<Self>, ui: &mut egui::Ui, response: &egui::Response, projector: &Projector) {
+        // Clip to the map widget itself — trails of off-screen points
+        // otherwise paint straight over the toolbar and rider list.
+        let painter = ui.painter().with_clip_rect(response.rect);
         for rider in self.riders.values() {
             let stale = rider.last_rx.elapsed() > STALE_AFTER;
             let color = if stale {
@@ -510,6 +512,11 @@ impl RaceState {
             if let Some(c) = self.centroid() {
                 self.map_memory.center_at(c);
             }
+        }
+        // OSM has no tiles past z19 — deeper zoom renders a blank grey
+        // world, so clamp what the wheel/buttons can reach.
+        if self.map_memory.zoom() > 19.0 {
+            let _ = self.map_memory.set_zoom(19.0);
         }
         // `my_position` is only the fallback camera anchor before the
         // first fix arrives; Ermioni harbour is as good a default as any.
