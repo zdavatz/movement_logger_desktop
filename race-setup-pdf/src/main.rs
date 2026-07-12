@@ -108,12 +108,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Requirements -----------------------------------------------------
     p.heading("Requirements");
     p.body("- All phones and the desktop computer on the same WiFi network (club/venue WiFi works fine).");
-    p.body("- Versions: Desktop app 0.0.67 or newer, Android app 0.0.52 or newer, iOS app 1.0.29 or newer.");
+    p.body("- Versions: Desktop app 0.0.67 or newer, Android app 0.0.52 or newer, iOS app 1.0.30 or newer.");
     p.body("- Android riders: a u-blox USB GNSS receiver plugged into the phone. iPhone riders: nothing extra.");
 
     // --- Desktop ----------------------------------------------------------
     p.heading("1 — Desktop (race committee)");
-    p.body("1. Install: github.com/zdavatz/movement_logger_desktop -> Releases (macOS DMG, Windows zip, Linux tar).");
+    p.body("1. Install: github.com/zdavatz/movement_logger_desktop/releases (macOS DMG, Windows zip, Linux tar).");
     p.body("2. Open the app -> Race tab -> click \"Start listening\".");
     p.body("3. The header now shows:  Phones send to  <IP>:47777   — riders enter exactly these two values.");
     p.body("4. Map controls: scroll or double-click or the -/+ buttons to zoom; \"Satellite\" switches to imagery;");
@@ -122,14 +122,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Android ----------------------------------------------------------
     p.heading("2 — Android rider (u-blox USB GPS)");
-    p.body("1. Install \"Movement Logger\" from Google Play.");
+    p.body("1. Install \"Movement Logger\" from Google Play: play.google.com/store/apps/details?id=ch.ywesee.movementlogger");
     p.body("2. Plug the u-blox receiver into USB-C -> GPS tab -> Connect (allow USB access).");
     p.body("3. In the \"Race mode\" card: enter your rider name + the desktop IP and port from step 1.3 -> toggle ON.");
     p.body("4. \"Sending — N fixes\" counts up as soon as the receiver has a GPS fix (needs sky view — go outside).");
 
     // --- iOS --------------------------------------------------------------
     p.heading("3 — iPhone / Apple Watch rider");
-    p.body("1. Install \"Movement Logger\" from the App Store.");
+    p.body("1. Install \"MovementLogger\" from the App Store: apps.apple.com/app/id6769086271");
     p.body("2. GPS tab -> \"Race mode\" card: rider name + the desktop IP and port, then pick the GPS source:");
     p.body("   - iPhone GPS: toggle ON — done. The phone's own GPS starts automatically.");
     p.body("   - Apple Watch: toggle ON, then start a recording in the watch app. The watch streams its fixes");
@@ -212,7 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &regular,
         8.0,
         0.0,
-        "github.com/zdavatz/movement_logger_desktop   ·   movement_logger_android   ·   movement_logger_ios",
+        "Desktop: github.com/zdavatz/movement_logger_desktop/releases   ·   Android: play.google.com/store/apps/details?id=ch.ywesee.movementlogger   ·   iPhone: apps.apple.com/app/id6769086271",
     );
 
     doc.save(&mut BufWriter::new(File::create(&out)?))?;
