@@ -12,7 +12,7 @@
 //!
 //! ```json
 //! {"v":1,"rider":"Zeno","src":"ublox","lat":37.3838,"lon":23.2472,
-//!  "kmh":4.2,"deg":181.0,"ts":1783948000123,"batt":85}
+//!  "kmh":4.2,"deg":181.0,"ts":1783948000123,"batt":85,"acc":2.7,"sat":12}
 //! ```
 //!
 //! `src` = "ublox" (Android dongle) | "phone" (iPhone GPS) | "watch"
@@ -50,6 +50,14 @@ const TRAIL_LEN: usize = 600;
 /// perfectly still — without the dead-band a parked phone scribbles a
 /// knot. The dot itself always shows the raw latest fix.
 const TRAIL_MIN_STEP_M: f64 = 3.0;
+
+/// Fixes with a worse sender-reported accuracy than this never enter
+/// the trail (the dot + accuracy circle still show them honestly).
+const MAX_TRAIL_ACC_M: f64 = 20.0;
+
+/// A hop implying more than this between consecutive fixes is a
+/// multipath jump, not movement — same clip as the ride-map stats.
+const MAX_TRAIL_JUMP_KMH: f64 = 60.0;
 
 /// OSM serves tiles up to z19; deeper zoom magnifies those via
 /// [`OverzoomTiles`], readable to about z22.
@@ -148,6 +156,14 @@ pub struct RaceFix {
     /// Sender battery percent, -1 = unknown.
     #[serde(default = "batt_unknown")]
     pub batt: i32,
+    /// Estimated horizontal accuracy in metres (CoreLocation's
+    /// `horizontalAccuracy` on iOS, ~HDOP-derived on Android). NaN when
+    /// the sender doesn't know.
+    #[serde(default = "nan")]
+    pub acc: f64,
+    /// Satellites used in the fix, -1 = unknown (iOS doesn't expose it).
+    #[serde(default = "batt_unknown")]
+    pub sat: i32,
 }
 
 fn nan() -> f64 {
@@ -344,8 +360,20 @@ impl Plugin for RidersPlugin<'_> {
                 painter.add(egui::Shape::line(pts, egui::Stroke::new(3.0, color)));
             }
             // Dot + white ring at the latest fix.
-            let v = projector.project(Position::from_lat_lon(rider.last.lat, rider.last.lon));
+            let pos = Position::from_lat_lon(rider.last.lat, rider.last.lon);
+            let v = projector.project(pos);
             let at = egui::pos2(v.x, v.y);
+            // Accuracy circle first (under the dot): the receiver's own
+            // uncertainty estimate, so an imprecise fix LOOKS imprecise
+            // instead of pretending — next to a house this is tens of
+            // metres, on open water a couple.
+            if rider.last.acc.is_finite() && rider.last.acc > 0.0 {
+                let r = projector.scale_pixel_per_meter(pos) * rider.last.acc as f32;
+                if r > 9.0 {
+                    painter.circle_filled(at, r, color.gamma_multiply(0.12));
+                    painter.circle_stroke(at, r, egui::Stroke::new(1.0, color.gamma_multiply(0.5)));
+                }
+            }
             painter.circle_filled(at, 7.0, color);
             painter.circle_stroke(at, 7.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
             // Name label with a soft plate behind it for readability
@@ -384,7 +412,7 @@ impl RaceState {
                 let path = dir.join(name);
                 if let Ok(f) = File::create(&path) {
                     let mut w = BufWriter::new(f);
-                    let _ = writeln!(w, "rx_iso,rider,src,lat,lon,kmh,deg,ts,batt");
+                    let _ = writeln!(w, "rx_iso,rider,src,lat,lon,kmh,deg,ts,batt,acc,sat");
                     self.log = Some(w);
                     self.log_path = Some(path);
                 }
@@ -426,7 +454,7 @@ impl RaceState {
             if let Some(w) = self.log.as_mut() {
                 let _ = writeln!(
                     w,
-                    "{},{},{},{:.7},{:.7},{:.2},{:.1},{},{}",
+                    "{},{},{},{:.7},{:.7},{:.2},{:.1},{},{},{:.1},{}",
                     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
                     fix.rider.replace(',', " "),
                     fix.src,
@@ -436,6 +464,8 @@ impl RaceState {
                     fix.deg,
                     fix.ts,
                     fix.batt,
+                    fix.acc,
+                    fix.sat,
                 );
             }
             let pos = Position::from_lat_lon(fix.lat, fix.lon);
@@ -455,6 +485,21 @@ impl RaceState {
                     trail: VecDeque::with_capacity(TRAIL_LEN),
                     color,
                 });
+            // Trail gates, judged BEFORE the fix replaces `last`:
+            //  - the sender's own accuracy estimate must be plausible;
+            //  - the implied speed from the previous raw fix must be
+            //    physically possible — a 50 m hop in half a second is a
+            //    multipath jump (house wall next to the antenna), not
+            //    movement, whatever HDOP claims.
+            let prev = Position::from_lat_lon(rider.last.lat, rider.last.lon);
+            let dt = rider.last_rx.elapsed().as_secs_f64();
+            let implied_kmh = if dt > 0.05 {
+                dist_m(prev, pos) / dt * 3.6
+            } else {
+                0.0
+            };
+            let trustworthy =
+                !(fix.acc > MAX_TRAIL_ACC_M) && implied_kmh <= MAX_TRAIL_JUMP_KMH;
             rider.last = fix;
             rider.last_rx = Instant::now();
             // Dead-band: a parked phone's GPS jitter must not scribble.
@@ -462,7 +507,7 @@ impl RaceState {
                 .trail
                 .back()
                 .map_or(true, |p| dist_m(*p, pos) >= TRAIL_MIN_STEP_M);
-            if moved {
+            if trustworthy && moved {
                 if rider.trail.len() == TRAIL_LEN {
                     rider.trail.pop_front();
                 }
@@ -592,9 +637,19 @@ impl RaceState {
                             } else {
                                 String::new()
                             };
+                            let acc = if r.last.acc.is_finite() {
+                                format!("  ·  ±{:.0} m", r.last.acc)
+                            } else {
+                                String::new()
+                            };
+                            let sats = if r.last.sat >= 0 {
+                                format!("  ·  {} sats", r.last.sat)
+                            } else {
+                                String::new()
+                            };
                             let line = format!(
-                                "{}  ·  {}  ·  {}{}",
-                                r.last.rider, kmh, r.last.src, batt
+                                "{}  ·  {}  ·  {}{}{}{}",
+                                r.last.rider, kmh, r.last.src, acc, sats, batt
                             );
                             if stale {
                                 ui.colored_label(
