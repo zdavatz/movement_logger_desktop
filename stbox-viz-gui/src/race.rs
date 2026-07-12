@@ -338,10 +338,16 @@ impl RaceState {
                 );
             }
             let pos = Position::from_lat_lon(fix.lat, fix.lon);
-            let color = rider_color(&fix.rider);
+            // Keyed by name AND source: two phones configured with the
+            // same rider name must become two dots, not one dot
+            // teleporting between them (and dragging the follow-camera
+            // along) — cost one live debugging round with a simulator
+            // and a real phone both named "Zeno".
+            let key = format!("{}·{}", fix.rider, fix.src);
+            let color = rider_color(&key);
             let rider = self
                 .riders
-                .entry(fix.rider.clone())
+                .entry(key)
                 .or_insert_with(|| Rider {
                     last: fix.clone(),
                     last_rx: Instant::now(),
@@ -404,6 +410,15 @@ impl RaceState {
             if ui.button("Clear riders").clicked() {
                 self.riders.clear();
                 self.centered_once = false;
+            }
+            ui.separator();
+            // Explicit zoom controls; the map also zooms with the scroll
+            // wheel / pinch and double-click.
+            if ui.button("−").on_hover_text("Zoom out").clicked() {
+                let _ = self.map_memory.zoom_out();
+            }
+            if ui.button("+").on_hover_text("Zoom in").clicked() {
+                let _ = self.map_memory.zoom_in();
             }
         });
         ui.horizontal(|ui| {
@@ -506,6 +521,11 @@ impl RaceState {
             &mut self.map_memory,
             anchor,
         )
+        // Plain scroll wheel / pinch zooms (walkers' default demands
+        // Ctrl+scroll, which reads as "the map can't zoom"), and
+        // double-click steps in a level like every web map.
+        .zoom_with_ctrl(false)
+        .double_click_to_zoom(true)
         .with_plugin(RidersPlugin {
             riders: &self.riders,
         });
