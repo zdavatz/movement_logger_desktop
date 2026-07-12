@@ -813,7 +813,8 @@ impl RaceState {
             let _ = self.map_memory.set_zoom(MAX_MAP_ZOOM);
         }
         // `my_position` is only the fallback camera anchor before the
-        // first fix arrives; Ermioni harbour is as good a default as any.
+        // first fix arrives; Zürich is as good a default as any — the
+        // camera jumps to the riders the moment the first fix lands.
         let anchor = self
             .centroid()
             .unwrap_or(Position::from_lat_lon(47.3769, 8.5417));
