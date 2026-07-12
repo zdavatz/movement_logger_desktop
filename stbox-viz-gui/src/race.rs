@@ -56,6 +56,34 @@ const TRAIL_MIN_STEP_M: f64 = 3.0;
 const TILE_MAX_NATIVE_ZOOM: u8 = 19;
 const MAX_MAP_ZOOM: f64 = 22.0;
 
+/// Esri World Imagery — satellite tiles, the view that actually shows
+/// something at deep zoom where OSM carto is a featureless landuse
+/// fill (a rural backyard at z21 is one uniform `#E0DFDF` rectangle).
+/// Note the `z/y/x` path order, unlike OSM's `z/x/y`.
+struct EsriWorldImagery;
+
+impl walkers::sources::TileSource for EsriWorldImagery {
+    fn tile_url(&self, tile_id: TileId) -> String {
+        format!(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{}/{}/{}",
+            tile_id.zoom, tile_id.y, tile_id.x
+        )
+    }
+
+    fn attribution(&self) -> walkers::sources::Attribution {
+        walkers::sources::Attribution {
+            text: "Esri, Maxar, Earthstar Geographics",
+            url: "https://www.esri.com",
+            logo_light: None,
+            logo_dark: None,
+        }
+    }
+
+    fn max_zoom(&self) -> u8 {
+        TILE_MAX_NATIVE_ZOOM
+    }
+}
+
 /// Tile source wrapper that answers requests beyond the server's
 /// native maximum zoom with a magnified sub-rect of the deepest real
 /// tile — blurry but usable, instead of walkers' blank grey world.
@@ -178,6 +206,12 @@ pub struct RaceState {
     log_path: Option<PathBuf>,
     log: Option<BufWriter<File>>,
     tiles: Option<OverzoomTiles>,
+    /// Esri World Imagery instance, created on first use of the
+    /// Satellite toggle.
+    tiles_sat: Option<OverzoomTiles>,
+    /// Satellite view — the useful style at deep zoom, where OSM carto
+    /// over water or plain land is a single featureless colour.
+    satellite: bool,
     map_memory: MapMemory,
     /// First fix centres + zooms the map once; after that the camera
     /// belongs to the user (or the follow toggle).
@@ -197,6 +231,8 @@ impl Default for RaceState {
             log_path: None,
             log: None,
             tiles: None,
+            tiles_sat: None,
+            satellite: false,
             map_memory: MapMemory::default(),
             centered_once: false,
         }
@@ -492,6 +528,8 @@ impl RaceState {
             if ui.button("+").on_hover_text("Zoom in").clicked() {
                 let _ = self.map_memory.zoom_in();
             }
+            ui.checkbox(&mut self.satellite, "Satellite")
+                .on_hover_text("Esri World Imagery — shows real detail at deep zoom");
         });
         ui.horizontal(|ui| {
             if let Some(l) = &self.listener {
@@ -564,17 +602,27 @@ impl RaceState {
         }
 
         // Map — created lazily so the tiles cache/UA are set up with a
-        // live egui context.
-        if self.tiles.is_none() {
-            let opts = HttpOptions {
-                cache: Some(crate::agent_config::movementlogger_home().join("tiles-cache")),
+        // live egui context. One instance per style, each with its own
+        // disk cache.
+        fn opts(dir: &str) -> HttpOptions {
+            HttpOptions {
+                cache: Some(crate::agent_config::movementlogger_home().join(dir)),
                 user_agent: Some(walkers::HeaderValue::from_static(
                     "MovementLogger-Desktop (github.com/zdavatz/movement_logger_desktop)",
                 )),
-            };
+            }
+        }
+        if self.tiles.is_none() {
             self.tiles = Some(OverzoomTiles(HttpTiles::with_options(
                 walkers::sources::OpenStreetMap,
-                opts,
+                opts("tiles-cache"),
+                ui.ctx().clone(),
+            )));
+        }
+        if self.satellite && self.tiles_sat.is_none() {
+            self.tiles_sat = Some(OverzoomTiles(HttpTiles::with_options(
+                EsriWorldImagery,
+                opts("tiles-cache-esri"),
                 ui.ctx().clone(),
             )));
         }
@@ -592,8 +640,13 @@ impl RaceState {
         let anchor = self
             .centroid()
             .unwrap_or(Position::from_lat_lon(47.3769, 8.5417));
+        let tiles = if self.satellite {
+            self.tiles_sat.as_mut()
+        } else {
+            self.tiles.as_mut()
+        };
         let map = Map::new(
-            self.tiles.as_mut().map(|t| t as &mut dyn walkers::Tiles),
+            tiles.map(|t| t as &mut dyn walkers::Tiles),
             &mut self.map_memory,
             anchor,
         )
@@ -606,13 +659,120 @@ impl RaceState {
             riders: &self.riders,
         });
         ui.add_sized(ui.available_size(), map);
-        ui.small("© OpenStreetMap contributors");
+        ui.small(if self.satellite {
+            "© Esri, Maxar, Earthstar Geographics"
+        } else {
+            "© OpenStreetMap contributors"
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run the full Map widget headlessly at a given zoom and return
+    /// how many textured (tile) meshes it painted after letting the
+    /// downloads land. Reproduces the app's exact paint path — flood
+    /// fill, projector, MapMemory — without a window.
+    fn painted_tile_meshes(zoom: f64, cache: Option<PathBuf>) -> usize {
+        let ctx = egui::Context::default();
+        let mut tiles = OverzoomTiles(HttpTiles::with_options(
+            walkers::sources::OpenStreetMap,
+            HttpOptions {
+                cache,
+                user_agent: Some(walkers::HeaderValue::from_static(
+                    "MovementLogger-Desktop test (github.com/zdavatz/movement_logger_desktop)",
+                )),
+            },
+            ctx.clone(),
+        ));
+        let mut mem = MapMemory::default();
+        mem.center_at(Position::from_lat_lon(37.3838, 23.2472));
+        mem.set_zoom(zoom).unwrap();
+        let pos = Position::from_lat_lon(37.3838, 23.2472);
+        for _ in 0..100 {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.add(Map::new(
+                            Some(&mut tiles as &mut dyn walkers::Tiles),
+                            &mut mem,
+                            pos,
+                        ));
+                    });
+                },
+            );
+            let textured = out
+                .shapes
+                .iter()
+                .filter(|s| matches!(&s.shape, egui::Shape::Mesh(m)
+                    if m.texture_id != egui::TextureId::default()))
+                .count();
+            if textured > 0 {
+                return textured;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        0
+    }
+
+    /// The whole widget must paint magnified tiles at z22 — guards the
+    /// overzoom path end-to-end (grey-world regression).
+    #[test]
+    fn map_paints_tiles_at_overzoom() {
+        assert!(painted_tile_meshes(22.0, None) > 0, "no tile meshes at z22");
+    }
+
+
+    /// Network test: the overzoom wrapper must serve a magnified z19
+    /// tile for a z22 request (Ermioni harbour). Proves download +
+    /// interpolation + UV composition without needing a window.
+    #[test]
+    fn overzoom_serves_magnified_tiles() {
+        let ctx = egui::Context::default();
+        let mut tiles = OverzoomTiles(HttpTiles::with_options(
+            walkers::sources::OpenStreetMap,
+            HttpOptions {
+                cache: None,
+                user_agent: Some(walkers::HeaderValue::from_static(
+                    "MovementLogger-Desktop test (github.com/zdavatz/movement_logger_desktop)",
+                )),
+            },
+            ctx,
+        ));
+        // Ermioni at z22.
+        let n = (1u64 << 22) as f64;
+        let x = ((23.2472 + 180.0) / 360.0 * n) as u32;
+        let lat_rad: f64 = 37.3838_f64.to_radians();
+        let y = ((1.0 - lat_rad.tan().asinh() / std::f64::consts::PI) / 2.0 * n) as u32;
+        let id = TileId { x, y, zoom: 22 };
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(t) = walkers::Tiles::at(&mut tiles, id) {
+                // A z22 view of a z19 tile covers 1/8 of it per axis.
+                assert!(
+                    t.uv.width() <= 0.13,
+                    "expected a sub-rect UV, got {:?}",
+                    t.uv
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no tile served within 15 s — download or interpolation broken"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 
     /// End-to-end through a real socket: bind, fire datagrams (one per
     /// sender platform + one broken), assert the parsed fixes and the
