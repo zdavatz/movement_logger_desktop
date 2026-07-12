@@ -9,7 +9,10 @@
 //! pre-wrapped by hand — keep body lines under ~105 characters so the
 //! page never overflows.
 
-use printpdf::{BuiltinFont, Color, IndirectFontRef, Line, Mm, PdfDocument, Point, Rgb};
+use printpdf::image_crate::codecs::jpeg::JpegDecoder;
+use printpdf::{
+    BuiltinFont, Color, Image, ImageTransform, IndirectFontRef, Line, Mm, PdfDocument, Point, Rgb,
+};
 use std::fs::File;
 use std::io::BufWriter;
 
@@ -146,6 +149,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     p.body("- Everything jumps or looks imprecise near buildings: watch the accuracy circle — GPS is a 2-5 m");
     p.body("  instrument; on open water it is at its best.");
     p.body("- Two riders must not use the same rider name on the same source type.");
+
+    // --- Screenshots strip ----------------------------------------------
+    // Three JPEGs from assets/ (checked into the repo so the PDF is
+    // reproducible). A missing file is skipped so the tool still works
+    // while a screenshot is being (re)taken.
+    p.heading("What it looks like");
+    let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let shots: [(&str, &str, f32); 3] = [
+        ("desktop.jpg", "Desktop — Race tab", 86.0),
+        ("android.jpg", "Android — Race mode card", 46.0),
+        ("iphone.jpg", "iPhone — Race mode card", 46.0),
+    ];
+    let strip_top = p.y - 1.5; // top edge for every image in the row
+    let mut x = MARGIN;
+    let mut strip_bottom = strip_top;
+    let caption_font = p.regular.clone();
+    for (file, caption, width_mm) in shots {
+        let path = assets.join(file);
+        let Ok(mut f) = File::open(&path) else {
+            eprintln!("skipping missing screenshot {}", path.display());
+            continue;
+        };
+        let Ok(decoder) = JpegDecoder::new(&mut f) else {
+            continue;
+        };
+        let Ok(img) = Image::try_from(decoder) else {
+            continue;
+        };
+        // Scale by DPI so the image is exactly `width_mm` wide.
+        let px_w = img.image.width.0 as f32;
+        let px_h = img.image.height.0 as f32;
+        let dpi = px_w / (width_mm / 25.4);
+        let height_mm = px_h / px_w * width_mm;
+        img.add_to_layer(
+            p.layer.clone(),
+            ImageTransform {
+                translate_x: Some(Mm(x)),
+                translate_y: Some(Mm(strip_top - height_mm)),
+                dpi: Some(dpi),
+                ..Default::default()
+            },
+        );
+        p.layer.use_text(
+            caption,
+            7.5,
+            Mm(x),
+            Mm(strip_top - height_mm - 3.2),
+            &caption_font,
+        );
+        strip_bottom = strip_bottom.min(strip_top - height_mm - 4.0);
+        x += width_mm + 4.0;
+    }
+    p.y = strip_bottom;
 
     // --- Footer -------------------------------------------------------------
     p.gap(4.0);

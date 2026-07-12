@@ -7,5 +7,6 @@ license = "GPL-3.0-only"
 
 [dependencies]
 # Classic pre-0.8 API (PdfDocument::new + builtin Helvetica fonts) — no
-# font files needed, fully deterministic output.
-printpdf = "0.7"
+# font files needed, fully deterministic output. embedded_images for
+# the three app screenshots in assets/.
+printpdf = { version = "0.7", features = ["embedded_images"] }
