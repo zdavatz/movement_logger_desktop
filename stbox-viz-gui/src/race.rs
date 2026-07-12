@@ -595,17 +595,32 @@ impl RaceState {
         }
     }
 
-    /// Riders' centroid — the follow-mode camera target.
+    /// Riders' centroid — the follow-mode camera target. Only riders
+    /// that are actively sending count: a stale ghost (a capsized
+    /// rider's last dot, a stray test datagram) must not drag the
+    /// camera off to the middle of nowhere. Falls back to everyone
+    /// when nobody is live, so the map still frames the field after
+    /// the race ends.
     fn centroid(&self) -> Option<Position> {
-        if self.riders.is_empty() {
+        let live: Vec<&Rider> = self
+            .riders
+            .values()
+            .filter(|r| r.last_rx.elapsed() <= STALE_AFTER)
+            .collect();
+        let pool: Vec<&Rider> = if live.is_empty() {
+            self.riders.values().collect()
+        } else {
+            live
+        };
+        if pool.is_empty() {
             return None;
         }
         let (mut lat, mut lon) = (0.0, 0.0);
-        for r in self.riders.values() {
+        for r in &pool {
             lat += r.last.lat;
             lon += r.last.lon;
         }
-        let n = self.riders.len() as f64;
+        let n = pool.len() as f64;
         Some(Position::from_lat_lon(lat / n, lon / n))
     }
 
