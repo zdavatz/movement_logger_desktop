@@ -1,0 +1,11 @@
+[package]
+name = "race-setup-pdf"
+version = "0.1.0"
+edition = "2021"
+description = "Generates the one-page Race Mode setup PDF (Desktop + Android + iOS/Watch) for handing to riders and race committees."
+license = "GPL-3.0-only"
+
+[dependencies]
+# Classic pre-0.8 API (PdfDocument::new + builtin Helvetica fonts) — no
+# font files needed, fully deterministic output.
+printpdf = "0.7"
