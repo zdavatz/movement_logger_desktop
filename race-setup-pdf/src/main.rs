@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     p.heading("Requirements");
     p.body("- All phones and the desktop computer on the same WiFi network (club/venue WiFi works fine).");
     p.body("- Versions: Desktop app 0.0.67 or newer, Android app 0.0.52 or newer, iOS app 1.0.30 or newer.");
-    p.body("- Android riders: a u-blox USB GNSS receiver plugged into the phone. iPhone riders: nothing extra.");
+    p.body("- No extra hardware required: phones use their own GPS; Android can also use a u-blox USB receiver.");
 
     // --- Desktop ----------------------------------------------------------
     p.heading("1 — Desktop (race committee)");
@@ -122,19 +122,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     p.note("Every received fix is also logged to ~/.movementlogger/race/race_<timestamp>.csv for post-race analysis.");
 
     // --- Android ----------------------------------------------------------
-    p.heading("2 — Android rider (u-blox USB GPS)");
+    p.heading("2 — Android rider (u-blox USB receiver or phone GPS)");
     p.body("1. Install \"Movement Logger\" from Google Play: play.google.com/store/apps/details?id=ch.ywesee.movementlogger");
-    p.body("2. Plug the u-blox receiver into USB-C -> GPS tab -> Connect (allow USB access).");
-    p.body("3. In the \"Race mode\" card: enter your rider name + the desktop IP and port from step 1.3 -> toggle ON.");
-    p.body("4. \"Sending — N fixes\" counts up as soon as the receiver has a GPS fix (needs sky view — go outside).");
+    p.body("2. GPS tab -> \"Race mode\" card: enter your rider name + the desktop IP and port from step 1.3.");
+    p.body("3. Pick the GPS source: \"u-blox USB\" (plug the receiver into USB-C and tap Connect first) or");
+    p.body("   \"Phone GPS\" (no extra hardware; allow the location permission) -> toggle ON.");
+    p.body("4. \"Sending — N fixes\" counts up as soon as there is a GPS fix (needs sky view — go outside).");
 
     // --- iOS --------------------------------------------------------------
     p.heading("3 — iPhone / Apple Watch rider");
     p.body("1. Install \"MovementLogger\" from the App Store: apps.apple.com/app/id6769086271");
     p.body("2. GPS tab -> \"Race mode\" card: rider name + the desktop IP and port, then pick the GPS source:");
     p.body("   - iPhone GPS: toggle ON — done. The phone's own GPS starts automatically.");
-    p.body("   - Apple Watch: toggle ON, then start a recording in the watch app. The watch streams its fixes");
-    p.body("     through the paired iPhone — keep the iPhone with you (it is the uplink).");
+    p.body("   - Apple Watch: toggle ON once with the iPhone nearby (hands the settings to the watch), then");
+    p.body("     start a recording in the watch app. With the iPhone around, fixes relay through it; without");
+    p.body("     it, the watch sends directly over the venue WiFi — watch-only riders work.");
 
     // --- Reading the map ----------------------------------------------------
     p.heading("Reading the map");
