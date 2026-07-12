@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Requirements -----------------------------------------------------
     p.heading("Requirements");
     p.body("- All phones and the desktop computer on the same WiFi network (club/venue WiFi works fine).");
-    p.body("- Versions: Desktop app 0.0.67 or newer, Android app 0.0.52 or newer, iOS app 1.0.30 or newer.");
+    p.body("- Versions: Desktop app 0.0.68 or newer, Android app 0.0.53 or newer, iOS app 1.0.31 or newer.");
     p.body("- No extra hardware required: phones use their own GPS; Android can also use a u-blox USB receiver.");
 
     // --- Desktop ----------------------------------------------------------
