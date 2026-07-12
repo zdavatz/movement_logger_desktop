@@ -545,7 +545,16 @@ impl RaceState {
                 }
                 if let Some(p) = &self.log_path {
                     ui.separator();
-                    ui.label(format!("log: {}", p.display()));
+                    // File name only: the full path overflowed narrow
+                    // windows and inflated the layout width, which
+                    // pushed the map rect (and the follow-camera's
+                    // centre) past the visible window centre.
+                    let name = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string());
+                    ui.label(format!("log: {name}"))
+                        .on_hover_text(p.display().to_string());
                 }
             } else {
                 ui.label(
@@ -628,7 +637,24 @@ impl RaceState {
         }
         if self.follow {
             if let Some(c) = self.centroid() {
-                self.map_memory.center_at(c);
+                // Camera dead-band: re-centring every frame made the map
+                // snap on every fix (GPS jitter!) and fight the
+                // pointer-anchored zoom gesture — at deep zoom the whole
+                // scene visibly jumped around ("the dot moves"). Only
+                // pull the camera once the centroid strays meaningfully
+                // from the current view centre.
+                let recenter = match self.map_memory.detached() {
+                    Some(cur) => {
+                        let zoom = self.map_memory.zoom();
+                        let m_per_px =
+                            156_543.033 * c.lat().to_radians().cos() / 2f64.powf(zoom);
+                        dist_m(c, cur) / m_per_px > 150.0
+                    }
+                    None => true,
+                };
+                if recenter {
+                    self.map_memory.center_at(c);
+                }
             }
         }
         // Past MAX_MAP_ZOOM even magnified z19 pixels stop being useful.
@@ -658,7 +684,14 @@ impl RaceState {
         .with_plugin(RidersPlugin {
             riders: &self.riders,
         });
-        ui.add_sized(ui.available_size(), map);
+        // Size the map to the VISIBLE area, never the layout's inflated
+        // width: any row wider than the window (a long path, many
+        // riders) used to grow `available_size` past the window edge,
+        // shifting the map rect — and everything follow centres on —
+        // sideways off the visible middle.
+        let visible = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+        let map_size = egui::vec2(visible.width(), (visible.height() - 14.0).max(50.0));
+        ui.add_sized(map_size, map);
         ui.small(if self.satellite {
             "© Esri, Maxar, Earthstar Geographics"
         } else {
