@@ -49,6 +49,13 @@ sha2 = "0.10"
 # (no OpenSSL on Linux, no Schannel quirks on Windows).
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
+# Race mode: parse the phones' UDP JSON position datagrams.
+serde_json = "1"
+
+# Race mode: interactive OSM slippy map inside egui for the live rider
+# view. 0.31 is the last release on egui 0.29 — bump together with
+# eframe/egui.
+walkers = "0.31"
 
 # Persisted agent/GUI config (~/.movementlogger/config.toml): box id,
 # save dir, keep-synced, box log mode. Shared by the GUI (writer) and

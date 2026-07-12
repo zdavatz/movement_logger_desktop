@@ -141,6 +141,37 @@ The **GPS Debug** tab (`enum Tab::Gps`) runs the `gps-debug` u-blox UBX survey (
 
 The firmware half lives in `movement_logger_firmware` (opcodes `0x0D GPS_BRIDGE` / `0x0E GPS_TX` in `ble.c`; raw UBX frame capture + `$PUBX,41` output-protocol toggle in `gps.c`). NMEA keeps flowing to the SD logger the whole time — enabling the bridge only *adds* UBX output on the port. See that repo's docs for the wire details.
 
+## Race tab — live multi-rider tracking (`race.rs`)
+
+Wingfoil-race screen: every rider's phone streams its GPS fix as one
+small JSON UDP datagram (1–2 Hz) to this machine; the tab plots live
+dots + trails on an OSM slippy map (`walkers` crate — **0.31 is the
+last release on egui 0.29**, bump together) with a rider list (speed,
+source, battery, staleness) and appends every datagram to
+`~/.movementlogger/race/race_<ts>.csv` for post-race replay.
+
+- **Wire format** (senders: Android `usb/RaceUplink.kt` from the u-blox
+  dongle stream, iOS `Location/RaceUplink.swift` from iPhone GPS or
+  Apple-Watch-relayed fixes):
+  `{"v":1,"rider":"Zeno","src":"ublox|phone|watch","lat":..,"lon":..,
+  "kmh":..,"deg":..,"ts":<epoch ms>,"batt":0-100}` — only
+  `rider`/`lat`/`lon` required; unknown numbers omitted. Default port
+  47777 on all three apps.
+- **Transport-agnostic by design**: on a venue LAN the phones send
+  straight to the Mac's IP (shown in the tab header on Start); over
+  cellular a dumb relay forwarding the same datagrams works unchanged.
+  Phone/laptop WiFi hotspots do NOT cover a 500 m course (~30–80 m
+  outdoors, ≤10-ish clients) — cellular or a shore-mounted outdoor AP
+  is the real deployment story.
+- Staleness is judged by **receive time**, not the sender `ts`, so
+  phone clock skew can't grey riders out. A stale (>5 s) rider stays on
+  the map dimmed — a capsized rider's last position is the interesting
+  one.
+- Listener is a plain `std::net::UdpSocket` thread with a 500 ms read
+  timeout honouring a stop flag; events cross to the UI over `mpsc` +
+  `request_repaint`. OSM tiles cached at `~/.movementlogger/tiles-cache`
+  with an identifying UA (tile policy).
+
 ## ERRLOG auto-check — `errlog_check.rs` + `--check-errlog`
 
 Automatic per-boot health grading of the box's mirrored `ERRLOG.LOG`. The

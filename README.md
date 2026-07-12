@@ -19,6 +19,10 @@ This GUI talks to one board only:
 
 Older SensorTile.box variants (Rev_A/B, STWIN.box) are **not** supported by this firmware/GUI combination.
 
+## Race tab — live rider tracking
+
+For a race (wingfoil, pumpfoil, …) every rider's phone can stream its live GPS position to this app: the **Race** tab listens on a UDP port (default 47777) and plots each rider as a coloured dot with a trail on an OpenStreetMap view, with a rider list showing speed, source and battery. Riders enable **Race mode** in the Android app (GPS tab — streams the u-blox dongle fixes) or the iOS app (GPS tab — iPhone GPS, or Apple Watch fixes relayed through the paired iPhone) and enter the `ip:port` the Race tab shows when it starts listening. On a shared WiFi the phones send directly; note a phone/laptop hotspot only reaches ~30–80 m outdoors, so a real 500 m course needs either cellular data (with a relay forwarding the datagrams to this machine) or a proper shore-mounted outdoor access point. Every received fix is also appended to `~/.movementlogger/race/race_<timestamp>.csv` for post-race analysis.
+
 ## Download
 
 Grab the latest archive for your platform from the [Releases page](https://github.com/zdavatz/movement_logger_desktop/releases).

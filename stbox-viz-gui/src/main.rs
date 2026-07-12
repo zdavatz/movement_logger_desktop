@@ -24,6 +24,7 @@ mod coord;
 mod errlog_check;
 mod installer;
 mod power;
+mod race;
 mod sync_core;
 mod sync_db;
 mod update;
@@ -63,6 +64,10 @@ enum Tab {
     Live,
     Sync,
     Replay,
+    /// Live multi-rider race tracking: UDP listener + OSM map with one
+    /// dot/trail per phone that's sending position datagrams (see
+    /// `race.rs` for the wire format and the Android/iOS senders).
+    Race,
     /// Diagnostics: BLE probe (headless --ble-debug as a child) + the
     /// GPS/antenna survey. One tab so every "send me the output" tool
     /// lives in the same place.
@@ -259,6 +264,8 @@ struct AppState {
     // ----- UI top-level tab + Live tab state ---------------------------
     /// Active top-level tab — drives the central panel switch.
     current_tab: Tab,
+    /// Race tab: UDP listener + live rider map (race.rs owns it all).
+    race: race::RaceState,
     /// Most recent SensorStream snapshot. Cleared on disconnect.
     latest_sample: Option<LiveSample>,
     /// Wall-clock instant the latest sample arrived. Used for the
@@ -3924,6 +3931,7 @@ impl eframe::App for AppState {
                     (Tab::Live,     "Live"),
                     (Tab::Sync,     "Sync"),
                     (Tab::Replay,   "Replay"),
+                    (Tab::Race,     "Race"),
                     (Tab::Debug,    "Debug"),
                     (Tab::Firmware, "Firmware"),
                 ] {
@@ -4018,6 +4026,7 @@ impl eframe::App for AppState {
                     return;
                 }
                 Tab::Debug    => { self.ui_debug_tab(ui);    return; }
+                Tab::Race     => { self.race.ui(ui);         return; }
                 Tab::Replay   => { /* fall through to original layout */ }
             }
 
