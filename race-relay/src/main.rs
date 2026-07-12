@@ -20,7 +20,7 @@
 //! TCP 80/443, this is UDP): `race-relay [--port 47777]`, open the
 //! port in the firewall, done. A systemd unit ships next to this file.
 //!
-//! Capacity maths: 50 riders × 2 Hz × ~200 B ≈ 20 KB/s in, times the
+//! Capacity maths: 50 riders × 5 Hz × ~200 B ≈ 50 KB/s in, times the
 //! handful of viewers out — a single blocking thread is plenty.
 
 use serde::Deserialize;

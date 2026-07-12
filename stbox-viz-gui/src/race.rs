@@ -2,7 +2,7 @@
 //! riders, each with an Android/iOS phone + GPS on the board nose).
 //!
 //! Transport-agnostic UDP listener: every phone fires one small JSON
-//! datagram per fix (1–2 Hz) at this machine's `ip:port`. On a venue
+//! datagram per fix (up to 5 Hz) at this machine's `ip:port`. On a venue
 //! LAN the phones send directly; over cellular a relay can forward the
 //! same datagrams unchanged, so this listener never needs to know.
 //!
@@ -42,8 +42,8 @@ pub const DEFAULT_PORT: u16 = 47777;
 /// what the race committee wants to see).
 const STALE_AFTER: Duration = Duration::from_secs(5);
 
-/// Trail points kept per rider — 600 ≈ 5 min at the senders' 2 Hz cap.
-const TRAIL_LEN: usize = 600;
+/// Trail points kept per rider — 1500 ≈ 5 min at the senders' 5 Hz cap.
+const TRAIL_LEN: usize = 1500;
 
 /// A new trail point is recorded only when the rider moved at least
 /// this far from the previous one. The u-blox jitters ±2.7 m RMS when
