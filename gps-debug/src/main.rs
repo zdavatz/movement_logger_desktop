@@ -43,6 +43,11 @@ struct Cli {
     /// Optional stop after N seconds. Omit to run until Ctrl-C.
     #[arg(long)]
     duration: Option<f64>,
+    /// One-shot: read the receiver's live configuration (UBX-CFG-VALGET,
+    /// RAM layer) for every key of the known-good u-center 2 chip export,
+    /// print each value, and mark divergences with ***. Read-only.
+    #[arg(long)]
+    read_config: bool,
 }
 
 fn main() -> Result<()> {
@@ -81,6 +86,10 @@ fn main() -> Result<()> {
             ),
         },
     };
+
+    if cli.read_config {
+        return gps_debug::read_config_serial(&port, cli.baud);
+    }
 
     survey::run(&survey::SurveyArgs {
         port: &port,

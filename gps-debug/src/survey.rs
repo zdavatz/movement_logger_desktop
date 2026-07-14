@@ -48,7 +48,7 @@ pub struct SurveyArgs<'a> {
 // ---- UBX framing --------------------------------------------------------
 
 /// 8-bit Fletcher checksum over `class .. payload-end` (UBX spec).
-fn ubx_checksum(body: &[u8]) -> (u8, u8) {
+pub(crate) fn ubx_checksum(body: &[u8]) -> (u8, u8) {
     let (mut a, mut b) = (0u8, 0u8);
     for &x in body {
         a = a.wrapping_add(x);
@@ -70,7 +70,7 @@ fn poll_frame((cls, id): (u8, u8)) -> [u8; 8] {
 /// `(class, id, payload)` frames as their checksums verify. Non-UBX bytes
 /// (NMEA, noise) are skipped by the sync-word hunt.
 #[derive(Default)]
-struct UbxParser {
+pub(crate) struct UbxParser {
     state: u8,
     cls: u8,
     id: u8,
@@ -81,7 +81,7 @@ struct UbxParser {
 }
 
 impl UbxParser {
-    fn push(&mut self, byte: u8, out: &mut Vec<(u8, u8, Vec<u8>)>) {
+    pub(crate) fn push(&mut self, byte: u8, out: &mut Vec<(u8, u8, Vec<u8>)>) {
         match self.state {
             0 => if byte == 0xB5 { self.state = 1; },
             // Saw 0xB5. 0x62 completes the sync word; a repeated 0xB5 keeps us

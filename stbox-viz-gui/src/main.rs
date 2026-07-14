@@ -2834,6 +2834,17 @@ impl AppState {
             {
                 self.gps_dbg_cancel.store(true, Ordering::SeqCst);
             }
+            if ui
+                .add_enabled(!running, egui::Button::new("⚙ Read config"))
+                .on_hover_text(
+                    "Read the receiver's live configuration (UBX-CFG-VALGET, RAM \
+                     layer) — every key of the known-good u-center 2 chip export — \
+                     and mark any value that differs from it. Read-only.",
+                )
+                .clicked()
+            {
+                self.start_gps_cfg_read();
+            }
             if running {
                 ui.spinner();
                 ui.colored_label(egui::Color32::LIGHT_GREEN, "polling…");
@@ -3096,6 +3107,92 @@ impl AppState {
             push_log(&log, "--- stopped ---".into());
             running.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// One-shot config readout for the GPS Debug tab ("⚙ Read config"):
+    /// `gps_debug::read_config_core` polls every key of the known-good
+    /// u-center 2 chip export over the selected transport (USB serial or
+    /// the box's BLE GPS bridge) and prints value + divergence marks into
+    /// the same log panel the survey uses. Shares the survey's running/
+    /// cancel flags so the two can't run concurrently and ■ Stop works.
+    fn start_gps_cfg_read(&mut self) {
+        if self.gps_dbg_running.load(Ordering::SeqCst) {
+            return;
+        }
+        self.gps_dbg_cancel.store(false, Ordering::SeqCst);
+
+        if self.gps_dbg_transport == GpsTransport::Ble {
+            if !matches!(self.sync.ble_state, BleState::Connected) {
+                push_log(
+                    &self.gps_dbg_log,
+                    "error: connect to the box in the Sync tab first — the config \
+                     readout tunnels the u-blox over the box's link."
+                        .into(),
+                );
+                return;
+            }
+            let Some(ble) = self.sync.ble.as_ref() else {
+                push_log(&self.gps_dbg_log, "error: BLE backend not running.".into());
+                return;
+            };
+            let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>();
+            ble.set_gps_data_sink(Some(data_tx));
+            ble.send(BleCmd::GpsBridge { on: true });
+            let cmd = ble.cmd_sender();
+            let cmd_off = ble.cmd_sender();
+
+            push_log(
+                &self.gps_dbg_log,
+                "BLE config readout — bridging the u-blox over the box".into(),
+            );
+            self.gps_dbg_running.store(true, Ordering::SeqCst);
+            let log = self.gps_dbg_log.clone();
+            let stop = self.gps_dbg_cancel.clone();
+            let running = self.gps_dbg_running.clone();
+            thread::spawn(move || {
+                let mut transport = BleTransport::new(cmd, data_rx);
+                if let Err(e) = gps_debug::read_config_core(
+                    &mut transport, stop, &mut |line| push_log(&log, line),
+                ) {
+                    push_log(&log, format!("error: {e}"));
+                }
+                let _ = cmd_off.send(BleCmd::GpsBridge { on: false });
+                running.store(false, Ordering::SeqCst);
+            });
+        } else {
+            let port = self.gps_dbg_port.trim().to_string();
+            if port.is_empty() {
+                push_log(
+                    &self.gps_dbg_log,
+                    "error: enter a serial port first \
+                     (e.g. /dev/cu.usbserial-XXXX, /dev/ttyACM0, COM3)."
+                        .into(),
+                );
+                return;
+            }
+            let baud: u32 = self.gps_dbg_baud.trim().parse().unwrap_or(38400);
+            push_log(
+                &self.gps_dbg_log,
+                format!("USB config readout — {port} @ {baud} baud"),
+            );
+            self.gps_dbg_running.store(true, Ordering::SeqCst);
+            let log = self.gps_dbg_log.clone();
+            let stop = self.gps_dbg_cancel.clone();
+            let running = self.gps_dbg_running.clone();
+            thread::spawn(move || {
+                match gps_debug::open_serial(&port, baud) {
+                    Ok(mut transport) => {
+                        if let Err(e) = gps_debug::read_config_core(
+                            &mut transport, stop, &mut |line| push_log(&log, line),
+                        ) {
+                            push_log(&log, format!("error: {e}"));
+                        }
+                    }
+                    Err(e) => push_log(&log, format!("error: {e}")),
+                }
+                running.store(false, Ordering::SeqCst);
+            });
+        }
     }
 
     fn ui_live_tab(&mut self, ui: &mut egui::Ui) {

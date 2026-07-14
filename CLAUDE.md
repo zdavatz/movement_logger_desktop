@@ -141,6 +141,42 @@ The **GPS Debug** tab (`enum Tab::Gps`) runs the `gps-debug` u-blox UBX survey (
 
 The firmware half lives in `movement_logger_firmware` (opcodes `0x0D GPS_BRIDGE` / `0x0E GPS_TX` in `ble.c`; raw UBX frame capture + `$PUBX,41` output-protocol toggle in `gps.c`). NMEA keeps flowing to the SD logger the whole time — enabling the bridge only *adds* UBX output on the port. See that repo's docs for the wire details.
 
+### ⚙ Read config — live chip config vs Peter's known-good export (v0.0.70+)
+
+The tab's **⚙ Read config** button (`start_gps_cfg_read`, main.rs) is a one-shot
+**UBX-CFG-VALGET** readout of the receiver's live RAM-layer configuration,
+key-for-key against Peter's known-good u-center 2 chip export
+(`01_known_good_before_reset.ucf`, 2026-07-14, 393 keys). Every key is printed
+into the survey's log panel (grouped `[CFG-…]`, official u-blox names); values
+that differ from the known-good reference are marked `***`, and a summary line
+closes the dump (`… 393 keys · N match · M differ · K unread`). Strictly
+read-only. Works over **both transports** — USB serial (in-process via
+`gps_debug::open_serial`, no sidecar) and the BLE box bridge (same
+`0x0D`/`0x0E` plumbing as the survey) — and shares the survey's
+running/cancel flags so the two can't overlap and ■ Stop works. CLI parity:
+`gps-debug --read-config [--port … --baud …]`.
+
+Engine + reference live in the `gps-debug` crate:
+
+- `cfg_read.rs` — chunked VALGET polls, **32 keys/request** (≈140 B request,
+  worst-case ≈400 B reply — under BLE FileCmd's 244 B write cap and the box
+  bridge's 1024 B frame cap). A receiver NAKs a VALGET containing *any* key it
+  doesn't know, so a NAK'd/timed-out chunk falls back to per-key polls — one
+  unsupported key (older module firmware) costs only itself.
+- `known_good.rs` — **generated** from the .ucf via pyubx2's config database
+  (all 393 key names resolved to official `CFG-…` form). Don't hand-edit
+  values; re-export from a healthy chip in u-center 2 and regenerate.
+
+**Reading the output on a healthy box:** the known-good export is "what the
+chip looked like in u-center 2 when it fixed", *not* "what the firmware
+configures" — so a box whose v0.0.41+ boot config landed correctly still shows
+~9 deliberate `***` diffs: the six NMEA `MSGOUT-…_UART1` rates the firmware
+silences (known-good has GGA/RMC/GSA/GLL/VTG = 1, GSV = 5), `UBX_NAV_SAT_UART1`
+10 vs 1, `UBX_NAV_SIG_UART1` 0 vs 1, and `CFG-SIGNAL-BDS_ENA` 0 vs 1 (firmware
+is GPS+Galileo only). Everything else — baud 230400, RATE-MEAS 100,
+PM-OPERATEMODE 0, INPROT/OUTPROT-UBX, GPS/GAL enables — should MATCH; any
+*other* `***` (or a wall of "no reply") is a real finding.
+
 ## Race tab — live multi-rider tracking (`race.rs`)
 
 Wingfoil-race screen: every rider's phone streams its GPS fix as one

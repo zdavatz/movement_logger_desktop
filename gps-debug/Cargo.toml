@@ -1,6 +1,6 @@
 [package]
 name = "gps-debug"
-version = "0.0.48"
+version = "0.0.49"
 edition = "2021"
 description = "Live UBX diagnostics readout from a u-blox receiver — antenna + mounting evaluation for the MovementLogger box. Ships next to MovementLogger as a sidecar."
 

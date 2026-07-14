@@ -5,6 +5,9 @@
 //! transports. See `survey.rs` for the wire details and `survey::run_core`
 //! for the transport-agnostic loop.
 
+pub mod cfg_read;
+pub mod known_good;
 pub mod survey;
 
+pub use cfg_read::{open_serial, read_config_core, read_config_serial};
 pub use survey::{detect_ports, run, run_core, SurveyArgs};
