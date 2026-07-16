@@ -10,11 +10,20 @@
 //!                        svUsed/prUsed, prRes  (the real antenna-quality signal)
 //!   * RF / antenna     — antStatus, antPower, noisePerMS, agcCnt,
 //!                        cwSuppression (jamInd), jammingState
+//!   * L1 spectrum      — UBX-MON-SPAN, the receiver's built-in coarse
+//!                        spectrum analyzer (256 bins across the GNSS band).
+//!                        Amplitudes aren't calibrated, but A/B comparisons
+//!                        (case open vs. closed, subsystem on vs. off) show
+//!                        *which frequency* an interferer sits on — the
+//!                        fastest way from "GPS is jammed" to "by that clock".
+//!                        M8 receivers don't answer the poll; skipped then.
 //!
-//! Two CSVs are written: `<label>_gnss_epoch.csv` (one row per second) and
-//! `<label>_gnss_signals.csv` (one row per tracked signal per second). The
-//! `--label` ends up in both the filename and a column so you can A/B several
-//! antennas/positions and concatenate the runs later.
+//! Three CSVs are written: `<label>_gnss_epoch.csv` (one row per second),
+//! `<label>_gnss_signals.csv` (one row per tracked signal per second) and
+//! `<label>_gnss_spectrum.csv` (one row per second per RF block; only created
+//! once the receiver actually answers MON-SPAN). The `--label` ends up in both
+//! the filename and a column so you can A/B several antennas/positions and
+//! concatenate the runs later.
 //!
 //! **Non-destructive:** we only ever *poll* (send zero-length UBX requests).
 //! The receiver's own message rates / configuration are never written, so this
@@ -30,11 +39,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // ---- UBX message identifiers (class, id) --------------------------------
-const NAV_PVT: (u8, u8) = (0x01, 0x07);
-const NAV_DOP: (u8, u8) = (0x01, 0x04);
-const NAV_SAT: (u8, u8) = (0x01, 0x35);
-const NAV_SIG: (u8, u8) = (0x01, 0x43);
-const MON_RF:  (u8, u8) = (0x0A, 0x38);
+const NAV_PVT:  (u8, u8) = (0x01, 0x07);
+const NAV_DOP:  (u8, u8) = (0x01, 0x04);
+const NAV_SAT:  (u8, u8) = (0x01, 0x35);
+const NAV_SIG:  (u8, u8) = (0x01, 0x43);
+const MON_RF:   (u8, u8) = (0x0A, 0x38);
+const MON_SPAN: (u8, u8) = (0x0A, 0x31);
 
 // ---- CLI args -----------------------------------------------------------
 pub struct SurveyArgs<'a> {
@@ -149,6 +159,24 @@ struct SigInfo { gnss: u8, sv: u8, sig: u8, cno: u8, pr_res_m: f64, qual: u8, pr
 #[derive(Clone, Default)]
 struct MonRf { ant_status: u8, ant_power: u8, noise_per_ms: u16, agc_cnt: u16, jam_ind: u8, jamming_state: u8 }
 
+/// One RF block of a UBX-MON-SPAN reply — the receiver's coarse spectrum
+/// snapshot: 256 amplitude bins (uncalibrated) covering `span_hz` around
+/// `center_hz`. Single-band MAX-M10S reports one block (L1).
+#[derive(Clone)]
+struct SpanBlock { spectrum: Vec<u8>, span_hz: u32, res_hz: u32, center_hz: u32, pga_db: u8 }
+
+impl SpanBlock {
+    /// Frequency of bin `i` in Hz (bin 0 = center - span/2).
+    fn bin_freq_hz(&self, i: usize) -> f64 {
+        self.center_hz as f64 - self.span_hz as f64 / 2.0 + i as f64 * self.res_hz as f64
+    }
+    /// (bin index, amplitude) of the strongest bin.
+    fn peak(&self) -> (usize, u8) {
+        self.spectrum.iter().copied().enumerate()
+            .max_by_key(|&(_, a)| a).map(|(i, a)| (i, a)).unwrap_or((0, 0))
+    }
+}
+
 fn parse_nav_pvt(p: &[u8]) -> Option<NavPvt> {
     if p.len() < 78 { return None; }
     Some(NavPvt {
@@ -217,6 +245,27 @@ fn parse_mon_rf(p: &[u8]) -> Option<MonRf> {
     })
 }
 
+/// UBX-MON-SPAN: version U1, numRfBlocks U1, reserved U1[2], then per block
+/// spectrum U1[256] + span U4 + res U4 + center U4 + pga U1 + reserved U1[3]
+/// (272 B/block). Not supported on M8 — those receivers simply never reply.
+fn parse_mon_span(p: &[u8]) -> Vec<SpanBlock> {
+    let mut v = Vec::new();
+    if p.len() < 4 { return v; }
+    let n = p[1] as usize;
+    for i in 0..n {
+        let o = 4 + i * 272;
+        if o + 272 > p.len() { break; }
+        v.push(SpanBlock {
+            spectrum: p[o..o + 256].to_vec(),
+            span_hz: u32le(p, o + 256),
+            res_hz: u32le(p, o + 260),
+            center_hz: u32le(p, o + 264),
+            pga_db: p[o + 268],
+        });
+    }
+    v
+}
+
 // ---- enum → text decoders ----------------------------------------------
 fn gnss_name(id: u8) -> &'static str {
     match id { 0 => "GPS", 1 => "SBAS", 2 => "Galileo", 3 => "BeiDou", 4 => "IMES", 5 => "QZSS", 6 => "GLONASS", 7 => "NavIC", _ => "?" }
@@ -251,6 +300,7 @@ struct Epoch {
     sats: Vec<SatInfo>,
     sigs: Vec<SigInfo>,
     rf: Option<MonRf>,
+    span: Vec<SpanBlock>,
 }
 
 fn now_iso() -> String {
@@ -305,6 +355,10 @@ pub fn run_core<T: Read + Write>(
         .collect();
     let epoch_path: PathBuf = out_dir.join(format!("{safe_label}_gnss_epoch.csv"));
     let sig_path: PathBuf = out_dir.join(format!("{safe_label}_gnss_signals.csv"));
+    let spec_path: PathBuf = out_dir.join(format!("{safe_label}_gnss_spectrum.csv"));
+    // Created lazily on the first MON-SPAN reply — M8 receivers never answer
+    // the poll, and an empty spectrum CSV would read as "no interference".
+    let mut spec_w: Option<BufWriter<std::fs::File>> = None;
 
     let mut epoch_w = BufWriter::new(std::fs::File::create(&epoch_path)
         .with_context(|| format!("create {}", epoch_path.display()))?);
@@ -316,7 +370,7 @@ pub fn run_core<T: Read + Write>(
     on_status(format!("epoch  -> {}", epoch_path.display()));
     on_status(format!("signals-> {}", sig_path.display()));
 
-    let polls = [NAV_PVT, NAV_DOP, NAV_SAT, NAV_SIG, MON_RF];
+    let polls = [NAV_PVT, NAV_DOP, NAV_SAT, NAV_SIG, MON_RF, MON_SPAN];
     let mut parser = UbxParser::default();
     let mut buf = [0u8; 2048];
     let start = Instant::now();
@@ -348,11 +402,12 @@ pub fn run_core<T: Read + Write>(
             }
             for (cls, id, pl) in frames.drain(..) {
                 match (cls, id) {
-                    NAV_PVT => ep.pvt = parse_nav_pvt(&pl),
-                    NAV_DOP => ep.dop = parse_nav_dop(&pl),
-                    NAV_SAT => ep.sats = parse_nav_sat(&pl),
-                    NAV_SIG => ep.sigs = parse_nav_sig(&pl),
-                    MON_RF  => ep.rf  = parse_mon_rf(&pl),
+                    NAV_PVT  => ep.pvt = parse_nav_pvt(&pl),
+                    NAV_DOP  => ep.dop = parse_nav_dop(&pl),
+                    NAV_SAT  => ep.sats = parse_nav_sat(&pl),
+                    NAV_SIG  => ep.sigs = parse_nav_sig(&pl),
+                    MON_RF   => ep.rf  = parse_mon_rf(&pl),
+                    MON_SPAN => ep.span = parse_mon_span(&pl),
                     _ => {}
                 }
             }
@@ -362,6 +417,19 @@ pub fn run_core<T: Read + Write>(
         write_epoch(&mut epoch_w, &mut sig_w, label, &ep)?;
         epoch_w.flush()?;
         sig_w.flush()?;
+        if !ep.span.is_empty() {
+            if spec_w.is_none() {
+                let mut w = BufWriter::new(std::fs::File::create(&spec_path)
+                    .with_context(|| format!("create {}", spec_path.display()))?);
+                writeln!(w, "label,host_iso,iTOW_ms,block,center_hz,span_hz,res_hz,pga_db,peak_bin,peak_amp,peak_freq_hz,bins")?;
+                on_status(format!("spectrum-> {}", spec_path.display()));
+                spec_w = Some(w);
+            }
+            if let Some(w) = spec_w.as_mut() {
+                write_spectrum(w, label, &ep)?;
+                w.flush()?;
+            }
+        }
         n_epochs += 1;
         on_status(live_summary(&ep));
     }
@@ -431,24 +499,64 @@ fn write_epoch(
     Ok(())
 }
 
+/// Spectrum rows: one per RF block per epoch. `bins` is the raw 256-value
+/// amplitude vector, space-separated inside one CSV field, so plotting tools
+/// can `split(' ')` it; peak_* pre-computes the strongest bin for quick sorts.
+fn write_spectrum(w: &mut impl Write, label: &str, ep: &Epoch) -> Result<()> {
+    let host = now_iso();
+    let itow = ep.pvt.as_ref().map(|p| p.itow).unwrap_or(0);
+    for (bi, b) in ep.span.iter().enumerate() {
+        let (pi, pa) = b.peak();
+        let bins: Vec<String> = b.spectrum.iter().map(|a| a.to_string()).collect();
+        writeln!(w,
+            "{label},{host},{itow},{bi},{center},{span},{res},{pga},{pi},{pa},{pf:.0},{bins}",
+            center = b.center_hz, span = b.span_hz, res = b.res_hz, pga = b.pga_db,
+            pf = b.bin_freq_hz(pi), bins = bins.join(" "),
+        )?;
+    }
+    Ok(())
+}
+
 /// One-line human-readable summary of an epoch — fed to `on_status` so the
 /// CLI can print it and the GUI can append it to the live log panel.
+/// `top4` (mean C/N0 of the 4 strongest signals) and `n35` (signals at
+/// ≥ 35 dB-Hz) are the two EMI-experiment metrics: both collapse within a
+/// second of closing the case / powering a noisy subsystem, long before the
+/// fix itself reacts.
 fn live_summary(ep: &Epoch) -> String {
-    let max_cno = ep.sigs.iter().map(|s| s.cno).chain(ep.sats.iter().map(|s| s.cno)).max().unwrap_or(0);
+    let cnos: Vec<u8> = if !ep.sigs.is_empty() {
+        ep.sigs.iter().map(|s| s.cno).collect()
+    } else {
+        ep.sats.iter().map(|s| s.cno).collect()
+    };
+    let max_cno = cnos.iter().copied().max().unwrap_or(0);
+    let mut sorted = cnos.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    let k = sorted.len().min(4);
+    let top4 = if k == 0 { 0.0 } else { sorted[..k].iter().map(|&c| c as f64).sum::<f64>() / k as f64 };
+    let n35 = cnos.iter().filter(|&&c| c >= 35).count();
     let used = ep.sigs.iter().filter(|s| s.pr_used).count()
         .max(ep.sats.iter().filter(|s| s.sv_used).count());
-    match (&ep.pvt, &ep.rf) {
-        (Some(p), rf) => {
-            let (astat, apow, jam) = rf.as_ref()
-                .map(|r| (ant_status_name(r.ant_status), ant_power_name(r.ant_power), jamming_name(r.jamming_state)))
-                .unwrap_or(("?", "?", "?"));
+    match &ep.pvt {
+        Some(p) => {
+            let rfs = match &ep.rf {
+                Some(r) => format!(
+                    "ant={}/{} jam={}({}) noise={} agc={}",
+                    ant_status_name(r.ant_status), ant_power_name(r.ant_power),
+                    r.jam_ind, jamming_name(r.jamming_state), r.noise_per_ms, r.agc_cnt),
+                None => "ant=?/? jam=? noise=? agc=?".to_string(),
+            };
+            let span_s = ep.span.first().map(|b| {
+                let (pi, pa) = b.peak();
+                format!(" | peak {:.1}MHz a={}", b.bin_freq_hz(pi) / 1e6, pa)
+            }).unwrap_or_default();
             format!(
-                "{:02}:{:02}:{:02} fix={} ok={} sv={:2} used={:2} maxCN0={:2} hAcc={:.1}m pDOP={:.1} | ant={}/{} jam={}",
+                "{:02}:{:02}:{:02} fix={} ok={} sv={:2} used={:2} maxCN0={:2} top4={:2.0} n35={:2} hAcc={:.1}m pDOP={:.1} | {rfs}{span_s}",
                 p.hour, p.min, p.sec, p.fix_type, p.gnss_fix_ok as u8,
-                p.num_sv, used, max_cno, p.hacc_m, p.pdop, astat, apow, jam,
+                p.num_sv, used, max_cno, top4, n35, p.hacc_m, p.pdop,
             )
         }
-        (None, _) => "(no NAV-PVT reply — check port/baud; receiver may be NMEA-only or wrong device)".to_string(),
+        None => "(no NAV-PVT reply — check port/baud; receiver may be NMEA-only or wrong device)".to_string(),
     }
 }
 
@@ -592,6 +700,33 @@ mod tests {
         assert_eq!(r.noise_per_ms, 123);
         assert_eq!(r.agc_cnt, 4096);
         assert_eq!(r.jam_ind, 7);
+    }
+
+    #[test]
+    fn mon_span_offsets() {
+        let mut pl = vec![0u8; 4 + 272];
+        pl[0] = 0; // version
+        pl[1] = 1; // numRfBlocks
+        let o = 4;
+        pl[o + 100] = 200; // strongest bin at index 100
+        pl[o + 256..o + 260].copy_from_slice(&96_000_000u32.to_le_bytes());    // span 96 MHz
+        pl[o + 260..o + 264].copy_from_slice(&375_000u32.to_le_bytes());       // res 375 kHz
+        pl[o + 264..o + 268].copy_from_slice(&1_575_420_000u32.to_le_bytes()); // center L1
+        pl[o + 268] = 12;                                                      // pga dB
+        let v = parse_mon_span(&pl);
+        assert_eq!(v.len(), 1);
+        let b = &v[0];
+        assert_eq!(b.span_hz, 96_000_000);
+        assert_eq!(b.res_hz, 375_000);
+        assert_eq!(b.center_hz, 1_575_420_000);
+        assert_eq!(b.pga_db, 12);
+        let (pi, pa) = b.peak();
+        assert_eq!((pi, pa), (100, 200));
+        // bin 0 = center - span/2; bin 100 = that + 100*res
+        let f0 = 1_575_420_000f64 - 48_000_000f64;
+        assert!((b.bin_freq_hz(100) - (f0 + 100.0 * 375_000.0)).abs() < 1e-6);
+        // truncated payload → no blocks
+        assert!(parse_mon_span(&pl[..200]).is_empty());
     }
 
     #[test]
