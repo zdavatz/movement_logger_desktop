@@ -278,6 +278,14 @@ mirror and/or confirmed by adversarial review — don't simplify them away):
 - Stall detection requires a real tick advance (≥ 2.5 s) between equal-byte
   samples, only outside bridge windows; pair deltas are skipped across
   > 10 min discontinuities.
+- **`gps_rf:` RF health lines (firmware v0.0.52+)**: one line/min with
+  Peter's assembly metrics (fixType, numSV used, top-6 GPS+Galileo C/N0)
+  + MON-RF EMI set (noise/agc/jamInd/jammingState/antStatus). Graded HERE,
+  never `***` on the firmware side (by design — `***` would FAIL the boot):
+  `ant=SHORT/OPEN` and `state=crit` → WARN, `state=warn` → Info, last
+  sample surfaced as an Info finding. Tick-stamped ⇒ the replay frontier
+  dedups them like every other graded line. Keep the `key=value` tokens in
+  sync with firmware `parse_mon_rf`.
 - Boots with < 6 lines and no GPS-ready are "cut short during init (power
   removed?)" — but **hard evidence is graded before that early-return**:
   a 4-line boot ending in `fuel: init FAIL` or carrying `reset: IWDG` must

@@ -346,6 +346,16 @@ struct BootScan {
     bad_bridge: u64,
     err_clean: u64,
     err_bridge: u64,
+    /// `gps_rf:` RF/EMI health lines (firmware v0.0.52+): worst-case
+    /// tallies + the last accepted sample. The firmware never `***`s
+    /// these by design — wiring/jamming grading happens here.
+    rf_samples: u32,
+    rf_jam_max: u32,
+    rf_jam_crit: u32,
+    rf_jam_warn: u32,
+    rf_ant_bad: u32,
+    rf_noreply: bool,
+    rf_last: Option<String>,
     /// Replayed/duplicated log lines (mirror resume overlap) skipped by
     /// the monotonic-tick frontier.
     dup_lines: usize,
@@ -531,6 +541,24 @@ pub fn analyze(text: &str) -> ErrlogReport {
             rep.torn_lines += 1;
         } else if replayed {
             scan.dup_lines += 1;
+        } else if let Some(r) = rest.strip_prefix("gps_rf: ") {
+            if r.starts_with("MON-RF poll unanswered") {
+                scan.rf_noreply = true;
+            } else {
+                scan.rf_samples += 1;
+                if let Some(j) = field_i64(rest, "jam") {
+                    scan.rf_jam_max = scan.rf_jam_max.max(j.max(0) as u32);
+                }
+                if r.contains("state=crit") {
+                    scan.rf_jam_crit += 1;
+                } else if r.contains("state=warn") {
+                    scan.rf_jam_warn += 1;
+                }
+                if r.contains("ant=SHORT") || r.contains("ant=OPEN") {
+                    scan.rf_ant_bad += 1;
+                }
+                scan.rf_last = Some(r.trim().to_string());
+            }
         } else if rest.contains("***") {
             scan.markers.push(rest.trim().to_string());
         } else if let Some(m) = rest.strip_suffix(": init FAIL") {
@@ -784,6 +812,50 @@ fn finish_boot(mut rep: BootReport, scan: BootScan) -> BootReport {
         }
     }
 
+    // RF/EMI health from the periodic `gps_rf:` lines (firmware v0.0.52+).
+    // Antenna-supervisor faults and critical jamming are wiring/EMI
+    // evidence; everything else is trend data surfaced as Info.
+    if scan.rf_ant_bad > 0 {
+        f.push(Finding {
+            severity: Severity::Warn,
+            msg: format!(
+                "antenna supervisor reported SHORT/OPEN in {} of {} RF sample(s) — \
+                 antenna feed wiring suspect",
+                scan.rf_ant_bad, scan.rf_samples
+            ),
+        });
+    }
+    if scan.rf_jam_crit > 0 {
+        f.push(Finding {
+            severity: Severity::Warn,
+            msg: format!(
+                "RF jamming CRITICAL in {} of {} sample(s) (jam_ind max {}) — \
+                 strong interference at the antenna (issue #10 EMI)",
+                scan.rf_jam_crit, scan.rf_samples, scan.rf_jam_max
+            ),
+        });
+    } else if scan.rf_jam_warn > 0 {
+        f.push(Finding {
+            severity: Severity::Info,
+            msg: format!(
+                "RF jamming 'warn' in {} of {} sample(s) (jam_ind max {})",
+                scan.rf_jam_warn, scan.rf_samples, scan.rf_jam_max
+            ),
+        });
+    }
+    if let Some(last) = &scan.rf_last {
+        f.push(Finding {
+            severity: Severity::Info,
+            msg: format!("RF health (last sample): {last}"),
+        });
+    }
+    if scan.rf_noreply {
+        f.push(Finding {
+            severity: Severity::Info,
+            msg: "MON-RF poll unanswered — no RF health data this boot".into(),
+        });
+    }
+
     if scan.readv_fails > 0 {
         f.push(Finding {
             severity: Severity::Warn,
@@ -1000,6 +1072,44 @@ reset: SOFTWARE+BOR (CSR=0x0C004400)
             .findings
             .iter()
             .any(|f| f.msg.contains("command wire verified")));
+    }
+
+    #[test]
+    fn healthy_gps_rf_lines_stay_ok_and_surface_last_sample() {
+        let txt = format!(
+            "{HEALTHY}\
+             [25000 ms] gps_rf: fix=3D used=12 avg6=41.3 min6=38 max6=45 noise=88 agc=3120 jam=3 state=ok ant=ok\n\
+             [85000 ms] gps_rf: fix=3D used=13 avg6=42.0 min6=39 max6=46 noise=90 agc=3100 jam=5 state=ok ant=ok\n"
+        );
+        let rep = analyze(&txt);
+        let b = &rep.boots[0];
+        assert_eq!(b.verdict(), Severity::Info, "findings: {:?}", b.findings);
+        let last = b
+            .findings
+            .iter()
+            .find(|f| f.msg.starts_with("RF health (last sample):"))
+            .expect("last RF sample surfaced");
+        assert!(last.msg.contains("used=13"), "wrong sample kept: {}", last.msg);
+    }
+
+    #[test]
+    fn jamming_critical_and_antenna_fault_warn() {
+        let txt = format!(
+            "{HEALTHY}\
+             [25000 ms] gps_rf: fix=0 used=0 avg6=0.0 min6=0 max6=0 noise=412 agc=7900 jam=201 state=crit ant=SHORT\n"
+        );
+        let rep = analyze(&txt);
+        let b = &rep.boots[0];
+        assert_eq!(b.verdict(), Severity::Warn, "findings: {:?}", b.findings);
+        assert!(b
+            .findings
+            .iter()
+            .any(|f| f.severity == Severity::Warn && f.msg.contains("jamming CRITICAL")
+                && f.msg.contains("jam_ind max 201")));
+        assert!(b
+            .findings
+            .iter()
+            .any(|f| f.severity == Severity::Warn && f.msg.contains("SHORT/OPEN")));
     }
 
     #[test]
