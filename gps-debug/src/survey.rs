@@ -517,24 +517,47 @@ fn write_spectrum(w: &mut impl Write, label: &str, ep: &Epoch) -> Result<()> {
     Ok(())
 }
 
+/// Per-satellite C/N0 of the GPS (gnssId 0) and Galileo (gnssId 2)
+/// constellations only, strongest first. NAV-SAT already reports one
+/// best-signal C/N0 per satellite; when only NAV-SIG answered, its
+/// per-signal rows are folded to max-per-satellite so a dual-band sat
+/// isn't counted twice. cno == 0 (searched but not tracked) is skipped.
+fn gps_gal_sat_cnos(ep: &Epoch) -> Vec<u8> {
+    let mut v: Vec<u8> = if !ep.sats.is_empty() {
+        ep.sats.iter()
+            .filter(|s| (s.gnss == 0 || s.gnss == 2) && s.cno > 0)
+            .map(|s| s.cno).collect()
+    } else {
+        let mut best: std::collections::HashMap<(u8, u8), u8> = std::collections::HashMap::new();
+        for s in ep.sigs.iter().filter(|s| (s.gnss == 0 || s.gnss == 2) && s.cno > 0) {
+            let e = best.entry((s.gnss, s.sv)).or_insert(0);
+            if s.cno > *e { *e = s.cno; }
+        }
+        best.into_values().collect()
+    };
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    v
+}
+
+/// UBX fixType rendered the way Peter reads it (0/2D/3D…), not as a raw enum.
+fn fix_type_name(t: u8) -> &'static str {
+    match t { 0 => "none", 1 => "DR", 2 => "2D", 3 => "3D", 4 => "3D+DR", 5 => "time", _ => "?" }
+}
+
 /// One-line human-readable summary of an epoch — fed to `on_status` so the
 /// CLI can print it and the GUI can append it to the live log panel.
-/// `top4` (mean C/N0 of the 4 strongest signals) and `n35` (signals at
-/// ≥ 35 dB-Hz) are the two EMI-experiment metrics: both collapse within a
-/// second of closing the case / powering a noisy subsystem, long before the
-/// fix itself reacts.
+/// Peter's EMI assembly metrics (2026-07-17): `avg6`/`min6`/`max6` are the
+/// mean/weakest/strongest of the 6 strongest **GPS + Galileo** satellites
+/// (other constellations excluded), plus `used` (sats in the nav solution),
+/// `jam` (narrowband jamming), `noise` (broadband noise floor) and `agc`
+/// (antenna-signal gain). All collapse within a second of closing the case /
+/// powering a noisy subsystem, long before the fix itself reacts.
 fn live_summary(ep: &Epoch) -> String {
-    let cnos: Vec<u8> = if !ep.sigs.is_empty() {
-        ep.sigs.iter().map(|s| s.cno).collect()
-    } else {
-        ep.sats.iter().map(|s| s.cno).collect()
-    };
-    let max_cno = cnos.iter().copied().max().unwrap_or(0);
-    let mut sorted = cnos.clone();
-    sorted.sort_unstable_by(|a, b| b.cmp(a));
-    let k = sorted.len().min(4);
-    let top4 = if k == 0 { 0.0 } else { sorted[..k].iter().map(|&c| c as f64).sum::<f64>() / k as f64 };
-    let n35 = cnos.iter().filter(|&&c| c >= 35).count();
+    let cnos = gps_gal_sat_cnos(ep);
+    let top6 = &cnos[..cnos.len().min(6)];
+    let avg6 = if top6.is_empty() { 0.0 } else { top6.iter().map(|&c| c as f64).sum::<f64>() / top6.len() as f64 };
+    let max6 = top6.first().copied().unwrap_or(0);
+    let min6 = top6.last().copied().unwrap_or(0);
     let used = ep.sigs.iter().filter(|s| s.pr_used).count()
         .max(ep.sats.iter().filter(|s| s.sv_used).count());
     match &ep.pvt {
@@ -551,9 +574,9 @@ fn live_summary(ep: &Epoch) -> String {
                 format!(" | peak {:.1}MHz a={}", b.bin_freq_hz(pi) / 1e6, pa)
             }).unwrap_or_default();
             format!(
-                "{:02}:{:02}:{:02} fix={} ok={} sv={:2} used={:2} maxCN0={:2} top4={:2.0} n35={:2} hAcc={:.1}m pDOP={:.1} | {rfs}{span_s}",
-                p.hour, p.min, p.sec, p.fix_type, p.gnss_fix_ok as u8,
-                p.num_sv, used, max_cno, top4, n35, p.hacc_m, p.pdop,
+                "{:02}:{:02}:{:02} fix={} ok={} sv={:2} used={:2} avg6={:4.1} min6={:2} max6={:2} hAcc={:.1}m pDOP={:.1} | {rfs}{span_s}",
+                p.hour, p.min, p.sec, fix_type_name(p.fix_type), p.gnss_fix_ok as u8,
+                p.num_sv, used, avg6, min6, max6, p.hacc_m, p.pdop,
             )
         }
         None => "(no NAV-PVT reply — check port/baud; receiver may be NMEA-only or wrong device)".to_string(),
@@ -620,6 +643,29 @@ mod tests {
     fn checksum_known_vector() {
         // UBX-MON-VER poll: B5 62 0A 04 00 00 0E 34 (ck = 0x0E, 0x34).
         assert_eq!(ubx_checksum(&[0x0A, 0x04, 0x00, 0x00]), (0x0E, 0x34));
+    }
+
+    #[test]
+    fn gps_gal_top6_metrics() {
+        let sat = |gnss, sv, cno| SatInfo { gnss, sv, cno, elev: 0, azim: 0, pr_res_m: 0.0, qual: 0, sv_used: true };
+        let mut ep = Epoch::default();
+        ep.sats = vec![
+            sat(0, 1, 45), sat(0, 2, 40), sat(2, 3, 42),   // GPS + Galileo
+            sat(3, 4, 50), sat(6, 5, 49),                  // BeiDou/GLONASS — excluded
+            sat(0, 6, 0),                                  // searched, not tracked — excluded
+            sat(2, 7, 38), sat(0, 8, 33), sat(0, 9, 30),
+            sat(2, 10, 28),                                // 7th-strongest GPS+GAL — outside top6
+        ];
+        let cnos = gps_gal_sat_cnos(&ep);
+        assert_eq!(cnos, vec![45, 42, 40, 38, 33, 30, 28]);
+        let top6 = &cnos[..6];
+        assert_eq!((top6[0], top6[5]), (45, 30));
+
+        // NAV-SIG fallback folds dual-band rows to one per satellite.
+        let sig = |gnss, sv, sig_id, cno| SigInfo { gnss, sv, sig: sig_id, cno, pr_res_m: 0.0, qual: 0, pr_used: true };
+        ep.sats.clear();
+        ep.sigs = vec![sig(2, 3, 0, 41), sig(2, 3, 1, 44), sig(0, 1, 0, 39), sig(3, 9, 0, 50)];
+        assert_eq!(gps_gal_sat_cnos(&ep), vec![44, 39]);
     }
 
     #[test]
