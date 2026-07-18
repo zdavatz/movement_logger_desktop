@@ -23,6 +23,7 @@ mod calibration;
 mod coord;
 mod errlog_check;
 mod installer;
+mod mpv;
 mod power;
 mod race;
 mod sync_core;
@@ -170,6 +171,19 @@ struct AppState {
     /// 0-100 progress of the running child, fed by "[progress] N"
     /// stdout lines (stbox-viz merge emits them); 0 = no progress yet.
     child_progress: Arc<AtomicU32>,
+    /// Lazily-loaded libmpv for the in-app preview pane (None = not yet
+    /// tried; Some(Err) = unavailable, e.g. mpv not installed).
+    mpv_lib: Option<Result<Arc<mpv::MpvLib>, String>>,
+    /// In-app player showing the last merged film (right side pane).
+    preview: Option<mpv::Player>,
+    preview_path: Option<PathBuf>,
+    preview_tex: Option<egui::TextureHandle>,
+    /// Output path of the in-flight merge; consumed on child exit to
+    /// auto-open the preview.
+    merge_output: Option<PathBuf>,
+    /// `running` as of the previous frame — used to detect the child's
+    /// completion edge.
+    was_running: bool,
     /// Last subprocess exit status, displayed in the status bar.
     last_status: Option<RunStatus>,
 
@@ -571,6 +585,7 @@ fn spawn_merge(state: &mut AppState) {
     }
     let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let out = state.output_dir.join(format!("merged_{stamp}.mov"));
+    state.merge_output = Some(out.clone());
     let mut cmd = Command::new(stbox_viz_path());
     cmd.arg("merge");
     for v in &state.merge_videos {
@@ -3838,6 +3853,125 @@ impl AppState {
         );
     }
 
+    /// Open `path` in the in-app libmpv preview (paused on frame 1).
+    /// Logs a hint instead of failing hard when libmpv is missing.
+    fn open_preview(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.mpv_lib.is_none() {
+            self.mpv_lib = Some(mpv::MpvLib::load().map(Arc::new));
+        }
+        match self.mpv_lib.as_ref().unwrap() {
+            Ok(lib) => {
+                let Some(p) = path.to_str() else { return };
+                match mpv::Player::open(lib.clone(), ctx, p) {
+                    Ok(player) => {
+                        self.preview = Some(player);
+                        self.preview_tex = None;
+                        push_log(
+                            &self.log,
+                            format!("preview: {}", path.display()),
+                        );
+                        self.preview_path = Some(path);
+                    }
+                    Err(e) => push_log(&self.log, format!("preview: failed to open ({e})")),
+                }
+            }
+            Err(e) => push_log(
+                &self.log,
+                format!(
+                    "preview: libmpv unavailable ({e}) — install mpv \
+                     (`brew install mpv`) for the in-app preview pane."
+                ),
+            ),
+        }
+    }
+
+    /// The right-side preview pane: video frame, play/pause, seek bar.
+    fn ui_preview_pane(&mut self, ui: &mut egui::Ui) {
+        let mut close = false;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Preview").strong());
+            if let Some(p) = &self.preview_path {
+                ui.label(
+                    egui::RichText::new(
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    )
+                    .weak(),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("✕").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.preview = None;
+            self.preview_tex = None;
+            self.preview_path = None;
+            return;
+        }
+        let Some(player) = self.preview.as_mut() else { return };
+
+        let avail_w = ui.available_width().max(100.0);
+        let (vw, vh) = player.video_size().unwrap_or((16, 9));
+        let mut h = avail_w * vh as f32 / vw as f32;
+        h = h.min((ui.available_height() - 60.0).max(100.0));
+        if let Some((fw, fh, rgba)) =
+            player.poll_frame(avail_w.round() as i32, h.round() as i32)
+        {
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [fw as usize, fh as usize],
+                rgba,
+            );
+            match &mut self.preview_tex {
+                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                None => {
+                    self.preview_tex = Some(ui.ctx().load_texture(
+                        "merge_preview_frame",
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
+        }
+        if let Some(tex) = &self.preview_tex {
+            ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(avail_w, h)));
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let icon = if player.is_paused() { "▶" } else { "⏸" };
+            if ui.button(icon).clicked() {
+                player.toggle_pause();
+            }
+            let dur = player.duration().max(0.001);
+            let mut t = player.time_pos();
+            let slider = ui.add(
+                egui::Slider::new(&mut t, 0.0..=dur)
+                    .show_value(false)
+                    .trailing_fill(true),
+            );
+            if slider.changed() {
+                player.seek_absolute(t);
+            }
+            ui.label(format!(
+                "{}:{:02} / {}:{:02}",
+                (t / 60.0) as u32,
+                (t % 60.0) as u32,
+                (dur / 60.0) as u32,
+                (dur % 60.0) as u32
+            ));
+        });
+        // Keep frames flowing while playing (mpv's update callback also
+        // requests repaints; this covers the tail between callbacks).
+        if !player.is_paused() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        }
+    }
+
     fn ingest_dropped(&mut self, files: &[egui::DroppedFile]) {
         for f in files {
             let Some(path) = f.path.as_ref() else { continue };
@@ -4167,6 +4301,25 @@ impl eframe::App for AppState {
             }
             ui.add_space(2.0);
         });
+
+        // ----- Merge preview (right pane, libmpv) ---------------------
+        // Auto-open the preview when a merge child finishes and its
+        // output file exists (a cancelled/failed merge writes none).
+        let running_now = self.running.load(Ordering::SeqCst);
+        if self.was_running && !running_now {
+            if let Some(out) = self.merge_output.take() {
+                if out.exists() {
+                    self.open_preview(out, ctx);
+                }
+            }
+        }
+        self.was_running = running_now;
+        if self.current_tab == Tab::Replay && self.preview.is_some() {
+            egui::SidePanel::right("merge_preview_pane")
+                .resizable(true)
+                .default_width(430.0)
+                .show(ctx, |ui| self.ui_preview_pane(ui));
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(6.0);

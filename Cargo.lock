@@ -2944,6 +2944,7 @@ dependencies = [
  "futures",
  "gps-debug",
  "image 0.25.10",
+ "libloading",
  "reqwest 0.12.28",
  "rfd",
  "rusqlite",

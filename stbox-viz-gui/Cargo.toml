@@ -22,6 +22,7 @@ egui = "0.29"
 rfd = "0.15"
 anyhow = "1"
 chrono = "0.4"
+libloading = "0.8"
 # Decode assets/icon.png at startup → window icon + in-app top-right
 # logo. Default-features off to avoid pulling JPEG/TIFF/etc. — we only
 # ever load the PNG that's baked in via include_bytes!.
