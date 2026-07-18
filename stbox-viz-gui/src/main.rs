@@ -115,6 +115,10 @@ struct AppState {
     gps_csv: Option<PathBuf>,
     /// Optional camera video paired with the session.
     video: Option<PathBuf>,
+    /// Videos collected for "Merge videos" — every dropped/browsed
+    /// video lands here (in addition to `video`, which animate uses).
+    /// `stbox-viz merge` sorts them by capture time itself.
+    merge_videos: Vec<PathBuf>,
     /// Optional board STL mesh (defaults to fingerfoil's
     /// `0_combined.stl` if the user has it).
     board_stl: Option<PathBuf>,
@@ -546,6 +550,41 @@ fn spawn_animate(state: &mut AppState) {
         cmd.arg("--subtitle").arg(&state.subtitle);
     }
 
+    spawn_and_pump(state, cmd);
+}
+
+/// "Merge videos": every collected clip, chronological, a date/time card
+/// before each, a 3 s last-frame fade-out after each; with a loaded
+/// sensor CSV each clip gets the animate side panel, without one the
+/// plain videos are merged. All the real work happens in
+/// `stbox-viz merge`.
+fn spawn_merge(state: &mut AppState) {
+    if state.merge_videos.is_empty() {
+        push_log(
+            &state.log,
+            "error: no videos to merge — drop .mov/.mp4 files here first.".into(),
+        );
+        return;
+    }
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let out = state.output_dir.join(format!("merged_{stamp}.mov"));
+    let mut cmd = Command::new(stbox_viz_path());
+    cmd.arg("merge");
+    for v in &state.merge_videos {
+        cmd.arg(v);
+    }
+    if let Some(csv) = state.sensor_csv.as_ref() {
+        cmd.arg("--sensor-csv").arg(csv);
+        cmd.arg("--mount").arg(state.mount.flag());
+    }
+    cmd.arg("-o").arg(&out).arg("--fps").arg(state.fps.to_string());
+    spawn_and_pump(state, cmd);
+}
+
+/// Shared child-process runner: logs the command line, spawns it with
+/// piped stdout/stderr, pumps both into the log panel, and honours the
+/// Stop button via `state.cancel`.
+fn spawn_and_pump(state: &mut AppState, mut cmd: Command) {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     push_log(
@@ -3802,6 +3841,9 @@ impl AppState {
                 }
                 FileKind::Video => {
                     self.video = Some(path.clone());
+                    if !self.merge_videos.contains(path) {
+                        self.merge_videos.push(path.clone());
+                    }
                 }
                 FileKind::Stl => {
                     self.board_stl = Some(path.clone());
@@ -4260,6 +4302,61 @@ impl eframe::App for AppState {
                         });
                 });
 
+            ui.add_space(6.0);
+
+            // ----- Merge videos ---------------------------------------
+            ui.label(egui::RichText::new("Merge videos").strong());
+            if self.merge_videos.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "Drop several .mov/.mp4 files (or Add…) to merge them \
+                         chronologically — a date/time card before each clip, a 3 s \
+                         fade-out after each. With a sensor CSV loaded every clip \
+                         gets the sensor panel; without one the plain videos are merged.",
+                    )
+                    .weak(),
+                );
+            } else {
+                let mut remove: Option<usize> = None;
+                for (i, v) in self.merge_videos.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.label(
+                            v.file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| v.display().to_string()),
+                        );
+                    });
+                }
+                if let Some(i) = remove {
+                    self.merge_videos.remove(i);
+                }
+            }
+            ui.horizontal(|ui| {
+                let running = self.running.load(Ordering::SeqCst);
+                if ui.button("Add…").clicked() {
+                    if let Some(paths) = rfd::FileDialog::new()
+                        .add_filter("Videos", &["mov", "mp4", "MOV", "MP4", "m4v"])
+                        .pick_files()
+                    {
+                        for p in paths {
+                            if !self.merge_videos.contains(&p) {
+                                self.merge_videos.push(p);
+                            }
+                        }
+                    }
+                }
+                let can_merge = !running && !self.merge_videos.is_empty();
+                let label = format!("▶ Merge {} video(s)", self.merge_videos.len());
+                if ui.add_enabled(can_merge, egui::Button::new(label)).clicked() {
+                    spawn_merge(self);
+                }
+                if !self.merge_videos.is_empty() && ui.button("Clear list").clicked() {
+                    self.merge_videos.clear();
+                }
+            });
             ui.add_space(6.0);
 
             // ----- Action buttons -------------------------------------
