@@ -157,16 +157,18 @@ pub fn run(args: &MergeArgs) -> Result<()> {
     }
 
     // Common canvas: height 900, width = widest segment (kept even).
-    let mut canvas_w: u32 = 0;
+    // Canvas width = the NARROWEST clip. The user films portrait and
+    // never wants black side bars; with mixed portrait aspects (9:16
+    // camera clips vs 3:4 QuickTake) the narrow 9:16 majority fills the
+    // frame edge-to-edge and the wider 3:4 clips letterbox top/bottom
+    // instead (cropping them is off the table — footage is never cut).
+    let mut canvas_w: u32 = u32::MAX;
     for s in &seg_sources {
         let (w, h) = probe_display_dims(s)?;
         let w900 = ((w as f64) * 900.0 / (h as f64)).round() as u32;
-        // Round UP to even — ffmpeg's scale=-2:900 rounds to the nearest
-        // even width, and a canvas one pixel narrower than a scaled clip
-        // makes the pad filter fail the whole encode.
-        canvas_w = canvas_w.max((w900 + 1) & !1);
+        canvas_w = canvas_w.min(w900 & !1);
     }
-    let canvas_w = canvas_w.max(2);
+    let canvas_w = canvas_w.clamp(2, 4096);
 
     // Pass 2: cards, normalized segments, freeze-fades → concat list.
     let mut list = String::new();
@@ -186,12 +188,13 @@ pub fn run(args: &MergeArgs) -> Result<()> {
         ])?;
 
         let seg_mp4 = work.join(format!("seg{}.mp4", i));
-        // pad width via max(iw, canvas): even if a scaled clip lands a
-        // pixel or two wider than the computed canvas, pad grows with it
-        // instead of erroring out.
+        // Fit-into-canvas: scale to touch the canvas from inside (a
+        // 9:16 clip fills it exactly; a wider clip fits the width and
+        // letterboxes top/bottom), then center-pad to the exact canvas.
         let vf = format!(
-            "scale=-2:900,pad=w=max(iw\\,{}):h=900:x=(ow-iw)/2:y=0:color=black,setsar=1,fps=30",
-            canvas_w
+            "scale=w={cw}:h=900:force_original_aspect_ratio=decrease:force_divisible_by=2,\
+             pad={cw}:900:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30",
+            cw = canvas_w
         );
         ffmpeg(&[
             "-y", "-i", src.to_str().unwrap(), "-vf", &vf,
