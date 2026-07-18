@@ -93,6 +93,11 @@ pub struct AgentConfig {
     /// unusable. GUI-only; the headless agent ignores it.
     #[serde(default)]
     pub ui_zoom: Option<f32>,
+    /// Videos last collected in the Replay tab's "Merge videos" list,
+    /// restored at startup (entries whose files vanished are dropped).
+    /// GUI-only; the headless agent ignores it.
+    #[serde(default)]
+    pub merge_videos: Option<Vec<String>>,
 }
 
 impl AgentConfig {

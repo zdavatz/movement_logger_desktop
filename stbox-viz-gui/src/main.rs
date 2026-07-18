@@ -1043,6 +1043,15 @@ impl AppState {
            tab's "Box health" panel is populated before any connect;
            every later sync of ERRLOG.LOG re-runs it automatically. */
         s.sync.run_errlog_check("startup");
+        // Restore the Merge-videos list from the last session; silently
+        // drop entries whose files no longer exist.
+        if let Some(v) = agent_config::AgentConfig::load().merge_videos {
+            s.merge_videos = v
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
+                .collect();
+        }
         s
     }
 
@@ -3913,6 +3922,19 @@ impl AppState {
         );
     }
 
+    /// Persist the Merge-videos list so it survives an app restart
+    /// (load-modify-save so sync fields aren't clobbered).
+    fn persist_merge_list(&self) {
+        let mut cfg = agent_config::AgentConfig::load();
+        cfg.merge_videos = Some(
+            self.merge_videos
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+        );
+        let _ = cfg.save();
+    }
+
     /// Open `path` in the in-app libmpv preview (paused on frame 1).
     /// Logs a hint instead of failing hard when libmpv is missing.
     fn open_preview(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -3962,7 +3984,9 @@ impl AppState {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").clicked() {
+                // Plain text, not "✕" — that glyph is missing from the
+                // bundled font and renders as a tofu box.
+                if ui.button("Close").clicked() {
                     close = true;
                 }
             });
@@ -4033,6 +4057,7 @@ impl AppState {
     }
 
     fn ingest_dropped(&mut self, files: &[egui::DroppedFile]) {
+        let mut merge_changed = false;
         for f in files {
             let Some(path) = f.path.as_ref() else { continue };
             // A dropped FOLDER adds every video in it to the merge list
@@ -4050,6 +4075,7 @@ impl AppState {
                         if !self.merge_videos.contains(&v) {
                             self.merge_videos.push(v);
                             added += 1;
+                            merge_changed = true;
                         }
                     }
                 }
@@ -4073,6 +4099,7 @@ impl AppState {
                     self.video = Some(path.clone());
                     if !self.merge_videos.contains(path) {
                         self.merge_videos.push(path.clone());
+                        merge_changed = true;
                     }
                 }
                 FileKind::Stl => {
@@ -4088,6 +4115,9 @@ impl AppState {
                     );
                 }
             }
+        }
+        if merge_changed {
+            self.persist_merge_list();
         }
     }
 }
@@ -4573,7 +4603,7 @@ impl eframe::App for AppState {
                 let mut remove: Option<usize> = None;
                 for (i, v) in self.merge_videos.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        if ui.small_button("✕").clicked() {
+                        if ui.small_button("x").clicked() {
                             remove = Some(i);
                         }
                         ui.label(
@@ -4585,6 +4615,7 @@ impl eframe::App for AppState {
                 }
                 if let Some(i) = remove {
                     self.merge_videos.remove(i);
+                    self.persist_merge_list();
                 }
             }
             ui.horizontal(|ui| {
@@ -4599,6 +4630,7 @@ impl eframe::App for AppState {
                                 self.merge_videos.push(p);
                             }
                         }
+                        self.persist_merge_list();
                     }
                 }
                 let can_merge = !running && !self.merge_videos.is_empty();
@@ -4608,6 +4640,7 @@ impl eframe::App for AppState {
                 }
                 if !self.merge_videos.is_empty() && ui.button("Clear list").clicked() {
                     self.merge_videos.clear();
+                    self.persist_merge_list();
                 }
             });
             {
