@@ -9,6 +9,7 @@
 
 mod animate_cmd;
 mod baro;
+mod merge_cmd;
 mod bin_util;
 mod board3d;
 mod butter;
@@ -98,6 +99,12 @@ enum Cmd {
         title: Option<String>,
         #[arg(long)]
         subtitle: Option<String>,
+        /// Override the bottom trace panel's title (default
+        /// "Nasenwinkel"/"Brett-Pitch"). Use e.g. "Rhythmus" for
+        /// box-in-pocket sessions where the trace is body motion,
+        /// not a board angle.
+        #[arg(long)]
+        trace_label: Option<String>,
         /// Wall-clock start time HH:MM[:SS] in local time. When set,
         /// bypasses session detection and renders one GIF spanning the
         /// `--duration` window (or the video's length if --video given).
@@ -149,6 +156,43 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = MountArg::Mast)]
         mount: MountArg,
     },
+    /// Merge several session videos into one film: chronological order,
+    /// a date+time card before each clip, the clip complete and uncut
+    /// (with a sensor-animation side panel when --sensor-csv is given),
+    /// and a fade-out of each clip's last frame. Needs ffmpeg in PATH.
+    Merge {
+        /// Video files to merge (any order — sorted by capture time).
+        #[arg(required = true)]
+        videos: Vec<PathBuf>,
+        /// Session sensor CSV; when given, every clip is rendered
+        /// camera-left / sensor-animation-right via the animate
+        /// pipeline (aligned through the CSV's # SYNC anchors). When
+        /// absent, the plain videos are merged.
+        #[arg(long)]
+        sensor_csv: Option<PathBuf>,
+        /// Output file for the merged film.
+        #[arg(short, long, default_value = "merged.mov")]
+        output: PathBuf,
+        /// Timezone for the cards as UTC offset in hours. Default:
+        /// host local time.
+        #[arg(long, allow_hyphen_values = true)]
+        tz_offset_h: Option<f64>,
+        #[arg(long, value_enum, default_value_t = MountArg::Mast)]
+        mount: MountArg,
+        /// Bottom trace panel title for the sensor renders (e.g.
+        /// "Rhythmus" for box-in-pocket sessions).
+        #[arg(long)]
+        trace_label: Option<String>,
+        /// Seconds the date/time card is shown before each clip.
+        #[arg(long, default_value_t = 2.5)]
+        card_seconds: f64,
+        /// Seconds of last-frame fade-out after each clip.
+        #[arg(long, default_value_t = 3.0)]
+        fade_seconds: f64,
+        /// Animation fps for the sensor renders.
+        #[arg(long, default_value_t = 15)]
+        fps: u32,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -176,6 +220,7 @@ fn main() -> Result<()> {
             compass_cmd::run(&sensor_csv, &output),
         Cmd::Animate { sensor_csv, output, fps, session, video,
                        video_offset, sensor_offset, title, subtitle,
+                       trace_label,
                        at, duration, tz_offset_h, date, auto_skip,
                        dock_height_m, board_stl, mount } => {
             animate_cmd::run(&animate_cmd::AnimateArgs {
@@ -188,6 +233,7 @@ fn main() -> Result<()> {
                 sensor_offset,
                 title: title.as_deref(),
                 subtitle: subtitle.as_deref(),
+                trace_label: trace_label.as_deref(),
                 at: at.as_deref(),
                 duration,
                 tz_offset_h,
@@ -196,6 +242,20 @@ fn main() -> Result<()> {
                 dock_height_m,
                 board_stl: board_stl.as_deref(),
                 mount: mount.into(),
+            })
+        }
+        Cmd::Merge { videos, sensor_csv, output, tz_offset_h, mount,
+                     trace_label, card_seconds, fade_seconds, fps } => {
+            merge_cmd::run(&merge_cmd::MergeArgs {
+                videos: &videos,
+                sensor_csv: sensor_csv.as_deref(),
+                output: &output,
+                tz_offset_h,
+                mount: mount.into(),
+                trace_label: trace_label.as_deref(),
+                card_seconds,
+                fade_seconds,
+                fps,
             })
         }
     }

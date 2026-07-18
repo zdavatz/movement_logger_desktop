@@ -39,6 +39,11 @@ pub struct AnimateArgs<'a> {
     pub sensor_offset: f64,
     pub title: Option<&'a str>,
     pub subtitle: Option<&'a str>,
+    /// Override the bottom trace panel's title. Default is the pitch
+    /// label ("Nasenwinkel"/"Brett-Pitch"), which is wrong when the box
+    /// rides in the rider's pocket instead of on the board — pass e.g.
+    /// "Rhythmus" there so the trace isn't read as a board angle.
+    pub trace_label: Option<&'a str>,
     /// Wall-clock start (HH:MM[:SS]) in local time. When set, bypasses
     /// session detection and renders one GIF for that exact window.
     pub at: Option<&'a str>,
@@ -681,6 +686,7 @@ pub fn run(args: &AnimateArgs) -> Result<()> {
                 Some(pc)
             }.as_deref(),
             args.mount,
+            args.trace_label,
         )?;
         println!("Saved {}", gif_path.display());
 
@@ -735,6 +741,7 @@ pub fn run(args: &AnimateArgs) -> Result<()> {
             None,
             None, None, None, None, None,  // 3D mesh/quats/q_mount/yaw + pump_count — only --at mode
             args.mount,
+            args.trace_label,
         )?;
         println!("Saved {}", gif_path.display());
 
@@ -1038,6 +1045,7 @@ fn render_session_gif(
     // None, the displayed Pumps counter shows 0.
     pump_count: Option<&[u32]>,
     mount: board3d::MountKind,
+    trace_label: Option<&str>,
 ) -> Result<()> {
     // Subsample so the GIF's wall-clock playback matches the data
     // window exactly. Two pitfalls to avoid:
@@ -1260,6 +1268,7 @@ fn render_session_gif(
             yaw_now,
             pump_count_now,
             mount,
+            trace_label,
         )?;
         root.present()?;
         if frame % 100 == 0 {
@@ -1298,6 +1307,7 @@ fn draw_frame<DB: DrawingBackend>(
     yaw_rad_now: Option<f32>,
     pump_count: u32,
     mount: board3d::MountKind,
+    trace_label: Option<&str>,
 ) -> Result<(), anyhow::Error>
 where
     DB::ErrorType: 'static,
@@ -1845,7 +1855,9 @@ where
     }
 
     // --- Full-range panel: absolute orientation pitch (un-detrended) ---
-    let bottom_label = if nose_abs_hist.is_some() {
+    let bottom_label = if let Some(l) = trace_label {
+        l
+    } else if nose_abs_hist.is_some() {
         "Brett-Pitch absolut [°]"
     } else {
         "Nasenwinkel [°] (detrended)"
@@ -2017,7 +2029,7 @@ fn render_title_frame(
 }
 
 // Minimal tempfile substitute (we don't need the full crate).
-mod tempfile {
+pub(crate) mod tempfile {
     use std::path::PathBuf;
     pub struct TempDir { path: PathBuf }
     impl TempDir {

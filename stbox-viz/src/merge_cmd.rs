@@ -1,0 +1,310 @@
+//! `stbox-viz merge` — merge multiple session videos into one film.
+//!
+//! For every input video (sorted chronologically by capture time):
+//!   1. a title card (`card_seconds`, default 2.5 s) with the recording
+//!      date and start time,
+//!   2. the clip itself — NEVER trimmed or cut; when `--sensor-csv` is
+//!      given each clip is first rendered through the `animate` pipeline
+//!      (camera left, sensor animation right, aligned via the CSV's
+//!      `# SYNC` anchors), otherwise the plain clip is used,
+//!   3. the clip's last frame frozen and faded to black over
+//!      `fade_seconds` (default 3 s).
+//! All pieces are normalized to a common canvas (height 900, width =
+//! widest segment) and concatenated into a single H.264 .mov.
+//!
+//! Capture times come from `com.apple.quicktime.creationdate` (survives
+//! iOS share/export rewrites of the container `creation_time`, which is
+//! only the fallback), else the file mtime. Card times are shown in the
+//! host's local timezone unless `--tz-offset-h` is given.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{bail, Context, Result};
+use chrono::{DateTime, FixedOffset, Local, Offset, TimeZone, Utc};
+use plotters::prelude::*;
+use plotters::style::text_anchor::{HPos, Pos, VPos};
+
+use crate::animate_cmd::{self, tempfile, AnimateArgs};
+use crate::board3d;
+use crate::plot_common::FONT;
+
+pub struct MergeArgs<'a> {
+    pub videos: &'a [PathBuf],
+    pub sensor_csv: Option<&'a Path>,
+    pub output: &'a Path,
+    /// Display timezone for the cards as UTC offset in hours; None =
+    /// host local time.
+    pub tz_offset_h: Option<f64>,
+    pub mount: board3d::MountKind,
+    pub trace_label: Option<&'a str>,
+    pub card_seconds: f64,
+    pub fade_seconds: f64,
+    pub fps: u32,
+}
+
+struct Clip {
+    path: PathBuf,
+    /// Capture start in UTC.
+    start_utc: DateTime<Utc>,
+}
+
+pub fn run(args: &MergeArgs) -> Result<()> {
+    if args.videos.is_empty() {
+        bail!("no videos given");
+    }
+    let mut clips: Vec<Clip> = args
+        .videos
+        .iter()
+        .map(|v| {
+            let start_utc = probe_capture_time(v)
+                .with_context(|| format!("capture time of {}", v.display()))?;
+            Ok(Clip { path: v.clone(), start_utc })
+        })
+        .collect::<Result<_>>()?;
+    clips.sort_by_key(|c| c.start_utc);
+
+    let disp_offset: FixedOffset = match args.tz_offset_h {
+        Some(h) => FixedOffset::east_opt((h * 3600.0) as i32)
+            .context("bad --tz-offset-h")?,
+        None => Local::now().offset().fix(),
+    };
+
+    let tmp = tempfile::tempdir()?;
+    let work = tmp.path();
+
+    // Pass 1: build each clip's segment source (plain clip, or the
+    // animate side-by-side render when a sensor CSV is present).
+    let mut seg_sources: Vec<PathBuf> = Vec::new();
+    for (i, c) in clips.iter().enumerate() {
+        let src = if let Some(csv) = args.sensor_csv {
+            let at = c.start_utc.format("%H:%M:%S").to_string();
+            let date = c.start_utc.format("%Y-%m-%d").to_string();
+            let out_dir = work.join(format!("anim{}", i));
+            std::fs::create_dir_all(&out_dir)?;
+            println!(
+                "[{}/{}] render {} at {} UTC",
+                i + 1,
+                clips.len(),
+                c.path.file_name().unwrap_or_default().to_string_lossy(),
+                at
+            );
+            animate_cmd::run(&AnimateArgs {
+                sensor_csv: csv,
+                output_dir: &out_dir,
+                fps: args.fps,
+                session: None,
+                video: Some(&c.path),
+                video_offset: 0.0,
+                sensor_offset: 0.0,
+                title: None,
+                subtitle: None,
+                trace_label: args.trace_label,
+                at: Some(&at),
+                duration: None,
+                tz_offset_h: 0.0,
+                date: Some(&date),
+                auto_skip: false,
+                dock_height_m: 0.0,
+                board_stl: None,
+                mount: args.mount,
+            })
+            .with_context(|| format!("animate render for {}", c.path.display()))?;
+            // animate writes combined_<csvstem>_at<HHMMSS>.mov
+            let mov = std::fs::read_dir(&out_dir)?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| {
+                    p.extension().map(|e| e == "mov").unwrap_or(false)
+                        && p.file_name()
+                            .map(|n| n.to_string_lossy().starts_with("combined_"))
+                            .unwrap_or(false)
+                })
+                .context("animate produced no combined .mov")?;
+            mov
+        } else {
+            c.path.clone()
+        };
+        seg_sources.push(src);
+    }
+
+    // Common canvas: height 900, width = widest segment (kept even).
+    let mut canvas_w: u32 = 0;
+    for s in &seg_sources {
+        let (w, h) = probe_display_dims(s)?;
+        let w900 = ((w as f64) * 900.0 / (h as f64)).round() as u32;
+        canvas_w = canvas_w.max(w900 & !1);
+    }
+    let canvas_w = canvas_w.max(2);
+
+    // Pass 2: cards, normalized segments, freeze-fades → concat list.
+    let mut list = String::new();
+    for (i, (c, src)) in clips.iter().zip(&seg_sources).enumerate() {
+        let local = c.start_utc.with_timezone(&disp_offset);
+        let date_s = local.format("%d.%m.%Y").to_string();
+        let time_s = local.format("%H:%M:%S").to_string();
+
+        let card_png = work.join(format!("card{}.png", i));
+        draw_card(&card_png, canvas_w, 900, &date_s, &time_s)?;
+        let card_mp4 = work.join(format!("card{}.mp4", i));
+        ffmpeg(&[
+            "-y", "-loop", "1", "-i", card_png.to_str().unwrap(),
+            "-t", &args.card_seconds.to_string(),
+            "-r", "30", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-crf", "20", card_mp4.to_str().unwrap(),
+        ])?;
+
+        let seg_mp4 = work.join(format!("seg{}.mp4", i));
+        let vf = format!(
+            "scale=-2:900,pad={}:900:(ow-iw)/2:0:black,setsar=1,fps=30",
+            canvas_w
+        );
+        ffmpeg(&[
+            "-y", "-i", src.to_str().unwrap(), "-vf", &vf,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+            seg_mp4.to_str().unwrap(),
+        ])?;
+
+        let last_png = work.join(format!("last{}.png", i));
+        ffmpeg(&[
+            "-y", "-sseof", "-0.2", "-i", seg_mp4.to_str().unwrap(),
+            "-update", "1", "-frames:v", "1", last_png.to_str().unwrap(),
+        ])?;
+        let fade_mp4 = work.join(format!("fade{}.mp4", i));
+        let fade_vf = format!("fade=t=out:st=0:d={}", args.fade_seconds);
+        ffmpeg(&[
+            "-y", "-loop", "1", "-i", last_png.to_str().unwrap(),
+            "-t", &args.fade_seconds.to_string(),
+            "-r", "30", "-vf", &fade_vf,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+            fade_mp4.to_str().unwrap(),
+        ])?;
+
+        for p in [card_mp4.as_path(), seg_mp4.as_path(), fade_mp4.as_path()] {
+            list.push_str(&format!("file '{}'\n", p.display()));
+        }
+        println!("[{}/{}] segment ready ({} {})", i + 1, clips.len(), date_s, time_s);
+    }
+
+    let list_path = work.join("list.txt");
+    std::fs::write(&list_path, list)?;
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    ffmpeg(&[
+        "-y", "-f", "concat", "-safe", "0", "-i", list_path.to_str().unwrap(),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+        args.output.to_str().unwrap(),
+    ])?;
+    println!("Saved {}", args.output.display());
+    Ok(())
+}
+
+fn ffmpeg(a: &[&str]) -> Result<()> {
+    let out = Command::new("ffmpeg")
+        .args(a)
+        .output()
+        .context("running ffmpeg — is it in PATH?")?;
+    if !out.status.success() {
+        bail!(
+            "ffmpeg failed ({:?}): {}",
+            a.first().map(|_| a.join(" ")),
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
+    Ok(())
+}
+
+/// Capture start of a clip in UTC. Prefers the Apple capture-date tag,
+/// falls back to the container tag, then the file mtime.
+fn probe_capture_time(video: &Path) -> Result<DateTime<Utc>> {
+    for tag in ["com.apple.quicktime.creationdate", "creation_time"] {
+        let out = Command::new("ffprobe")
+            .args([
+                "-v", "error", "-show_entries",
+                &format!("format_tags={}", tag),
+                "-of", "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(video)
+            .output()
+            .context("running ffprobe — is it in PATH?")?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            continue;
+        }
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
+            return Ok(dt.with_timezone(&Utc));
+        }
+        // Apple writes e.g. 2026-07-18T10:34:07+0300 (no colon in offset).
+        if let Ok(dt) = DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%z") {
+            return Ok(dt.with_timezone(&Utc));
+        }
+        if let Ok(dt) = DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f%z") {
+            return Ok(dt.with_timezone(&Utc));
+        }
+    }
+    let mtime = std::fs::metadata(video)?.modified()?;
+    let secs = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("mtime before epoch")?
+        .as_secs() as i64;
+    Ok(Utc.timestamp_opt(secs, 0).single().context("bad mtime")?)
+}
+
+/// Displayed (post-rotation) pixel dimensions of a video.
+fn probe_display_dims(video: &Path) -> Result<(u32, u32)> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=width,height:stream_side_data=rotation",
+            "-of", "csv=p=0",
+        ])
+        .arg(video)
+        .output()
+        .context("running ffprobe — is it in PATH?")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.lines().next().unwrap_or_default();
+    let parts: Vec<&str> = first.split(',').collect();
+    let w: u32 = parts.first().and_then(|s| s.trim().parse().ok())
+        .with_context(|| format!("probe dims of {}: {:?}", video.display(), first))?;
+    let h: u32 = parts.get(1).and_then(|s| s.trim().parse().ok())
+        .with_context(|| format!("probe dims of {}: {:?}", video.display(), first))?;
+    let rot: i32 = parts.get(2).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    if rot.abs() % 180 == 90 {
+        Ok((h, w))
+    } else {
+        Ok((w, h))
+    }
+}
+
+/// Black title card with the date above the start time, both centered.
+fn draw_card(path: &Path, w: u32, h: u32, date_s: &str, time_s: &str) -> Result<()> {
+    let root = BitMapBackend::new(path, (w, h)).into_drawing_area();
+    root.fill(&BLACK)
+        .map_err(|e| anyhow::anyhow!("card fill: {e:?}"))?;
+    let center = Pos::new(HPos::Center, VPos::Center);
+    let date_style = (FONT, 72).into_font().color(&WHITE).pos(center);
+    let time_style = (FONT, 110).into_font().color(&WHITE).pos(center);
+    root.draw(&Text::new(
+        date_s.to_string(),
+        ((w / 2) as i32, (h / 2) as i32 - 90),
+        date_style,
+    ))
+    .map_err(|e| anyhow::anyhow!("card date: {e:?}"))?;
+    root.draw(&Text::new(
+        time_s.to_string(),
+        ((w / 2) as i32, (h / 2) as i32 + 30),
+        time_style,
+    ))
+    .map_err(|e| anyhow::anyhow!("card time: {e:?}"))?;
+    root.present()
+        .map_err(|e| anyhow::anyhow!("card present: {e:?}"))?;
+    Ok(())
+}
