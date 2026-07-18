@@ -192,6 +192,13 @@ enum Cmd {
         /// Animation fps for the sensor renders.
         #[arg(long, default_value_t = 15)]
         fps: u32,
+        /// Seconds of Pump Tsüri logo outro at the film's end. 0
+        /// disables the outro.
+        #[arg(long, default_value_t = 5.0)]
+        logo_seconds: f64,
+        /// Replace the embedded Pump Tsüri logo with a custom image.
+        #[arg(long)]
+        logo: Option<PathBuf>,
     },
 }
 
@@ -245,7 +252,8 @@ fn main() -> Result<()> {
             })
         }
         Cmd::Merge { videos, sensor_csv, output, tz_offset_h, mount,
-                     trace_label, card_seconds, fade_seconds, fps } => {
+                     trace_label, card_seconds, fade_seconds, fps,
+                     logo_seconds, logo } => {
             merge_cmd::run(&merge_cmd::MergeArgs {
                 videos: &videos,
                 sensor_csv: sensor_csv.as_deref(),
@@ -256,6 +264,8 @@ fn main() -> Result<()> {
                 card_seconds,
                 fade_seconds,
                 fps,
+                logo_seconds,
+                logo: logo.as_deref(),
             })
         }
     }

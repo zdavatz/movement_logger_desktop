@@ -41,7 +41,15 @@ pub struct MergeArgs<'a> {
     pub card_seconds: f64,
     pub fade_seconds: f64,
     pub fps: u32,
+    /// Seconds of Pump Tsüri logo outro at the film's end; 0 disables.
+    pub logo_seconds: f64,
+    /// Override the embedded logo image.
+    pub logo: Option<&'a Path>,
 }
+
+/// The Pump Tsüri foil logo (same asset as the GUI's top-right icon and
+/// iOS RideLogo), shown as the film's outro.
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
 
 struct Clip {
     path: PathBuf,
@@ -184,6 +192,30 @@ pub fn run(args: &MergeArgs) -> Result<()> {
             list.push_str(&format!("file '{}'\n", p.display()));
         }
         println!("[{}/{}] segment ready ({} {})", i + 1, clips.len(), date_s, time_s);
+    }
+
+    // Outro: the logo centered on black for logo_seconds.
+    if args.logo_seconds > 0.0 {
+        let logo_png = match args.logo {
+            Some(p) => p.to_path_buf(),
+            None => {
+                let p = work.join("logo.png");
+                std::fs::write(&p, LOGO_PNG)?;
+                p
+            }
+        };
+        let outro = work.join("outro.mp4");
+        let lavfi = format!("color=black:s={}x900:d={}:r=30", canvas_w, args.logo_seconds);
+        let filter = "[1:v]scale=-1:420[lg];[0:v][lg]overlay=(W-w)/2:(H-h)/2".to_string();
+        ffmpeg(&[
+            "-y", "-f", "lavfi", "-i", &lavfi,
+            "-i", logo_png.to_str().unwrap(),
+            "-filter_complex", &filter,
+            "-t", &args.logo_seconds.to_string(),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+            outro.to_str().unwrap(),
+        ])?;
+        list.push_str(&format!("file '{}'\n", outro.display()));
     }
 
     let list_path = work.join("list.txt");
