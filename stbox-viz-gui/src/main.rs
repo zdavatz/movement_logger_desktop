@@ -3999,12 +3999,21 @@ impl AppState {
         }
         let Some(player) = self.preview.as_mut() else { return };
 
+        // Fill the pane HEIGHT and let the width follow the video's
+        // aspect (portrait clips are the norm); clamp to the pane width
+        // for wide clips. Requesting the buffer at exactly the video's
+        // aspect also stops mpv from baking black side bars into it.
         let avail_w = ui.available_width().max(100.0);
+        let avail_h = (ui.available_height() - 60.0).max(120.0);
         let (vw, vh) = player.video_size().unwrap_or((16, 9));
-        let mut h = avail_w * vh as f32 / vw as f32;
-        h = h.min((ui.available_height() - 60.0).max(100.0));
+        let mut h = avail_h;
+        let mut w = h * vw as f32 / vh as f32;
+        if w > avail_w {
+            w = avail_w;
+            h = w * vh as f32 / vw as f32;
+        }
         if let Some((fw, fh, rgba)) =
-            player.poll_frame(avail_w.round() as i32, h.round() as i32)
+            player.poll_frame(w.round() as i32, h.round() as i32)
         {
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [fw as usize, fh as usize],
@@ -4022,7 +4031,9 @@ impl AppState {
             }
         }
         if let Some(tex) = &self.preview_tex {
-            ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(avail_w, h)));
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(w, h)));
+            });
         }
 
         ui.add_space(4.0);
