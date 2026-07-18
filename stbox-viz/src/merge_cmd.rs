@@ -161,7 +161,10 @@ pub fn run(args: &MergeArgs) -> Result<()> {
     for s in &seg_sources {
         let (w, h) = probe_display_dims(s)?;
         let w900 = ((w as f64) * 900.0 / (h as f64)).round() as u32;
-        canvas_w = canvas_w.max(w900 & !1);
+        // Round UP to even — ffmpeg's scale=-2:900 rounds to the nearest
+        // even width, and a canvas one pixel narrower than a scaled clip
+        // makes the pad filter fail the whole encode.
+        canvas_w = canvas_w.max((w900 + 1) & !1);
     }
     let canvas_w = canvas_w.max(2);
 
@@ -183,8 +186,11 @@ pub fn run(args: &MergeArgs) -> Result<()> {
         ])?;
 
         let seg_mp4 = work.join(format!("seg{}.mp4", i));
+        // pad width via max(iw, canvas): even if a scaled clip lands a
+        // pixel or two wider than the computed canvas, pad grows with it
+        // instead of erroring out.
         let vf = format!(
-            "scale=-2:900,pad={}:900:(ow-iw)/2:0:black,setsar=1,fps=30",
+            "scale=-2:900,pad=w=max(iw\\,{}):h=900:x=(ow-iw)/2:y=0:color=black,setsar=1,fps=30",
             canvas_w
         );
         ffmpeg(&[
@@ -331,7 +337,14 @@ fn probe_display_dims(video: &Path) -> Result<(u32, u32)> {
         .with_context(|| format!("probe dims of {}: {:?}", video.display(), first))?;
     let h: u32 = parts.get(1).and_then(|s| s.trim().parse().ok())
         .with_context(|| format!("probe dims of {}: {:?}", video.display(), first))?;
-    let rot: i32 = parts.get(2).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    // The rotation side-data lands at a varying field position (iPhone
+    // clips print "w,h,,-90" — an empty field first). Take the first
+    // trailing field that parses; treating it as absent turned every
+    // portrait clip landscape and baked pillar-box bars into the film.
+    let rot: i32 = parts[2.min(parts.len())..]
+        .iter()
+        .find_map(|s| s.trim().parse().ok())
+        .unwrap_or(0);
     if rot.abs() % 180 == 90 {
         Ok((h, w))
     } else {
