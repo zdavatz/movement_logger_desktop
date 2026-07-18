@@ -57,6 +57,15 @@ struct Clip {
     start_utc: DateTime<Utc>,
 }
 
+/// Machine-readable progress line for the GUI ("[progress] <0-100>").
+/// Plain stdout so the CLI stays scriptable; the GUI's log pump
+/// intercepts these lines and feeds its progress bar instead of the
+/// log panel.
+fn emit_progress(done: usize, total: usize) {
+    let pct = ((done as f64 / total.max(1) as f64) * 100.0).round() as u32;
+    println!("[progress] {}", pct.min(100));
+}
+
 pub fn run(args: &MergeArgs) -> Result<()> {
     if args.videos.is_empty() {
         bail!("no videos given");
@@ -80,6 +89,13 @@ pub fn run(args: &MergeArgs) -> Result<()> {
 
     let tmp = tempfile::tempdir()?;
     let work = tmp.path();
+
+    // Progress accounting: one step per sensor render (heavy), one per
+    // segment encode, one for the final concat.
+    let total_steps =
+        if args.sensor_csv.is_some() { clips.len() * 2 } else { clips.len() } + 1;
+    let mut steps_done = 0usize;
+    emit_progress(0, total_steps);
 
     // Pass 1: build each clip's segment source (plain clip, or the
     // animate side-by-side render when a sensor CSV is present).
@@ -133,6 +149,10 @@ pub fn run(args: &MergeArgs) -> Result<()> {
         } else {
             c.path.clone()
         };
+        if args.sensor_csv.is_some() {
+            steps_done += 1;
+            emit_progress(steps_done, total_steps);
+        }
         seg_sources.push(src);
     }
 
@@ -192,6 +212,8 @@ pub fn run(args: &MergeArgs) -> Result<()> {
             list.push_str(&format!("file '{}'\n", p.display()));
         }
         println!("[{}/{}] segment ready ({} {})", i + 1, clips.len(), date_s, time_s);
+        steps_done += 1;
+        emit_progress(steps_done, total_steps);
     }
 
     // Outro: the logo centered on black for logo_seconds.
@@ -230,6 +252,7 @@ pub fn run(args: &MergeArgs) -> Result<()> {
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
         args.output.to_str().unwrap(),
     ])?;
+    emit_progress(total_steps, total_steps);
     println!("Saved {}", args.output.display());
     Ok(())
 }

@@ -34,7 +34,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::thread;
@@ -167,6 +167,9 @@ struct AppState {
     cancel: Arc<AtomicBool>,
     /// True while a child is alive.
     running: Arc<AtomicBool>,
+    /// 0-100 progress of the running child, fed by "[progress] N"
+    /// stdout lines (stbox-viz merge emits them); 0 = no progress yet.
+    child_progress: Arc<AtomicU32>,
     /// Last subprocess exit status, displayed in the status bar.
     last_status: Option<RunStatus>,
 
@@ -613,9 +616,11 @@ fn spawn_and_pump(state: &mut AppState, mut cmd: Command) {
 
     state.cancel.store(false, Ordering::SeqCst);
     state.running.store(true, Ordering::SeqCst);
+    state.child_progress.store(0, Ordering::SeqCst);
     let log = state.log.clone();
     let cancel = state.cancel.clone();
     let running = state.running.clone();
+    let progress = state.child_progress.clone();
 
     // One thread per stream so a deadlock on either pipe doesn't stall
     // the other. Both forward into a shared mpsc that the main thread
@@ -634,6 +639,13 @@ fn spawn_and_pump(state: &mut AppState, mut cmd: Command) {
 
     thread::spawn(move || {
         for line in rx {
+            // "[progress] N" lines feed the progress bar, not the log.
+            if let Some(rest) = line.strip_prefix("[progress] ") {
+                if let Ok(p) = rest.trim().parse::<u32>() {
+                    progress.store(p.min(100), Ordering::SeqCst);
+                    continue;
+                }
+            }
             push_log(&log, line);
         }
         // After both pipes have closed, wait for exit + reap.
@@ -4381,6 +4393,12 @@ impl eframe::App for AppState {
                     self.merge_videos.clear();
                 }
             });
+            {
+                let p = self.child_progress.load(Ordering::SeqCst);
+                if self.running.load(Ordering::SeqCst) && p > 0 {
+                    ui.add(egui::ProgressBar::new(p as f32 / 100.0).show_percentage());
+                }
+            }
             ui.add_space(6.0);
 
             // ----- Action buttons -------------------------------------
