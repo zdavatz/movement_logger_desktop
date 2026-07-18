@@ -565,6 +565,10 @@ pub fn run(args: &AnimateArgs) -> Result<()> {
                          else { f64::NAN };
             }
             out
+        } else if height_full.is_empty() {
+            // No GPS at all (empty/fixless GPS CSV) — height_full is
+            // empty, same as the height_slice guard above.
+            Vec::new()
         } else {
             // No water_set detected — use raw baro slice.
             height_full[at_s..at_e].to_vec()
@@ -1929,7 +1933,10 @@ fn combine_with_ffmpeg(
                "-ss", &video_offset.to_string(), "-i", video_path.to_str().unwrap(),
                "-ss", &sensor_offset.to_string(), "-i", gif_path.to_str().unwrap(),
                "-filter_complex",
-               "[0:v]scale=-1:900[vid];[1:v]scale=-1:900[gif];[vid][gif]hstack=inputs=2",
+               // -2 (not -1) keeps the auto-computed width even — a
+               // portrait 1440×1920 iPhone clip scales to 675×900 with
+               // -1, and libx264/yuv420p rejects odd widths outright.
+               "[0:v]scale=-2:900[vid];[1:v]scale=-2:900[gif];[vid][gif]hstack=inputs=2",
                "-c:v", "libx264", "-pix_fmt", "yuv420p",
                "-r", &fps.to_string(),
                "-t", &ride_s.to_string(), "-an",
