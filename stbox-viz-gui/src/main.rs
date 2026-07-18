@@ -181,6 +181,9 @@ struct AppState {
     /// Output path of the in-flight merge; consumed on child exit to
     /// auto-open the preview.
     merge_output: Option<PathBuf>,
+    /// Last "Saved <path>.mov" the child printed — animate's outputs
+    /// auto-open in the preview through this (merge has merge_output).
+    last_saved_mov: Arc<Mutex<Option<PathBuf>>>,
     /// `running` as of the previous frame — used to detect the child's
     /// completion edge.
     was_running: bool,
@@ -636,6 +639,10 @@ fn spawn_and_pump(state: &mut AppState, mut cmd: Command) {
     let cancel = state.cancel.clone();
     let running = state.running.clone();
     let progress = state.child_progress.clone();
+    if let Ok(mut s) = state.last_saved_mov.lock() {
+        *s = None;
+    }
+    let saved_mov = state.last_saved_mov.clone();
 
     // One thread per stream so a deadlock on either pipe doesn't stall
     // the other. Both forward into a shared mpsc that the main thread
@@ -653,12 +660,35 @@ fn spawn_and_pump(state: &mut AppState, mut cmd: Command) {
     drop(tx);
 
     thread::spawn(move || {
+        // Once an explicit "[progress]" marker shows up (merge emits
+        // them), it owns the bar — the frame counters of merge's inner
+        // animate renders would otherwise yank it back and forth.
+        let mut saw_marker = false;
         for line in rx {
             // "[progress] N" lines feed the progress bar, not the log.
             if let Some(rest) = line.strip_prefix("[progress] ") {
                 if let Ok(p) = rest.trim().parse::<u32>() {
+                    saw_marker = true;
                     progress.store(p.min(100), Ordering::SeqCst);
                     continue;
+                }
+            }
+            // animate's "frame N/M" counter drives the bar too, and
+            // stays out of the log (it would spam a line per update).
+            if let Some(p) = parse_frame_progress(&line) {
+                if !saw_marker {
+                    progress.store(p, Ordering::SeqCst);
+                }
+                continue;
+            }
+            // Remember the newest finished .mov so the GUI can open it
+            // in the embedded preview when the child exits.
+            if let Some(path) = line.strip_prefix("Saved ") {
+                let path = path.trim();
+                if path.ends_with(".mov") {
+                    if let Ok(mut s) = saved_mov.lock() {
+                        *s = Some(PathBuf::from(path));
+                    }
                 }
             }
             push_log(&log, line);
@@ -698,19 +728,49 @@ fn spawn_and_pump(state: &mut AppState, mut cmd: Command) {
     });
 }
 
-fn pump_pipe<R: std::io::Read + Send + 'static>(r: R, tx: mpsc::Sender<String>) {
-    use std::io::{BufRead, BufReader};
-    let buf = BufReader::new(r);
-    for line in buf.lines() {
-        match line {
-            Ok(s) => {
-                if tx.send(s).is_err() {
-                    break;
+/// Line pump that splits on `\n` AND `\r` — stbox-viz's in-place frame
+/// counter ("\r    frame N/M") never sends a newline until the render is
+/// done, so a plain `lines()` reader would sit on the whole progress
+/// stream and deliver it in one lump at the end.
+fn pump_pipe<R: std::io::Read + Send + 'static>(mut r: R, tx: mpsc::Sender<String>) {
+    let mut acc: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                for &b in &chunk[..n] {
+                    if b == b'\n' || b == b'\r' {
+                        if !acc.is_empty() {
+                            let s = String::from_utf8_lossy(&acc).into_owned();
+                            acc.clear();
+                            if tx.send(s).is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        acc.push(b);
+                    }
                 }
             }
             Err(_) => break,
         }
     }
+    if !acc.is_empty() {
+        let _ = tx.send(String::from_utf8_lossy(&acc).into_owned());
+    }
+}
+
+/// Parse stbox-viz's "    frame N/M" render counter into a 0-100 percent.
+fn parse_frame_progress(line: &str) -> Option<u32> {
+    let rest = line.trim().strip_prefix("frame ")?;
+    let (n, m) = rest.trim().split_once('/')?;
+    let n: u64 = n.trim().parse().ok()?;
+    let m: u64 = m.trim().parse().ok()?;
+    if m == 0 {
+        return None;
+    }
+    Some(((n * 100) / m).min(100) as u32)
 }
 
 /// `Read + Write` adapter that lets `gps_debug::run_core` drive a GPS survey
@@ -4307,7 +4367,11 @@ impl eframe::App for AppState {
         // output file exists (a cancelled/failed merge writes none).
         let running_now = self.running.load(Ordering::SeqCst);
         if self.was_running && !running_now {
-            if let Some(out) = self.merge_output.take() {
+            let candidate = self
+                .merge_output
+                .take()
+                .or_else(|| self.last_saved_mov.lock().ok().and_then(|mut s| s.take()));
+            if let Some(out) = candidate {
                 if out.exists() {
                     self.open_preview(out, ctx);
                 }
