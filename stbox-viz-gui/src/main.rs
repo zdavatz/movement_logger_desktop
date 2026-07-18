@@ -3829,6 +3829,30 @@ impl AppState {
     fn ingest_dropped(&mut self, files: &[egui::DroppedFile]) {
         for f in files {
             let Some(path) = f.path.as_ref() else { continue };
+            // A dropped FOLDER adds every video in it to the merge list
+            // (non-recursive) — so "merge my session folder" is one drop.
+            if path.is_dir() {
+                let mut added = 0usize;
+                if let Ok(rd) = std::fs::read_dir(path) {
+                    let mut vids: Vec<PathBuf> = rd
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| matches!(classify(p), FileKind::Video))
+                        .collect();
+                    vids.sort();
+                    for v in vids {
+                        if !self.merge_videos.contains(&v) {
+                            self.merge_videos.push(v);
+                            added += 1;
+                        }
+                    }
+                }
+                push_log(
+                    &self.log,
+                    format!("added {} video(s) from {}", added, path.display()),
+                );
+                continue;
+            }
             match classify(path) {
                 FileKind::Sensor => {
                     self.sensor_csv = Some(path.clone());
