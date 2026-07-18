@@ -114,6 +114,12 @@ const BATTERY_UUID:  Uuid = Uuid::from_u128(0x00000200_0010_11e1_ac36_0002a5d5c5
 /// left staring at "running…" forever (e.g. after a drop-out the box
 /// reconnects but our subscription went stale).
 const OP_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// GET_VERSION answers within one connection interval or never (the firmware's
+/// reply notify is best-effort — `ble_notify_try` gives up after 500 ms when
+/// the stack is busy), so waiting the full OP_IDLE_TIMEOUT just delays the
+/// legacy-box verdict and starves the retry budget. Mirrors iOS's 4 s
+/// `modeReqTimeoutMs` (its v1.0.5 fix for the same single-op family).
+const VERSION_REQ_TIMEOUT: Duration = Duration::from_secs(4);
 /// READ ride-out: how long a READ may go with ZERO notify progress before we
 /// *note* it (a macOS notify pause). We do NOT tear the link down here — see
 /// `READ_RIDE_OUT_LIMIT`. A file READ streams thousands of notifies over
@@ -2912,7 +2918,17 @@ impl WorkerState {
                 /* Firmware replies with the ASCII version string (no NUL),
                    e.g. "0.0.29". Parse as UTF-8 and trim; a lossy/empty
                    decode yields None so a garbled reply reads as "unknown"
-                   (→ update) rather than a bogus version. */
+                   (→ update) rather than a bogus version.
+
+                   A 1-byte payload here is a stale single-byte reply
+                   (GET_MODE / GPS_POWER / status) the stack delivered after
+                   its own op already timed out — a real version is ≥5 ASCII
+                   chars ("0.0.x"). Decoding it would yield an unparseable
+                   "version" → spurious update banner. Ignore it; the real
+                   reply or the watchdog follows. */
+                if n.value.len() < 2 {
+                    return;
+                }
                 let v = String::from_utf8_lossy(&n.value).trim().to_string();
                 let parsed = if v.is_empty() { None } else { Some(v) };
                 self.emit(BleEvent::FirmwareVersion(parsed));
@@ -3198,7 +3214,7 @@ impl WorkerState {
                 read_trickle || now.duration_since(*last_progress) > READ_RIDE_OUT_LIMIT,
             CurrentOp::Deleting { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::GettingMode { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
-            CurrentOp::GettingVersion { last_progress } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
+            CurrentOp::GettingVersion { last_progress } => now.duration_since(*last_progress) > VERSION_REQ_TIMEOUT,
             CurrentOp::GpsPowerReq { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::CalibrationReq { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             // A flash is driven inline and never yields to the watchdog

@@ -328,6 +328,13 @@ pub struct SyncCore {
     /// box version can't change without a flash (a deliberate, rare action),
     /// so once is enough. v0.0.64.
     pub fw_checked_once: bool,
+    /// GET_VERSION timeouts re-tried before the box version is declared
+    /// unknown. The box's reply notify is best-effort (firmware
+    /// `ble_notify_try` gives up after 500 ms when the stack is busy — most
+    /// likely right after an OTA trial boot), and "unknown" raises the update
+    /// banner, so ONE dropped packet must not read as "legacy box". Genuine
+    /// legacy firmware (≤ v0.0.28) simply times out all three attempts.
+    pub fw_version_retries: u8,
     /// Status line for the "Check FW" flow ("Checking…", "Firmware up to
     /// date (vX.Y.Z)", "Updating box to vX.Y.Z…", or an error).
     pub fw_check_msg: String,
@@ -1136,6 +1143,32 @@ impl SyncCore {
                     }
                 }
                 BleEvent::FirmwareVersion(v) => {
+                    if v.is_none()
+                        && self.fw_check_active
+                        && self.fw_version_retries < 2
+                        && matches!(self.ble_state, BleState::Connected)
+                    {
+                        /* No reply is EITHER legacy firmware OR one dropped
+                           notify — and "unknown" raises the update banner,
+                           which on an up-to-date box claims an update it
+                           already runs (seen on iOS right after an OTA: the
+                           box answers from a fresh trial boot, exactly when
+                           its best-effort notify is most likely dropped).
+                           Retry before concluding; a legacy box times out
+                           every attempt. */
+                        self.fw_version_retries += 1;
+                        push_log(
+                            &self.log,
+                            format!(
+                                "fw-check: no version reply — retry {}/2",
+                                self.fw_version_retries
+                            ),
+                        );
+                        if let Some(b) = self.ble.as_ref() {
+                            b.send(BleCmd::GetFirmwareVersion);
+                        }
+                        continue;
+                    }
                     push_log(
                         &self.log,
                         format!(
@@ -1757,6 +1790,7 @@ impl SyncCore {
         self.fw_check_started = Some(std::time::Instant::now());
         self.fw_latest = None;
         self.fw_box_version = None;
+        self.fw_version_retries = 0;
         self.fw_check_msg = "Checking for firmware updates…".into();
         if let Ok(mut g) = self.fw_fetch_result.lock() {
             *g = None;
