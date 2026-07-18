@@ -610,6 +610,38 @@ pub struct LiveSample {
     pub logging_active: bool,
     /// True when the firmware has raised the low-battery warning.
     pub low_battery: bool,
+    /// GPS RF/signal health extension (firmware v0.0.55+, bytes 46..57).
+    /// None on legacy 46-byte packets.
+    pub rf: Option<LiveRf>,
+}
+
+/// GPS RF extension carried in the 58-byte SensorStream (v0.0.55+):
+/// Peter's assembly metrics — same values as the GPS-Debug survey live
+/// line and the firmware's `gps_rf:` errlog line — over the normal BLE
+/// link, no survey bridge needed.
+#[derive(Clone, Copy, Debug)]
+pub struct LiveRf {
+    /// Raw NAV-PVT fixType (0 none, 2 = 2D, 3 = 3D, 4 = 3D+DR, 5 = time).
+    pub fix_type: u8,
+    /// Satellites used in the solution.
+    pub used_sv: u8,
+    /// Mean of the 6 strongest GPS+Galileo C/N0s, ×10 (dB-Hz). 0 = no data.
+    pub avg6_x10: u16,
+    /// Weakest / strongest of that top-6 (dB-Hz).
+    pub min6: u8,
+    pub max6: u8,
+    /// MON-RF noisePerMS (broadband noise floor).
+    pub noise_per_ms: u16,
+    /// MON-RF agcCnt (0..8191).
+    pub agc_cnt: u16,
+    /// MON-RF jamInd (narrowband CW, 0..255).
+    pub jam_ind: u8,
+    /// MON-RF jammingState (0 unk, 1 ok, 2 warn, 3 crit).
+    pub jam_state: u8,
+    /// MON-RF antStatus (0 init, 2 ok, 3 SHORT, 4 OPEN).
+    pub ant_status: u8,
+    /// Flags bit 3: MON-RF values seen within the last 15 s.
+    pub fresh: bool,
 }
 
 impl LiveSample {
@@ -618,7 +650,7 @@ impl LiveSample {
     /// already reassembled chunked frames into 46 contiguous bytes
     /// before reaching here.
     fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 46 { return None; }
+        if bytes.len() != 46 && bytes.len() != 58 { return None; }
         // Length is fixed, so the slice → array conversions can't fail.
         // `unwrap` keeps the call sites readable; the bounds check above
         // is the precondition.
@@ -644,6 +676,25 @@ impl LiveSample {
             gps_valid:       flags & 0x01 != 0,
             low_battery:     flags & 0x02 != 0,
             logging_active:  flags & 0x04 != 0,
+            rf: if bytes.len() >= 58 {
+                let u16_at =
+                    |o: usize| u16::from_le_bytes(bytes[o..o + 2].try_into().unwrap());
+                Some(LiveRf {
+                    fix_type:     bytes[46],
+                    used_sv:      bytes[47],
+                    avg6_x10:     u16_at(48),
+                    min6:         bytes[50],
+                    max6:         bytes[51],
+                    noise_per_ms: u16_at(52),
+                    agc_cnt:      u16_at(54),
+                    jam_ind:      bytes[56],
+                    jam_state:    bytes[57] & 0x0F,
+                    ant_status:   bytes[57] >> 4,
+                    fresh:        flags & 0x08 != 0,
+                })
+            } else {
+                None
+            },
         })
     }
 
@@ -3056,8 +3107,9 @@ impl WorkerState {
     /// on the next 0x00, and at 0.5 Hz a lost frame is a 2 s gap that
     /// the user might not even notice.
     fn handle_stream_notification(&mut self, bytes: &[u8]) {
-        if bytes.len() == 46 {
-            // Single-notify path. Reset any in-flight chunked frame so
+        if bytes.len() == 46 || bytes.len() == 58 {
+            // Single-notify path (46 = legacy, 58 = v0.0.55+ with the
+            // GPS RF extension). Reset any in-flight chunked frame so
             // a mid-frame MTU upgrade doesn't leave the asm in a bad
             // state for the next chunked frame (defensive — should be
             // either-or in practice).
