@@ -41,6 +41,9 @@ pub struct MergeArgs<'a> {
     pub card_seconds: f64,
     pub fade_seconds: f64,
     pub fps: u32,
+    /// Seconds of the "MovementLogger" intro card at the film's start
+    /// (text in the logo's colors); 0 disables.
+    pub intro_seconds: f64,
     /// Seconds of Pump Tsüri logo outro at the film's end; 0 disables.
     pub logo_seconds: f64,
     /// Override the embedded logo image.
@@ -172,6 +175,23 @@ pub fn run(args: &MergeArgs) -> Result<()> {
 
     // Pass 2: cards, normalized segments, freeze-fades → concat list.
     let mut list = String::new();
+
+    // Intro: "MovementLogger" in the logo's colors on black, before the
+    // first date card.
+    if args.intro_seconds > 0.0 {
+        let intro_png = work.join("intro.png");
+        draw_intro(&intro_png, canvas_w, 900)?;
+        let intro_mp4 = work.join("intro.mp4");
+        ffmpeg(&[
+            "-y", "-loop", "1", "-i", intro_png.to_str().unwrap(),
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-t", &args.intro_seconds.to_string(),
+            "-r", "30", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-crf", "20", "-c:a", "aac",
+            intro_mp4.to_str().unwrap(),
+        ])?;
+        list.push_str(&format!("file '{}'\n", intro_mp4.display()));
+    }
     for (i, (c, src)) in clips.iter().zip(&seg_sources).enumerate() {
         let local = c.start_utc.with_timezone(&disp_offset);
         let date_s = local.format("%d.%m.%Y").to_string();
@@ -386,6 +406,71 @@ fn probe_display_dims(video: &Path) -> Result<(u32, u32)> {
     } else {
         Ok((w, h))
     }
+}
+
+/// The logo's palette (board orange → mast teal → wing blue → wing
+/// purple), lerped across the letters of the intro text.
+const INTRO_STOPS: [(u8, u8, u8); 4] =
+    [(247, 154, 51), (36, 195, 188), (62, 141, 243), (125, 77, 240)];
+
+fn intro_color(t: f64) -> RGBColor {
+    let x = (t.clamp(0.0, 1.0)) * (INTRO_STOPS.len() - 1) as f64;
+    let i = (x.floor() as usize).min(INTRO_STOPS.len() - 2);
+    let f = x - i as f64;
+    let (a, b) = (INTRO_STOPS[i], INTRO_STOPS[i + 1]);
+    RGBColor(
+        (a.0 as f64 + (b.0 as f64 - a.0 as f64) * f) as u8,
+        (a.1 as f64 + (b.1 as f64 - a.1 as f64) * f) as u8,
+        (a.2 as f64 + (b.2 as f64 - a.2 as f64) * f) as u8,
+    )
+}
+
+/// Black intro card: "MovementLogger" centered, each letter colored along
+/// the logo gradient. Letters are laid out by per-glyph measured widths
+/// (no kerning — close enough for a title card), sized to ~86% of the
+/// canvas width.
+fn draw_intro(path: &Path, w: u32, h: u32) -> Result<()> {
+    const TEXT: &str = "MovementLogger";
+    let root = BitMapBackend::new(path, (w, h)).into_drawing_area();
+    root.fill(&BLACK)
+        .map_err(|e| anyhow::anyhow!("intro fill: {e:?}"))?;
+
+    let measure = |size: f64| -> Result<(i32, Vec<i32>)> {
+        let font = (FONT, size).into_font();
+        let mut widths = Vec::with_capacity(TEXT.len());
+        let mut total = 0i32;
+        for ch in TEXT.chars() {
+            let cs = ch.to_string();
+            let ((x0, _), (x1, _)) = font
+                .box_size(&cs)
+                .map(|(bw, _)| ((0, 0), (bw as i32, 0)))
+                .map_err(|e| anyhow::anyhow!("intro measure: {e:?}"))?;
+            let cw = x1 - x0;
+            widths.push(cw);
+            total += cw;
+        }
+        Ok((total, widths))
+    };
+    let (base_total, _) = measure(100.0)?;
+    let size = (100.0 * (w as f64 * 0.86) / base_total.max(1) as f64).min(180.0);
+    let (total, widths) = measure(size)?;
+
+    let mut x = (w as i32 - total) / 2;
+    let y = (h as i32) / 2;
+    let n = TEXT.chars().count().max(2);
+    for (i, ch) in TEXT.chars().enumerate() {
+        let color = intro_color(i as f64 / (n - 1) as f64);
+        let style = (FONT, size)
+            .into_font()
+            .color(&color)
+            .pos(Pos::new(HPos::Left, VPos::Center));
+        root.draw(&Text::new(ch.to_string(), (x, y), style))
+            .map_err(|e| anyhow::anyhow!("intro draw: {e:?}"))?;
+        x += widths[i];
+    }
+    root.present()
+        .map_err(|e| anyhow::anyhow!("intro present: {e:?}"))?;
+    Ok(())
 }
 
 /// Black title card with the date above the start time, both centered.
