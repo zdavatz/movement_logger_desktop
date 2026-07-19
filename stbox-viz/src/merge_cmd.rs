@@ -182,9 +182,11 @@ pub fn run(args: &MergeArgs) -> Result<()> {
         let card_mp4 = work.join(format!("card{}.mp4", i));
         ffmpeg(&[
             "-y", "-loop", "1", "-i", card_png.to_str().unwrap(),
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
             "-t", &args.card_seconds.to_string(),
             "-r", "30", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-crf", "20", card_mp4.to_str().unwrap(),
+            "-crf", "20", "-c:a", "aac",
+            card_mp4.to_str().unwrap(),
         ])?;
 
         let seg_mp4 = work.join(format!("seg{}.mp4", i));
@@ -196,11 +198,24 @@ pub fn run(args: &MergeArgs) -> Result<()> {
              pad={cw}:900:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30",
             cw = canvas_w
         );
-        ffmpeg(&[
-            "-y", "-i", src.to_str().unwrap(), "-vf", &vf,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
-            seg_mp4.to_str().unwrap(),
-        ])?;
+        if has_audio(src) {
+            ffmpeg(&[
+                "-y", "-i", src.to_str().unwrap(), "-vf", &vf,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+                "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                seg_mp4.to_str().unwrap(),
+            ])?;
+        } else {
+            ffmpeg(&[
+                "-y", "-i", src.to_str().unwrap(),
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                "-vf", &vf,
+                "-map", "0:v", "-map", "1:a", "-shortest",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+                "-c:a", "aac",
+                seg_mp4.to_str().unwrap(),
+            ])?;
+        }
 
         let last_png = work.join(format!("last{}.png", i));
         ffmpeg(&[
@@ -211,9 +226,11 @@ pub fn run(args: &MergeArgs) -> Result<()> {
         let fade_vf = format!("fade=t=out:st=0:d={}", args.fade_seconds);
         ffmpeg(&[
             "-y", "-loop", "1", "-i", last_png.to_str().unwrap(),
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
             "-t", &args.fade_seconds.to_string(),
             "-r", "30", "-vf", &fade_vf,
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+            "-c:a", "aac",
             fade_mp4.to_str().unwrap(),
         ])?;
 
@@ -237,13 +254,17 @@ pub fn run(args: &MergeArgs) -> Result<()> {
         };
         let outro = work.join("outro.mp4");
         let lavfi = format!("color=black:s={}x900:d={}:r=30", canvas_w, args.logo_seconds);
-        let filter = "[1:v]scale=-1:420[lg];[0:v][lg]overlay=(W-w)/2:(H-h)/2".to_string();
+        let filter =
+            "[1:v]scale=-1:420[lg];[0:v][lg]overlay=(W-w)/2:(H-h)/2[v]".to_string();
         ffmpeg(&[
             "-y", "-f", "lavfi", "-i", &lavfi,
             "-i", logo_png.to_str().unwrap(),
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
             "-filter_complex", &filter,
+            "-map", "[v]", "-map", "2:a", "-shortest",
             "-t", &args.logo_seconds.to_string(),
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+            "-c:a", "aac",
             outro.to_str().unwrap(),
         ])?;
         list.push_str(&format!("file '{}'\n", outro.display()));
@@ -259,11 +280,23 @@ pub fn run(args: &MergeArgs) -> Result<()> {
     ffmpeg(&[
         "-y", "-f", "concat", "-safe", "0", "-i", list_path.to_str().unwrap(),
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+        "-c:a", "aac",
         args.output.to_str().unwrap(),
     ])?;
     emit_progress(total_steps, total_steps);
     println!("Saved {}", args.output.display());
     Ok(())
+}
+
+/// True when the file has at least one audio stream.
+fn has_audio(p: &Path) -> bool {
+    Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a",
+               "-show_entries", "stream=index", "-of", "csv=p=0"])
+        .arg(p)
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn ffmpeg(a: &[&str]) -> Result<()> {
