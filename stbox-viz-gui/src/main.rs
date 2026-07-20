@@ -2864,6 +2864,98 @@ impl AppState {
         );
         ui.add_space(6.0);
 
+        // Live RF health straight from the SensorStream (firmware v0.0.55+;
+        // no survey needed, works while a box is connected on the Sync tab):
+        // C/N0 max plus Peter's assembly metrics — fix type, sats used,
+        // top-6 GPS+Galileo C/N0 and the MON-RF EMI set. Moved here from
+        // the Live tab: all GPS debugging lives on this tab.
+        if let Some(s) = self.latest_sample {
+            ui.label(egui::RichText::new("Live RF (SensorStream)").strong());
+            egui::Grid::new("gps_dbg_live_rf")
+                .num_columns(4)
+                .spacing([16.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("GPS C/N0").strong());
+                    if s.cn0_max > 0 {
+                        ui.label(format!("{} dB-Hz max", s.cn0_max));
+                        let (txt, col) = if s.cn0_max >= 40 {
+                            ("good antenna", egui::Color32::LIGHT_GREEN)
+                        } else if s.cn0_max >= 30 {
+                            ("ok", egui::Color32::LIGHT_YELLOW)
+                        } else {
+                            ("weak signal", egui::Color32::LIGHT_RED)
+                        };
+                        ui.colored_label(col, txt);
+                        ui.label("");
+                    } else {
+                        ui.colored_label(egui::Color32::LIGHT_YELLOW, "no GSV / no data");
+                        ui.label("");
+                        ui.label("");
+                    }
+                    ui.end_row();
+
+                    // Legacy firmware sends 46-byte packets → rows absent.
+                    if let Some(rf) = &s.rf {
+                        ui.label(egui::RichText::new("GPS RF").strong());
+                        let fix = match rf.fix_type {
+                            0 => "no fix",
+                            2 => "2D",
+                            3 => "3D",
+                            4 => "3D+DR",
+                            5 => "time",
+                            _ => "?",
+                        };
+                        ui.label(format!("fix {fix} · {} used", rf.used_sv));
+                        if rf.avg6_x10 > 0 {
+                            ui.label(format!(
+                                "avg6 {:.1} / min {} / max {} dB-Hz",
+                                rf.avg6_x10 as f64 / 10.0,
+                                rf.min6,
+                                rf.max6
+                            ));
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::LIGHT_YELLOW,
+                                "no GPS+Galileo C/N0",
+                            );
+                        }
+                        ui.label("");
+                        ui.end_row();
+
+                        ui.label(egui::RichText::new("GPS EMI").strong());
+                        if rf.fresh {
+                            ui.label(format!(
+                                "noise {} · agc {}",
+                                rf.noise_per_ms, rf.agc_cnt
+                            ));
+                            let (jt, jc) = match rf.jam_state {
+                                1 => ("jam ok", egui::Color32::LIGHT_GREEN),
+                                2 => ("jam warn", egui::Color32::LIGHT_YELLOW),
+                                3 => ("jam CRIT", egui::Color32::LIGHT_RED),
+                                _ => ("jam ?", egui::Color32::from_gray(140)),
+                            };
+                            ui.colored_label(jc, format!("{jt} (ind {})", rf.jam_ind));
+                            let (at, ac) = match rf.ant_status {
+                                2 => ("ant ok", egui::Color32::LIGHT_GREEN),
+                                3 => ("ant SHORT", egui::Color32::LIGHT_RED),
+                                4 => ("ant OPEN", egui::Color32::LIGHT_RED),
+                                _ => ("ant ?", egui::Color32::from_gray(140)),
+                            };
+                            ui.colored_label(ac, at);
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::from_gray(140),
+                                "no MON-RF reply (module quiet)",
+                            );
+                            ui.label("");
+                            ui.label("");
+                        }
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(6.0);
+        }
+
         let running = self.gps_dbg_running.load(Ordering::SeqCst);
 
         // Transport: USB serial cable vs the box's BLE link.
@@ -3548,86 +3640,9 @@ impl AppState {
                 ));
                 ui.end_row();
 
-                ui.label(egui::RichText::new("GPS C/N0").strong());
-                if s.cn0_max > 0 {
-                    ui.label(format!("{} dB-Hz max", s.cn0_max));
-                    let (txt, col) = if s.cn0_max >= 40 {
-                        ("good antenna", egui::Color32::LIGHT_GREEN)
-                    } else if s.cn0_max >= 30 {
-                        ("ok", egui::Color32::LIGHT_YELLOW)
-                    } else {
-                        ("weak signal", egui::Color32::LIGHT_RED)
-                    };
-                    ui.colored_label(col, txt);
-                    ui.label("");
-                } else {
-                    ui.colored_label(egui::Color32::LIGHT_YELLOW, "no GSV / no data");
-                    ui.label("");
-                    ui.label("");
-                }
-                ui.end_row();
-
-                // GPS RF extension (firmware v0.0.55+): Peter's assembly
-                // metrics live over the normal BLE link — same values as
-                // the GPS-Debug survey line, no bridge needed. Legacy
-                // firmware sends 46-byte packets → rows absent.
-                if let Some(rf) = &s.rf {
-                    ui.label(egui::RichText::new("GPS RF").strong());
-                    let fix = match rf.fix_type {
-                        0 => "no fix",
-                        2 => "2D",
-                        3 => "3D",
-                        4 => "3D+DR",
-                        5 => "time",
-                        _ => "?",
-                    };
-                    ui.label(format!("fix {fix} · {} used", rf.used_sv));
-                    if rf.avg6_x10 > 0 {
-                        ui.label(format!(
-                            "avg6 {:.1} / min {} / max {} dB-Hz",
-                            rf.avg6_x10 as f64 / 10.0,
-                            rf.min6,
-                            rf.max6
-                        ));
-                    } else {
-                        ui.colored_label(
-                            egui::Color32::LIGHT_YELLOW,
-                            "no GPS+Galileo C/N0",
-                        );
-                    }
-                    ui.label("");
-                    ui.end_row();
-
-                    ui.label(egui::RichText::new("GPS EMI").strong());
-                    if rf.fresh {
-                        ui.label(format!(
-                            "noise {} · agc {}",
-                            rf.noise_per_ms, rf.agc_cnt
-                        ));
-                        let (jt, jc) = match rf.jam_state {
-                            1 => ("jam ok", egui::Color32::LIGHT_GREEN),
-                            2 => ("jam warn", egui::Color32::LIGHT_YELLOW),
-                            3 => ("jam CRIT", egui::Color32::LIGHT_RED),
-                            _ => ("jam ?", egui::Color32::from_gray(140)),
-                        };
-                        ui.colored_label(jc, format!("{jt} (ind {})", rf.jam_ind));
-                        let (at, ac) = match rf.ant_status {
-                            2 => ("ant ok", egui::Color32::LIGHT_GREEN),
-                            3 => ("ant SHORT", egui::Color32::LIGHT_RED),
-                            4 => ("ant OPEN", egui::Color32::LIGHT_RED),
-                            _ => ("ant ?", egui::Color32::from_gray(140)),
-                        };
-                        ui.colored_label(ac, at);
-                    } else {
-                        ui.colored_label(
-                            egui::Color32::from_gray(140),
-                            "no MON-RF reply (module quiet)",
-                        );
-                        ui.label("");
-                        ui.label("");
-                    }
-                    ui.end_row();
-                }
+                // GPS C/N0 + the RF/EMI extension rows moved to the GPS
+                // Debug tab ("Live RF" panel in ui_gps_debug_tab) — all GPS
+                // *debugging* lives there; Live keeps the logger readouts.
 
                 ui.label(egui::RichText::new("Flags").strong());
                 let flag_col = |on: bool| {
