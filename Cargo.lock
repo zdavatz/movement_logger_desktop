@@ -2931,7 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "movement-logger"
-version = "0.0.74"
+version = "0.0.75"
 dependencies = [
  "anyhow",
  "btleplug",
