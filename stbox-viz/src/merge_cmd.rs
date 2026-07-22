@@ -9,8 +9,13 @@
 //!      `# SYNC` anchors), otherwise the plain clip is used,
 //!   3. the clip's last frame frozen and faded to black over
 //!      `fade_seconds` (default 3 s).
-//! All pieces are normalized to a common canvas (height 900, width =
-//! widest segment) and concatenated into a single H.264 .mov.
+//! The film OPENS with the "MovementLogger" gradient title over the first
+//! clip's first frame (semi-transparent), and CLOSES with the foil logo
+//! PUMPING — rocking about its wings + a synced bob + squash over a sky→sea
+//! gradient (cadence mapped from the pumping footage), fading in from the
+//! last freeze's black and back out. All pieces are normalized to a common
+//! canvas (height 900, width = widest segment) and concatenated into a
+//! single H.264 .mov.
 //!
 //! Capture times come from `com.apple.quicktime.creationdate` (survives
 //! iOS share/export rewrites of the container `creation_time`, which is
@@ -176,11 +181,37 @@ pub fn run(args: &MergeArgs) -> Result<()> {
     // Pass 2: cards, normalized segments, freeze-fades → concat list.
     let mut list = String::new();
 
-    // Intro: "MovementLogger" in the logo's colors on black, before the
-    // first date card.
+    // Intro: "MovementLogger" in the logo's colors, over the FIRST clip's
+    // first frame (aspect-fit into the canvas), semi-transparent. Falls back
+    // to the gradient title on black if the frame can't be extracted.
     if args.intro_seconds > 0.0 {
+        let title_color = work.join("intro_title.png");
+        let title_mask = work.join("intro_mask.png");
+        draw_intro(&title_color, canvas_w, 900, false)?;
+        draw_intro(&title_mask, canvas_w, 900, true)?;
         let intro_png = work.join("intro.png");
-        draw_intro(&intro_png, canvas_w, 900)?;
+        let norm_vf = format!(
+            "scale=w={cw}:h=900:force_original_aspect_ratio=decrease:force_divisible_by=2,\
+             pad={cw}:900:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1",
+            cw = canvas_w
+        );
+        let mut composed = false;
+        if let Some(s) = seg_sources.first() {
+            let bg = work.join("intro_bg.png");
+            if ffmpeg(&[
+                "-y", "-ss", "0", "-i", s.to_str().unwrap(),
+                "-frames:v", "1", "-vf", &norm_vf,
+                bg.to_str().unwrap(),
+            ])
+            .is_ok()
+                && composite_intro(&bg, &title_color, &title_mask, &intro_png, 0.85).is_ok()
+            {
+                composed = true;
+            }
+        }
+        if !composed {
+            draw_intro(&intro_png, canvas_w, 900, false)?;
+        }
         let intro_mp4 = work.join("intro.mp4");
         ffmpeg(&[
             "-y", "-loop", "1", "-i", intro_png.to_str().unwrap(),
@@ -262,31 +293,16 @@ pub fn run(args: &MergeArgs) -> Result<()> {
         emit_progress(steps_done, total_steps);
     }
 
-    // Outro: the logo centered on black for logo_seconds.
+    // Outro: the foil logo PUMPING (rocking about its wings + bob + squash)
+    // over a sky→sea gradient, fading in from black and back out. Frames
+    // drawn in Rust, encoded by ffmpeg. `logo_seconds` sets its length.
     if args.logo_seconds > 0.0 {
-        let logo_png = match args.logo {
-            Some(p) => p.to_path_buf(),
-            None => {
-                let p = work.join("logo.png");
-                std::fs::write(&p, LOGO_PNG)?;
-                p
-            }
+        let logo_bytes: Vec<u8> = match args.logo {
+            Some(p) => std::fs::read(p)
+                .with_context(|| format!("read logo {}", p.display()))?,
+            None => LOGO_PNG.to_vec(),
         };
-        let outro = work.join("outro.mp4");
-        let lavfi = format!("color=black:s={}x900:d={}:r=30", canvas_w, args.logo_seconds);
-        let filter =
-            "[1:v]scale=-1:420[lg];[0:v][lg]overlay=(W-w)/2:(H-h)/2[v]".to_string();
-        ffmpeg(&[
-            "-y", "-f", "lavfi", "-i", &lavfi,
-            "-i", logo_png.to_str().unwrap(),
-            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-            "-filter_complex", &filter,
-            "-map", "[v]", "-map", "2:a", "-shortest",
-            "-t", &args.logo_seconds.to_string(),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
-            "-c:a", "aac",
-            outro.to_str().unwrap(),
-        ])?;
+        let outro = render_pump_outro(work, &logo_bytes, canvas_w, 900, 30, args.logo_seconds)?;
         list.push_str(&format!("file '{}'\n", outro.display()));
     }
 
@@ -425,11 +441,233 @@ fn intro_color(t: f64) -> RGBColor {
     )
 }
 
-/// Black intro card: "MovementLogger" centered, each letter colored along
-/// the logo gradient. Letters are laid out by per-glyph measured widths
-/// (no kerning — close enough for a title card), sized to ~86% of the
-/// canvas width.
-fn draw_intro(path: &Path, w: u32, h: u32) -> Result<()> {
+// ---- Pumping-foil outro (mapped from Ayano's IMG_5266.MOV pumping
+// footage): the foil rocks about its wings + a synced vertical bob + squash
+// over a sky→sea gradient, fading in from black and back out.
+const PUMP_PERIOD_S: f64 = 1.05; // ~3 pumps over 3 s
+const PUMP_PITCH_DEG: f64 = 11.0; // rock amplitude (°)
+const PUMP_HEAVE_FRAC: f64 = 0.021; // vertical bob (of height)
+const PUMP_SQUASH: f64 = 0.035; // compress/extend
+const PUMP_LOGO_FRAC: f64 = 0.55; // foil size (of height)
+const PUMP_PIVOT_FRAC: f64 = 0.78; // wings pivot (down the foil)
+const PUMP_FADE_IN_S: f64 = 0.35;
+const PUMP_FADE_OUT_S: f64 = 0.75;
+/// Sky → horizon → sea gradient (RGB) for the outro background.
+const PUMP_SKY: (f64, f64, f64) = (189.0, 227.0, 245.0);
+const PUMP_HORIZON: (f64, f64, f64) = (107.0, 184.0, 212.0);
+const PUMP_SEA: (f64, f64, f64) = (28.0, 87.0, 128.0);
+
+/// Vertical sky→sea gradient colour at `t` in [0,1] (0 = top).
+fn sea_gradient(t: f64) -> (f64, f64, f64) {
+    let lerp = |a: (f64, f64, f64), b: (f64, f64, f64), f: f64| {
+        (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f, a.2 + (b.2 - a.2) * f)
+    };
+    if t <= 0.52 {
+        lerp(PUMP_SKY, PUMP_HORIZON, (t / 0.52).clamp(0.0, 1.0))
+    } else {
+        lerp(PUMP_HORIZON, PUMP_SEA, ((t - 0.52) / 0.48).clamp(0.0, 1.0))
+    }
+}
+
+/// Bilinear RGBA sample of `logo` at (fx, fy) in image pixels. Returns
+/// (r, g, b) in 0..255 and alpha in 0..1.
+fn sample_logo(logo: &image::RgbaImage, fx: f64, fy: f64) -> (f64, f64, f64, f64) {
+    let (w, h) = (logo.width() as i64, logo.height() as i64);
+    let x0 = fx.floor() as i64;
+    let y0 = fy.floor() as i64;
+    let dx = fx - x0 as f64;
+    let dy = fy - y0 as f64;
+    let at = |x: i64, y: i64| -> (f64, f64, f64, f64) {
+        let xc = x.clamp(0, w - 1) as u32;
+        let yc = y.clamp(0, h - 1) as u32;
+        let p = logo.get_pixel(xc, yc).0;
+        (p[0] as f64, p[1] as f64, p[2] as f64, p[3] as f64 / 255.0)
+    };
+    let (a, b, c, d) = (
+        at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1),
+    );
+    let mix = |p: f64, q: f64, f: f64| p + (q - p) * f;
+    let r = mix(mix(a.0, b.0, dx), mix(c.0, d.0, dx), dy);
+    let g = mix(mix(a.1, b.1, dx), mix(c.1, d.1, dx), dy);
+    let bl = mix(mix(a.2, b.2, dx), mix(c.2, d.2, dx), dy);
+    let al = mix(mix(a.3, b.3, dx), mix(c.3, d.3, dx), dy);
+    (r, g, bl, al)
+}
+
+/// One frame of the pumping outro (RGB): sky→sea gradient with the foil
+/// rocked about its wings + bob + squash, plus fade in/out to black. Frame
+/// `i` of `n`. Mirrors the iOS `pumpFrameImage` transform, worked in the
+/// image crate's y-down space.
+fn render_pump_frame(
+    w: u32, h: u32, logo: &image::RgbaImage, i: usize, n: usize, fps: u32,
+) -> image::RgbImage {
+    use std::f64::consts::PI;
+    let (fw, fh) = (w as f64, h as f64);
+    let secs = i as f64 / fps as f64;
+    let dur = n as f64 / fps as f64;
+    let phase = 2.0 * PI / PUMP_PERIOD_S * secs;
+
+    let logo_iw = logo.width() as f64;
+    let logo_ih = logo.height() as f64;
+    let logo_h = fh * PUMP_LOGO_FRAC;
+    let logo_w = logo_h * logo_iw / logo_ih;
+    let left = (fw - logo_w) / 2.0;
+    let top = (fh - logo_h) / 2.0;
+    let piv_x = left + logo_w / 2.0;
+    let piv_y = top + PUMP_PIVOT_FRAC * logo_h; // wings, down from the top
+
+    let theta = PUMP_PITCH_DEG * phase.sin() * PI / 180.0;
+    let dy = -PUMP_HEAVE_FRAC * fh * phase.sin(); // rise on nose-up
+    let sy = 1.0 - PUMP_SQUASH * phase.cos(); // squash at compress
+    let (ct, st) = (theta.cos(), theta.sin());
+
+    let cover = if secs < PUMP_FADE_IN_S {
+        1.0 - secs / PUMP_FADE_IN_S
+    } else if secs > dur - PUMP_FADE_OUT_S {
+        (secs - (dur - PUMP_FADE_OUT_S)) / PUMP_FADE_OUT_S
+    } else {
+        0.0
+    }
+    .clamp(0.0, 1.0);
+
+    // Forward-transform the foil's rect corners to bound the (expensive)
+    // inverse-mapped sampling region; the gradient + fade cover the rest.
+    let fwd = |rx: f64, ry: f64| -> (f64, f64) {
+        let xs = rx;
+        let ys = piv_y + (ry - piv_y) * sy; // scale about pivot
+        let ( dx0, dy0) = (xs - piv_x, ys - piv_y);
+        let xr = piv_x + dx0 * ct - dy0 * st; // rotate about pivot
+        let yr = piv_y + dx0 * st + dy0 * ct;
+        (xr, yr + dy) // heave
+    };
+    let corners = [
+        fwd(left, top), fwd(left + logo_w, top),
+        fwd(left, top + logo_h), fwd(left + logo_w, top + logo_h),
+    ];
+    let pad = 2.0;
+    let bx0 = corners.iter().map(|c| c.0).fold(f64::MAX, f64::min).floor().max(0.0) - pad;
+    let bx1 = corners.iter().map(|c| c.0).fold(f64::MIN, f64::max).ceil().min(fw) + pad;
+    let by0 = corners.iter().map(|c| c.1).fold(f64::MAX, f64::min).floor().max(0.0) - pad;
+    let by1 = corners.iter().map(|c| c.1).fold(f64::MIN, f64::max).ceil().min(fh) + pad;
+    let (bx0, by0) = (bx0.max(0.0) as u32, by0.max(0.0) as u32);
+    let (bx1, by1) = ((bx1.min(fw)) as u32, (by1.min(fh)) as u32);
+
+    let mut img = image::RgbImage::new(w, h);
+    for y in 0..h {
+        let base = sea_gradient(y as f64 / (fh - 1.0).max(1.0));
+        for x in 0..w {
+            let mut gr = base.0;
+            let mut gg = base.1;
+            let mut gb = base.2;
+            if x >= bx0 && x < bx1 && y >= by0 && y < by1 {
+                // Inverse-map this output pixel back into logo space.
+                let ox = x as f64 + 0.5;
+                let oy = y as f64 + 0.5;
+                let y1 = oy - dy; // un-heave
+                let (dx0, dy0) = (ox - piv_x, y1 - piv_y);
+                let xr = piv_x + dx0 * ct + dy0 * st; // un-rotate
+                let yr = piv_y - dx0 * st + dy0 * ct;
+                let ys = piv_y + (yr - piv_y) / sy; // un-scale
+                let lx = (xr - left) / logo_w * logo_iw;
+                let ly = (ys - top) / logo_h * logo_ih;
+                if lx >= 0.0 && ly >= 0.0 && lx < logo_iw && ly < logo_ih {
+                    let (lr, lg, lb, la) = sample_logo(logo, lx, ly);
+                    if la > 0.0 {
+                        gr = gr * (1.0 - la) + lr * la;
+                        gg = gg * (1.0 - la) + lg * la;
+                        gb = gb * (1.0 - la) + lb * la;
+                    }
+                }
+            }
+            if cover > 0.0 {
+                let k = 1.0 - cover;
+                gr *= k;
+                gg *= k;
+                gb *= k;
+            }
+            img.put_pixel(
+                x, y,
+                image::Rgb([
+                    gr.round().clamp(0.0, 255.0) as u8,
+                    gg.round().clamp(0.0, 255.0) as u8,
+                    gb.round().clamp(0.0, 255.0) as u8,
+                ]),
+            );
+        }
+    }
+    img
+}
+
+/// Render the pumping-foil outro to `<work>/outro.mp4` (canvas-sized,
+/// `seconds` long at `fps`) and return its path. PNG frames drawn in Rust,
+/// encoded by ffmpeg (with a silent audio track for the concat).
+fn render_pump_outro(
+    work: &Path, logo_bytes: &[u8], w: u32, h: u32, fps: u32, seconds: f64,
+) -> Result<PathBuf> {
+    let logo = image::load_from_memory(logo_bytes)
+        .context("decode outro logo")?
+        .to_rgba8();
+    let frames_dir = work.join("pump");
+    std::fs::create_dir_all(&frames_dir)?;
+    let n = ((seconds * fps as f64).round() as usize).max(1);
+    for i in 0..n {
+        let frame = render_pump_frame(w, h, &logo, i, n, fps);
+        frame
+            .save(frames_dir.join(format!("f{:04}.png", i)))
+            .with_context(|| format!("write pump frame {i}"))?;
+    }
+    let pattern = frames_dir.join("f%04d.png");
+    let outro = work.join("outro.mp4");
+    ffmpeg(&[
+        "-y", "-framerate", &fps.to_string(), "-i", pattern.to_str().unwrap(),
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+        "-t", &seconds.to_string(),
+        "-r", "30", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+        "-c:a", "aac", "-shortest",
+        outro.to_str().unwrap(),
+    ])?;
+    Ok(outro)
+}
+
+/// Composite the gradient title (`color_png`) over the first-frame
+/// background (`bg_png`) at `alpha`, using the white coverage mask
+/// (`mask_png`) so every letter blends at the same strength regardless of
+/// its gradient colour. Writes `out_png`.
+fn composite_intro(
+    bg_png: &Path, color_png: &Path, mask_png: &Path, out_png: &Path, alpha: f64,
+) -> Result<()> {
+    let mut bg = image::open(bg_png).context("open intro bg")?.to_rgb8();
+    let color = image::open(color_png).context("open intro title")?.to_rgb8();
+    let mask = image::open(mask_png).context("open intro mask")?.to_rgb8();
+    let (w, h) = (bg.width().min(color.width()).min(mask.width()),
+                  bg.height().min(color.height()).min(mask.height()));
+    for y in 0..h {
+        for x in 0..w {
+            let m = mask.get_pixel(x, y).0;
+            let cov = *m.iter().max().unwrap() as f64 / 255.0;
+            if cov <= 0.02 {
+                continue;
+            }
+            let a = (cov * alpha).clamp(0.0, 1.0);
+            let c = color.get_pixel(x, y).0;
+            let p = bg.get_pixel_mut(x, y);
+            for k in 0..3 {
+                p.0[k] = (p.0[k] as f64 * (1.0 - a) + c[k] as f64 * a)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    bg.save(out_png).context("write intro composite")?;
+    Ok(())
+}
+
+/// "MovementLogger" title on black, centered, each letter colored along the
+/// logo gradient, sized to ~86% of the canvas width. With `mask = true`
+/// every letter is drawn solid WHITE instead — a coverage mask so the
+/// composite over the first frame (`composite_intro`) blends every letter at
+/// the same strength regardless of its gradient colour.
+fn draw_intro(path: &Path, w: u32, h: u32, mask: bool) -> Result<()> {
     const TEXT: &str = "MovementLogger";
     let root = BitMapBackend::new(path, (w, h)).into_drawing_area();
     root.fill(&BLACK)
@@ -459,7 +697,7 @@ fn draw_intro(path: &Path, w: u32, h: u32) -> Result<()> {
     let y = (h as i32) / 2;
     let n = TEXT.chars().count().max(2);
     for (i, ch) in TEXT.chars().enumerate() {
-        let color = intro_color(i as f64 / (n - 1) as f64);
+        let color = if mask { WHITE } else { intro_color(i as f64 / (n - 1) as f64) };
         let style = (FONT, size)
             .into_font()
             .color(&color)

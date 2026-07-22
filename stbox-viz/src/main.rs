@@ -196,9 +196,9 @@ enum Cmd {
         /// logo's colors) at the film's start. 0 disables it.
         #[arg(long, default_value_t = 3.0)]
         intro_seconds: f64,
-        /// Seconds of Pump Tsüri logo outro at the film's end. 0
+        /// Seconds of the pumping-foil logo outro at the film's end. 0
         /// disables the outro.
-        #[arg(long, default_value_t = 5.0)]
+        #[arg(long, default_value_t = 3.0)]
         logo_seconds: f64,
         /// Replace the embedded Pump Tsüri logo with a custom image.
         #[arg(long)]

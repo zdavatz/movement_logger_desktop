@@ -2931,7 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "movement-logger"
-version = "0.0.75"
+version = "0.0.76"
 dependencies = [
  "anyhow",
  "btleplug",
@@ -4790,13 +4790,14 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stbox-viz"
-version = "0.0.37"
+version = "0.0.38"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
  "csv",
  "gif 0.13.3",
+ "image 0.25.10",
  "plotters",
  "rustfft",
  "serde",

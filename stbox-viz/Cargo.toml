@@ -1,6 +1,6 @@
 [package]
 name = "stbox-viz"
-version = "0.0.37"
+version = "0.0.38"
 edition = "2024"
 description = "SensorTile.box-Pro pumpfoil session visualiser — replaces Utilities/scripts/*.py"
 
@@ -14,4 +14,5 @@ serde_json = "1"
 plotters = { version = "0.3", features = ["bitmap_encoder", "bitmap_backend", "line_series", "all_series"] }
 rustfft = "6"
 gif = "0.13"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
