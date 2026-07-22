@@ -12,8 +12,25 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_config::AgentConfig;
-use crate::ble::{BatterySample, BleBackend, BleCmd, BleEvent, LiveSample};
+use crate::ble::{BatterySample, BleBackend, BleCmd, BleEvent, LiveSample, QuietSample};
 use crate::sync_db;
+
+/// BT-off GPS A/B test lifecycle (BLE_QUIET 0x15/0x16, firmware v0.0.57+),
+/// rendered in the GPS Debug tab: Arming (0x15 sent) → Running (box is
+/// radio-silent for `dur_s`; the worker's auto-reconnect rides back in) →
+/// Fetching (0x16 driven by `tick_quiet_fetch`) → Done (samples for the
+/// verdict table) / Failed (message; the box ERRLOG `gps_rfq:` lines still
+/// carry the data, and "Fetch last result" retries).
+#[derive(Default, Clone)]
+pub enum QuietTestUi {
+    #[default]
+    Idle,
+    Arming { dur_s: u16 },
+    Running { dur_s: u16, since: std::time::Instant },
+    Fetching,
+    Done { dur_s: u16, samples: Vec<QuietSample>, at: std::time::Instant },
+    Failed { msg: String },
+}
 
 /// Append a line to the shared log buffer (the GUI's scrollable log
 /// panel; the headless agent drains the same buffer to stdout/file).
@@ -145,6 +162,17 @@ pub struct SyncCore {
     /// save battery — IMU + baro keep logging, Replay still time-aligns via the
     /// `# SYNC` anchor). NOT persisted in the app config — the box owns it.
     pub ble_gps_power: Option<bool>,
+    /// BT-off GPS A/B test lifecycle (0x15/0x16) — see [`QuietTestUi`].
+    pub ble_quiet: QuietTestUi,
+    /// GPS-Debug-tab duration selection for the BT-off test, in seconds.
+    /// 0 (the derived Default) is treated as the 10 s default at first render.
+    pub ble_quiet_dur_s: u16,
+    /// When set, `tick_quiet_fetch` (re-)sends the 0x16 result fetch at/after
+    /// this instant — armed on the post-window reconnect (delayed past the
+    /// box's ~5 s post phase) and re-armed while the single-op slot is busy.
+    pub quiet_fetch_at: Option<std::time::Instant>,
+    /// Bounded retry counter for `tick_quiet_fetch` (a busy slot re-arms).
+    pub quiet_fetch_tries: u8,
 
     // ----- Sync (vs. plain transfer) -----------------------------------
     /// Peripheral id of the box we're connected to, captured at Connect
@@ -684,6 +712,69 @@ impl SyncCore {
         }
     }
 
+    /// Start the BT-off GPS A/B test (BLE_QUIET 0x15, firmware v0.0.57+):
+    /// the box records ~3 s of BT-on baseline, goes radio-silent for the
+    /// selected duration while sampling its GPS RF metrics at 1 Hz (also
+    /// into the box ERRLOG as `gps_rfq:` lines), then re-inits its radio;
+    /// the worker auto-reconnects and `tick_quiet_fetch` pulls the
+    /// recording for the GPS Debug tab.
+    pub fn start_quiet_test(&mut self) {
+        if !matches!(self.ble_state, BleState::Connected) {
+            push_log(&self.log, "ble: BT-off test — not connected".into());
+            return;
+        }
+        let dur = if self.ble_quiet_dur_s == 0 { 10 } else { self.ble_quiet_dur_s };
+        self.ble_quiet = QuietTestUi::Arming { dur_s: dur };
+        push_log(&self.log, format!("ble: BLE_QUIET {dur}s"));
+        if let Some(b) = self.ble.as_ref() {
+            b.send(BleCmd::BleQuiet { dur_s: dur });
+        }
+    }
+
+    /// Manually (re-)fetch the most recent BT-off recording (0x16) — the
+    /// retry path after a Failed state; the box keeps the buffer until the
+    /// next test.
+    pub fn quiet_fetch_now(&mut self) {
+        if !matches!(self.ble_state, BleState::Connected) {
+            push_log(&self.log, "ble: BT-off result — not connected".into());
+            return;
+        }
+        self.ble_quiet = QuietTestUi::Fetching;
+        self.quiet_fetch_tries = 0;
+        self.quiet_fetch_at = Some(std::time::Instant::now());
+    }
+
+    /// Drive the deferred/retried 0x16 result fetch (see `quiet_fetch_at`).
+    /// Called from the same ~1 Hz ticks as the transfer supervisor. The
+    /// worker silently ignores the send while its single-op slot is busy,
+    /// so each re-arm is harmless; bounded so a wedged slot can't spin the
+    /// state forever.
+    pub fn tick_quiet_fetch(&mut self) {
+        let Some(at) = self.quiet_fetch_at else { return };
+        if std::time::Instant::now() < at {
+            return;
+        }
+        if !matches!(self.ble_quiet, QuietTestUi::Fetching)
+            || !matches!(self.ble_state, BleState::Connected)
+        {
+            self.quiet_fetch_at = None;
+            return;
+        }
+        if self.quiet_fetch_tries >= 10 {
+            self.quiet_fetch_at = None;
+            self.ble_quiet = QuietTestUi::Failed {
+                msg: "box stayed busy after reconnect — use \"Fetch last result\"".into(),
+            };
+            return;
+        }
+        self.quiet_fetch_tries += 1;
+        self.quiet_fetch_at =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        if let Some(b) = self.ble.as_ref() {
+            b.send(BleCmd::FetchQuietResult);
+        }
+    }
+
     /// Drain pending BLE events into the visible state. Called once per
     /// frame; egui repaints on a timer while a BLE op is in progress so
     /// events don't sit in the channel for long.
@@ -830,6 +921,18 @@ impl SyncCore {
                     if !self.fw_checked_once {
                         self.start_fw_check();
                     }
+                    /* BT-off test: this connect is the post-window
+                       reconnect — fetch the recording once the box's ~5 s
+                       post phase is over (0x16 answers BUSY before that)
+                       and the connect-time query burst has drained.
+                       tick_quiet_fetch re-arms on a busy single-op slot. */
+                    if matches!(self.ble_quiet, QuietTestUi::Running { .. }) {
+                        self.ble_quiet = QuietTestUi::Fetching;
+                        self.quiet_fetch_tries = 0;
+                        self.quiet_fetch_at = Some(
+                            std::time::Instant::now() + std::time::Duration::from_secs(6),
+                        );
+                    }
                 }
                 BleEvent::Disconnected => {
                     /* If a transfer/sync was live when the link dropped,
@@ -879,6 +982,23 @@ impl SyncCore {
                     /* Same for the box GPS power state — re-query on the
                        next Connect rather than show a stale toggle. */
                     self.ble_gps_power = None;
+                    /* A public Disconnected during a BT-off test means the
+                       worker's auto-reconnect gave up (or the user
+                       disconnected) — resolve the test. The box ERRLOG
+                       still carries the gps_rfq lines, and "Fetch last
+                       result" works on the next connect (the box keeps the
+                       buffer until the next test). */
+                    if matches!(
+                        self.ble_quiet,
+                        QuietTestUi::Arming { .. }
+                            | QuietTestUi::Running { .. }
+                            | QuietTestUi::Fetching
+                    ) {
+                        self.ble_quiet = QuietTestUi::Failed {
+                            msg: "link lost — reconnect and use \"Fetch last result\"".into(),
+                        };
+                        self.quiet_fetch_at = None;
+                    }
                     /* Abandon any in-flight "Check FW" — the box version
                        query can't complete across a drop, so drop the
                        active flag (the worker also emits FirmwareVersion(None)
@@ -1244,6 +1364,46 @@ impl SyncCore {
                             "ble: CAL_GET no reply (legacy firmware < v0.0.37, keeping local config)"
                                 .into(),
                         ),
+                    }
+                }
+                BleEvent::QuietArmed { dur_s } => {
+                    self.ble_quiet = QuietTestUi::Running {
+                        dur_s,
+                        since: std::time::Instant::now(),
+                    };
+                    push_log(&self.log, format!(
+                        "ble: BT-off window armed ({dur_s} s) — box goes radio-silent, auto-reconnect follows"
+                    ));
+                }
+                BleEvent::QuietResult { dur_s, samples } => {
+                    self.quiet_fetch_at = None;
+                    match samples {
+                        Some(samples) => {
+                            push_log(&self.log, format!(
+                                "ble: BT-off result — {} samples (window {dur_s} s)",
+                                samples.len()
+                            ));
+                            self.ble_quiet = QuietTestUi::Done {
+                                dur_s,
+                                samples,
+                                at: std::time::Instant::now(),
+                            };
+                        }
+                        None => {
+                            // Only fail a test that was actually in progress —
+                            // a stray failure event must not clobber a Done.
+                            if matches!(
+                                self.ble_quiet,
+                                QuietTestUi::Arming { .. }
+                                    | QuietTestUi::Running { .. }
+                                    | QuietTestUi::Fetching
+                            ) {
+                                self.ble_quiet = QuietTestUi::Failed {
+                                    msg: "no result — see log; the box ERRLOG gps_rfq lines carry the data"
+                                        .into(),
+                                };
+                            }
+                        }
                     }
                 }
                 BleEvent::DeleteDone { name } => {

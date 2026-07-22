@@ -43,7 +43,7 @@ use std::thread;
 use ble::{BatterySample, BleBackend, BleCmd, LiveSample};
 use sync_core::{
     default_save_base, is_sensor_data_name, push_log, resolve_save_dir, BleFile, BleState,
-    SyncCore, SyncHost,
+    QuietTestUi, SyncCore, SyncHost,
 };
 
 /// Bundled-into-binary 512×512 PNG. The build pipeline already
@@ -2956,6 +2956,94 @@ impl AppState {
             ui.add_space(6.0);
         }
 
+        // BT-off GPS A/B test (BLE_QUIET 0x15/0x16, firmware v0.0.57+,
+        // issue #10): does the BLE radio degrade GPS reception? The box
+        // goes radio-silent for the chosen window while sampling its RF
+        // metrics at 1 Hz (also into the box ERRLOG as `gps_rfq:` lines),
+        // then re-inits; the worker auto-reconnects and the recording +
+        // BT-on-vs-off C/N0 verdict land here.
+        ui.label(egui::RichText::new("BT-off test").strong());
+        ui.label(
+            egui::RichText::new(
+                "Box goes radio-silent for the chosen window while it keeps logging \
+                 its antenna values at 1 Hz (also into the box ERRLOG), then \
+                 reconnects and reports here. Needs box firmware v0.0.57+.",
+            )
+            .small(),
+        );
+        if self.sync.ble_quiet_dur_s == 0 {
+            self.sync.ble_quiet_dur_s = 10;
+        }
+        let quiet_connected = matches!(self.sync.ble_state, BleState::Connected);
+        match self.sync.ble_quiet.clone() {
+            QuietTestUi::Idle | QuietTestUi::Failed { .. } | QuietTestUi::Done { .. } => {
+                ui.horizontal(|ui| {
+                    ui.label("Window");
+                    for d in [10u16, 30, 60, 120] {
+                        ui.selectable_value(
+                            &mut self.sync.ble_quiet_dur_s,
+                            d,
+                            format!("{d}s"),
+                        );
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(quiet_connected, egui::Button::new("Start BT-off test"))
+                        .clicked()
+                    {
+                        self.sync.start_quiet_test();
+                    }
+                    if ui
+                        .add_enabled(quiet_connected, egui::Button::new("Fetch last result"))
+                        .clicked()
+                    {
+                        self.sync.quiet_fetch_now();
+                    }
+                });
+                if let QuietTestUi::Failed { msg } = &self.sync.ble_quiet {
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Failed: {msg}"));
+                }
+                if let QuietTestUi::Done { dur_s, samples, at } = &self.sync.ble_quiet {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Result from {} s ago:",
+                            at.elapsed().as_secs()
+                        ))
+                        .small(),
+                    );
+                    ui_quiet_result(ui, *dur_s, samples);
+                }
+            }
+            QuietTestUi::Arming { dur_s } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Arming {dur_s} s window…"));
+                });
+            }
+            QuietTestUi::Running { dur_s, since } => {
+                // pre (3 s) + window + chip re-init (~4 s) + reconnect slack.
+                let total = 3 + dur_s as u64 + 9;
+                let left = total.saturating_sub(since.elapsed().as_secs());
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!(
+                        "Box is radio-silent ({dur_s} s window) — recording GPS RF, \
+                         ~{left} s until reconnect…"
+                    ));
+                });
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(500));
+            }
+            QuietTestUi::Fetching => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Reconnected — fetching the recording…");
+                });
+            }
+        }
+        ui.add_space(6.0);
+
         let running = self.gps_dbg_running.load(Ordering::SeqCst);
 
         // Transport: USB serial cable vs the box's BLE link.
@@ -4312,6 +4400,7 @@ impl eframe::App for AppState {
         // Outer transfer safety net (see tick_transfer_supervisor): runs
         // ~1 Hz via the repaint timer below while connected.
         self.sync.tick_transfer_supervisor();
+        self.sync.tick_quiet_fetch();
         // Parked GPS-power toggle — sent once the sync engine drains.
         self.sync.tick_pending_gps();
         // Bounced-READ retry — re-drives the queue seconds after a READ
@@ -5266,6 +5355,109 @@ fn ago_text(secs: f64) -> String {
 /// (N red); semi-transparent lid; green nose arrow on the confirmed front
 /// end. All poses consistent — no Euler chaining. Mirrors iOS
 /// `OrientationBoxCanvas`.
+/// Verdict + per-second table for a completed BT-off window (GPS Debug
+/// tab). The verdict compares the mean top-6 C/N0 with BT on (pre + post
+/// phases) against BT off; ±2 dB-Hz is treated as noise. EMI means
+/// (noise/agc) only use samples whose MON-RF data was fresh.
+fn ui_quiet_result(ui: &mut egui::Ui, dur_s: u16, samples: &[ble::QuietSample]) {
+    if samples.is_empty() {
+        ui.label("Window recorded no samples.");
+        return;
+    }
+    let mean = |off: bool, f: &dyn Fn(&ble::QuietSample) -> Option<f64>| -> Option<f64> {
+        let v: Vec<f64> = samples
+            .iter()
+            .filter(|s| (s.phase == 1) == off)
+            .filter_map(f)
+            .collect();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.iter().sum::<f64>() / v.len() as f64)
+        }
+    };
+    let avg6 = |s: &ble::QuietSample| {
+        (s.avg6_x10 > 0).then(|| s.avg6_x10 as f64 / 10.0)
+    };
+    let on_avg = mean(false, &avg6);
+    let off_avg = mean(true, &avg6);
+    match (on_avg, off_avg) {
+        (Some(on), Some(off)) => {
+            let d = off - on;
+            let (judged, col) = if d >= 2.0 {
+                (
+                    "BT is degrading GPS — C/N0 rises when the radio is off",
+                    egui::Color32::LIGHT_RED,
+                )
+            } else if d <= -2.0 {
+                (
+                    "C/N0 dropped with BT off — sky/antenna changed mid-test? Re-run",
+                    egui::Color32::LIGHT_YELLOW,
+                )
+            } else {
+                (
+                    "no meaningful BT effect (< 2 dB-Hz)",
+                    egui::Color32::LIGHT_GREEN,
+                )
+            };
+            ui.colored_label(
+                col,
+                format!(
+                    "avg6 BT-on {on:.1} vs BT-off {off:.1} dB-Hz (Δ {d:+.1}) — {judged} \
+                     (window {dur_s} s)"
+                ),
+            );
+        }
+        _ => {
+            ui.colored_label(
+                egui::Color32::LIGHT_YELLOW,
+                "No C/N0 verdict — not enough satellite data in one of the phases \
+                 (no fix / NAV-SAT sparse). The per-second rows and the box ERRLOG \
+                 still count.",
+            );
+        }
+    }
+    let fresh = |off: bool, f: &dyn Fn(&ble::QuietSample) -> f64| {
+        mean(off, &|s| s.rf_fresh.ne(&0).then(|| f(s)))
+    };
+    if let (Some(n_on), Some(n_off), Some(a_on), Some(a_off)) = (
+        fresh(false, &|s| s.noise as f64),
+        fresh(true, &|s| s.noise as f64),
+        fresh(false, &|s| s.agc as f64),
+        fresh(true, &|s| s.agc as f64),
+    ) {
+        ui.label(format!(
+            "noise {n_on:.0} → {n_off:.0} · agc {a_on:.0} → {a_off:.0} (BT-on → BT-off)"
+        ));
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("quiet_result_rows")
+        .max_height(240.0)
+        .show(ui, |ui| {
+            ui.monospace("  t  bt  fix used  avg6 min max noise  agc jam st ant");
+            for s in samples {
+                let bt = if s.phase == 1 { "OFF" } else { "on " };
+                let avg = if s.avg6_x10 > 0 {
+                    format!("{:5.1}", s.avg6_x10 as f64 / 10.0)
+                } else {
+                    "    —".to_string()
+                };
+                let row = format!(
+                    "{:3} {}  {}  {:3} {} {:3} {:3} {:5} {:4} {:3} {:2} {:3}",
+                    s.t_s, bt, s.fix_type, s.used_sv, avg, s.min6, s.max6,
+                    s.noise, s.agc, s.jam_ind, s.jam_state, s.ant_status
+                );
+                if s.phase == 1 {
+                    ui.monospace(
+                        egui::RichText::new(row).color(egui::Color32::LIGHT_BLUE),
+                    );
+                } else {
+                    ui.monospace(row);
+                }
+            }
+        });
+}
+
 fn draw_orientation_box(
     ui: &mut egui::Ui,
     rows: Option<OriRows>,

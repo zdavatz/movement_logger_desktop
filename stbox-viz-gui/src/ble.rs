@@ -476,6 +476,77 @@ pub enum BleCmd {
     /// `calibration::encode` — only fields whose `valid_mask` bit is set
     /// overwrite the stored ones.
     SetCalibration { blob: [u8; 32] },
+    /// BLE_QUIET opcode `0x15` + `<dur_s:u16-LE>` (firmware v0.0.57+) — the
+    /// BT-off GPS A/B test (issue #10: does the BLE radio degrade GPS
+    /// reception?). The box replies one status byte (→ `QuietArmed`),
+    /// records ~3 s of BT-on pre-samples, disconnects and holds its BLE
+    /// chip in hardware reset for `dur_s` seconds (radio provably silent)
+    /// while sampling its GPS RF metrics at 1 Hz — also into the box
+    /// ERRLOG as `gps_rfq:` lines — then re-inits + re-advertises. The
+    /// worker's normal auto-reconnect rides the pending connect back in;
+    /// the caller then fetches the recording with `FetchQuietResult`.
+    /// Legacy firmware never replies → the op times out and emits
+    /// `QuietResult { samples: None }`.
+    BleQuiet { dur_s: u16 },
+    /// BLE_QUIET_RESULT opcode `0x16` — fetch the recorded window after
+    /// the reconnect: one 8-byte header (`'Q'`, version, sample_size,
+    /// count u16-LE, dur_s u16-LE, reserved) then `count` samples packed
+    /// into MTU-sized notifies → `QuietResult { samples: Some(..) }`.
+    /// The box replies 0xB0 BUSY while the window (incl. its ~5 s post
+    /// phase) is still running.
+    FetchQuietResult,
+}
+
+/// One 1 Hz RF sample from the box's BT-off window (16 B on the wire,
+/// layout pinned in firmware DESIGN.md §"BLE quiet window"). `phase`:
+/// 0 = BT on (pre), 1 = BT off, 2 = BT back on (post). `avg6_x10` = mean
+/// C/N0 of the 6 strongest GPS+Galileo satellites ×10 (0 = no data);
+/// `rf_fresh` ≠ 0 = the MON-RF EMI fields (noise/agc/jam/ant) had a reply
+/// within 15 s.
+#[derive(Clone, Copy, Debug)]
+pub struct QuietSample {
+    pub phase: u8,
+    pub t_s: u8,
+    pub fix_type: u8,
+    pub used_sv: u8,
+    pub avg6_x10: u16,
+    pub min6: u8,
+    pub max6: u8,
+    pub noise: u16,
+    pub agc: u16,
+    pub jam_ind: u8,
+    pub jam_state: u8,
+    pub ant_status: u8,
+    pub rf_fresh: u8,
+}
+
+impl QuietSample {
+    pub const WIRE_SIZE: usize = 16;
+
+    /// Parse one sample starting at `b[0]`. The caller strides by the
+    /// box-declared `sample_size` (≥ [`Self::WIRE_SIZE`]) so future
+    /// firmware may grow the record without breaking this parser.
+    pub fn parse(b: &[u8]) -> Option<QuietSample> {
+        if b.len() < Self::WIRE_SIZE {
+            return None;
+        }
+        let u16le = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+        Some(QuietSample {
+            phase: b[0],
+            t_s: b[1],
+            fix_type: b[2],
+            used_sv: b[3],
+            avg6_x10: u16le(4),
+            min6: b[6],
+            max6: b[7],
+            noise: u16le(8),
+            agc: u16le(10),
+            jam_ind: b[12],
+            jam_state: b[13],
+            ant_status: b[14],
+            rf_fresh: b[15],
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -537,6 +608,16 @@ pub enum BleEvent {
     /// (< v0.0.37) didn't reply → op timed out; the client keeps its local
     /// `AgentConfig` as before, no cross-device sync available.
     Calibration(Option<[u8; 32]>),
+    /// The box accepted BLE_QUIET (0x15) and goes radio-silent for `dur_s`
+    /// seconds after ~3 s of pre-samples. The disconnect that follows is
+    /// expected — the worker's auto-reconnect rides the pending connect
+    /// back in once the box's chip re-inits.
+    QuietArmed { dur_s: u16 },
+    /// The BT-off window recording, from a BLE_QUIET_RESULT (0x16) reply.
+    /// `samples == None` = the fetch failed (op timeout / legacy firmware /
+    /// link drop) — the `gps_rfq:` lines in the box ERRLOG still carry the
+    /// data. An empty Vec is a valid "window recorded nothing" reply.
+    QuietResult { dur_s: u16, samples: Option<Vec<QuietSample>> },
     /// User-facing error — display in the log panel.
     Error(String),
     /// One decoded SensorStream snapshot (0.5 Hz). Only emitted while
@@ -1073,6 +1154,23 @@ enum CurrentOp {
     /// payload so it can be re-emitted as `Calibration` (the box's new
     /// authoritative copy) when the status is OK.
     CalibrationReq { is_set: bool, blob: [u8; 32], last_progress: Instant },
+    /// BLE_QUIET (0x15) sent — waiting for the 1-byte armed/rejected
+    /// status. A disconnect while this is in flight means the status
+    /// notify was eaten but the window is evidently running (the box
+    /// disconnects ~3 s after 0x15) — `disconnect_inner` promotes it to
+    /// `QuietArmed` instead of failing the test.
+    QuietArm { dur_s: u16, last_progress: Instant },
+    /// BLE_QUIET_RESULT (0x16) reassembly. `expected` = sample count from
+    /// the 8-byte header (`None` until the header arrived); `sample_size`
+    /// = the box-declared per-sample stride; `buf` accumulates raw sample
+    /// bytes across notifies.
+    QuietFetch {
+        expected: Option<usize>,
+        sample_size: usize,
+        dur_s: u16,
+        buf: Vec<u8>,
+        last_progress: Instant,
+    },
     /// Firmware upload in flight. Unlike the other ops, the flash is
     /// driven *inline* by `flash_firmware` (it owns the notification
     /// stream for its whole duration and reads each reply with its own
@@ -1383,6 +1481,8 @@ impl WorkerState {
             BleCmd::GetGpsPower => self.get_gps_power().await,
             BleCmd::GetCalibration => self.get_calibration().await,
             BleCmd::SetCalibration { blob } => self.set_calibration(blob).await,
+            BleCmd::BleQuiet { dur_s } => self.ble_quiet(dur_s).await,
+            BleCmd::FetchQuietResult => self.fetch_quiet_result().await,
         }
     }
 
@@ -2008,6 +2108,21 @@ impl WorkerState {
                 // report — a status banner about a mid-teardown calibration
                 // request would just be noise.
             }
+            CurrentOp::QuietArm { dur_s, .. } => {
+                // The box disconnects ~3 s after an ACCEPTED 0x15 — if its
+                // status notify was eaten by ACL congestion, this disconnect
+                // IS the arm confirmation. Promote to QuietArmed instead of
+                // failing; the remote-drop auto-reconnect rides back in
+                // once the box's chip re-inits.
+                self.emit(BleEvent::QuietArmed { dur_s });
+                self.emit(BleEvent::Status(
+                    "BT-off window running (status notify lost) — auto-reconnecting after".into(),
+                ));
+            }
+            CurrentOp::QuietFetch { .. } => {
+                self.emit_err("BT-off result fetch aborted by disconnect");
+                self.emit(BleEvent::QuietResult { dur_s: 0, samples: None });
+            }
             CurrentOp::Flashing { .. } => {
                 self.emit(BleEvent::FlashError {
                     msg: "firmware upload aborted by disconnect".into(),
@@ -2527,6 +2642,53 @@ impl WorkerState {
         self.op = CurrentOp::CalibrationReq {
             is_set: true,
             blob,
+            last_progress: Instant::now(),
+        };
+    }
+
+    /// BLE_QUIET (0x15 + dur_s u16-LE) — arm the box's BT-off GPS A/B
+    /// window. Box replies one status byte (demuxed by the `QuietArm` op),
+    /// then disconnects ~3 s later; the worker's normal remote-drop
+    /// auto-reconnect rides the pending connect back in once the box's
+    /// chip re-inits (10 × 60 s pending covers the max 120 s window).
+    async fn ble_quiet(&mut self, dur_s: u16) {
+        if self.peripheral.is_none() {
+            self.emit_err("not connected");
+            self.emit(BleEvent::QuietResult { dur_s: 0, samples: None });
+            return;
+        }
+        if !matches!(self.op, CurrentOp::Idle) {
+            self.emit_err("BT-off test rejected — another op is in flight");
+            self.emit(BleEvent::QuietResult { dur_s: 0, samples: None });
+            return;
+        }
+        let d = dur_s.clamp(5, 120);
+        let payload = [0x15u8, (d & 0xFF) as u8, (d >> 8) as u8];
+        if let Err(e) = self.write_cmd(&payload).await {
+            self.emit_err(e);
+            self.emit(BleEvent::QuietResult { dur_s: 0, samples: None });
+            return;
+        }
+        self.op = CurrentOp::QuietArm { dur_s: d, last_progress: Instant::now() };
+    }
+
+    /// BLE_QUIET_RESULT (0x16) — fetch the recorded window after the
+    /// reconnect. Silent no-op while another op is in flight: the caller's
+    /// tick re-fires until the slot frees up (mirrors `get_calibration`).
+    async fn fetch_quiet_result(&mut self) {
+        if self.peripheral.is_none() || !matches!(self.op, CurrentOp::Idle) {
+            return;
+        }
+        if let Err(e) = self.write_cmd(&[0x16]).await {
+            self.emit_err(e);
+            self.emit(BleEvent::QuietResult { dur_s: 0, samples: None });
+            return;
+        }
+        self.op = CurrentOp::QuietFetch {
+            expected: None,
+            sample_size: QuietSample::WIRE_SIZE,
+            dur_s: 0,
+            buf: Vec::new(),
             last_progress: Instant::now(),
         };
     }
@@ -3062,6 +3224,78 @@ impl WorkerState {
                 self.op = CurrentOp::Idle;
                 return;
             }
+            CurrentOp::QuietArm { dur_s, .. } => {
+                /* 1-byte armed/rejected status. 0x00 ⇒ the box records ~3 s
+                   of pre-samples and then disconnects — expected; the
+                   remote-drop auto-reconnect brings us back. Anything else
+                   (0xB0 while a transfer/bridge/window is active) fails the
+                   test. */
+                let dur_s = *dur_s;
+                if let Some(&b) = n.value.first() {
+                    self.op = CurrentOp::Idle;
+                    if b == 0x00 {
+                        self.emit(BleEvent::QuietArmed { dur_s });
+                        self.emit(BleEvent::Status(format!(
+                            "BT-off window armed ({dur_s} s) — box disconnects shortly, auto-reconnecting after"
+                        )));
+                    } else {
+                        self.emit_err(format!("BT-off test rejected by box (0x{b:02X})"));
+                        self.emit(BleEvent::QuietResult { dur_s: 0, samples: None });
+                    }
+                }
+                return;
+            }
+            CurrentOp::QuietFetch { expected, sample_size, dur_s, buf, last_progress } => {
+                /* First notify: 8-byte header ('Q', version, sample_size,
+                   count u16-LE, dur_s u16-LE, reserved) — or a lone 0xB0
+                   BUSY while the window (incl. its ~5 s post phase) still
+                   runs. Then raw samples accumulate until
+                   count × sample_size bytes arrived. Stride by the
+                   box-declared sample_size so future firmware may grow the
+                   record. */
+                *last_progress = Instant::now();
+                let v = &n.value;
+                if expected.is_none() {
+                    if v.len() == 1 {
+                        let b = v[0];
+                        self.op = CurrentOp::Idle;
+                        self.emit_err(format!(
+                            "BT-off result: box replied 0x{b:02X} (window still running?)"
+                        ));
+                        self.emit(BleEvent::QuietResult { dur_s: 0, samples: None });
+                        return;
+                    }
+                    if v.len() < 8 || v[0] != b'Q' {
+                        self.op = CurrentOp::Idle;
+                        self.emit_err(format!("BT-off result: unexpected reply ({} B)", v.len()));
+                        self.emit(BleEvent::QuietResult { dur_s: 0, samples: None });
+                        return;
+                    }
+                    *sample_size = (v[2] as usize).max(QuietSample::WIRE_SIZE);
+                    *expected = Some(u16::from_le_bytes([v[3], v[4]]) as usize);
+                    *dur_s = u16::from_le_bytes([v[5], v[6]]);
+                    buf.extend_from_slice(&v[8..]);
+                } else {
+                    buf.extend_from_slice(v);
+                }
+                let (exp, size, d) = (expected.unwrap_or(0), *sample_size, *dur_s);
+                if buf.len() >= exp * size {
+                    let mut samples = Vec::with_capacity(exp);
+                    for i in 0..exp {
+                        if let Some(s) = QuietSample::parse(&buf[i * size..]) {
+                            samples.push(s);
+                        }
+                    }
+                    self.op = CurrentOp::Idle;
+                    self.emit(BleEvent::Status(format!(
+                        "BT-off result: {} samples (window {d} s)", samples.len()
+                    )));
+                    self.emit(BleEvent::QuietResult { dur_s: d, samples: Some(samples) });
+                    return;
+                }
+                // Incomplete — fall through so the post-match restore puts
+                // the (mutated) op back for the next notify.
+            }
             CurrentOp::Flashing { .. } => {
                 /* The flash drives the stream inline (see `flash_firmware`
                    / `next_filedata`), so a FileData reply never reaches
@@ -3269,6 +3503,11 @@ impl WorkerState {
             CurrentOp::GettingVersion { last_progress } => now.duration_since(*last_progress) > VERSION_REQ_TIMEOUT,
             CurrentOp::GpsPowerReq { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             CurrentOp::CalibrationReq { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
+            // The BLE_QUIET arm status comes within one connection interval
+            // or never (legacy firmware < v0.0.57 ignores 0x15) — use the
+            // short GET_VERSION budget for the legacy verdict.
+            CurrentOp::QuietArm { last_progress, .. } => now.duration_since(*last_progress) > VERSION_REQ_TIMEOUT,
+            CurrentOp::QuietFetch { last_progress, .. } => now.duration_since(*last_progress) > OP_IDLE_TIMEOUT,
             // A flash is driven inline and never yields to the watchdog
             // (its own per-step timeouts cover stalls), so it's never
             // "stale" here.
@@ -3355,6 +3594,22 @@ impl WorkerState {
                 if !is_set {
                     self.emit(BleEvent::Calibration(None));
                 }
+                false
+            }
+            CurrentOp::QuietArm { .. } => {
+                // Legacy firmware (< v0.0.57) never replies to BLE_QUIET.
+                // Resolve the test as failed; never reconnect (the link is
+                // fine — the box just doesn't know the opcode).
+                self.emit_err("BT-off test: no reply — box firmware may be older than v0.0.57");
+                self.emit(BleEvent::QuietResult { dur_s: 0, samples: None });
+                false
+            }
+            CurrentOp::QuietFetch { .. } => {
+                // The recording is still in the box ERRLOG (`gps_rfq:`
+                // lines) and the buffer survives until the next test —
+                // "Fetch last result" retries. Never reconnect.
+                self.emit_err("BT-off result timed out — the box ERRLOG gps_rfq lines still carry the data");
+                self.emit(BleEvent::QuietResult { dur_s: 0, samples: None });
                 false
             }
             // Unreachable in practice (the flash never yields here), but
