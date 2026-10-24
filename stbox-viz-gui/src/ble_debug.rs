@@ -48,6 +48,7 @@ const STREAM_UUID: Uuid = Uuid::from_u128(0x00000100_0010_11e1_ac36_0002a5d5c51b
 
 const OP_LIST: u8 = 0x01;
 const OP_DISCONNECT: u8 = 0x0F;
+const OP_GET_VERSION: u8 = 0x10;
 
 /// Same bound as ble.rs `LINK_OP_TIMEOUT` — no CoreBluetooth await may
 /// run unbounded (vendored-fork map holes never resolve their reply).
@@ -352,6 +353,33 @@ async fn run_async(secs: u64) -> Result<(), String> {
             Ok(s) => s,
             Err(e) => return Err(format!("notifications: {e}")),
         };
+        // GET_VERSION (0x10, fw v0.0.29+) first, so the dump says which
+        // firmware actually answered — after a FOTA the box may have rolled
+        // back. Legacy fw never replies; the 3 s wait just expires.
+        match tokio::time::timeout(
+            STEP_TIMEOUT,
+            p.write(&cmd, &[OP_GET_VERSION], WriteType::WithoutResponse),
+        )
+        .await
+        {
+            Ok(Ok(())) => match tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match notifs.next().await {
+                        Some(n) if n.uuid == FILEDATA_UUID => return Some(n.value),
+                        Some(_) => continue,
+                        None => return None,
+                    }
+                }
+            })
+            .await
+            {
+                Ok(Some(v)) => say!(t0, "  firmware version: {}",
+                                    String::from_utf8_lossy(&v).trim()),
+                _ => say!(t0, "  firmware version: no reply (fw < v0.0.29)"),
+            },
+            Ok(Err(e)) => say!(t0, "  GET_VERSION write FAILED: {e}"),
+            Err(_) => say!(t0, "  GET_VERSION write timed out"),
+        }
         say!(t0, "  writing LIST (0x01), waiting {}s for reply rows…",
              LIST_WAIT.as_secs());
         match tokio::time::timeout(
@@ -372,8 +400,9 @@ async fn run_async(secs: u64) -> Result<(), String> {
                         Ok(Some(n)) if n.uuid == FILEDATA_UUID => {
                             rows += 1;
                             if rows <= 3 {
-                                say!(t0, "    notify {} B head={}", n.value.len(),
-                                     hex(&n.value[..n.value.len().min(12)]));
+                                say!(t0, "    notify {} B head={} text={:?}", n.value.len(),
+                                     hex(&n.value[..n.value.len().min(12)]),
+                                     String::from_utf8_lossy(&n.value));
                             }
                         }
                         Ok(Some(_)) => {}
