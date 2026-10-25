@@ -63,7 +63,9 @@
 //!                               firmware ignores both → the op times out and
 //!                               the toggle stays "unknown".
 //!
-//!   Status bytes: 0x00 OK, 0xB0 BUSY, 0xE1 NOT_FOUND, 0xE2 IO_ERROR, 0xE3 BAD_REQ.
+//!   Status bytes: 0x00 OK, 0xB0 BUSY, 0xE1 NOT_FOUND, 0xE2 IO_ERROR, 0xE3 BAD_REQ,
+//!   0xE8 SD_USB (card mounted by a USB host), 0xE9 SD_LOWBAT (battery lock) —
+//!   the last two only on SD-writing ops, firmware v0.0.70+.
 
 use btleplug::api::{
     Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
@@ -2974,7 +2976,13 @@ impl WorkerState {
 
         match &mut op {
             CurrentOp::Idle => {
-                // Stray notify between ops — harmless, ignore.
+                // Stray notify between ops — harmless, ignore. Except the
+                // v0.0.70 SD-refusal bytes: fire-and-forget START_LOG /
+                // SET_MODE get their reply here, and "eject the USB drive"
+                // / "battery lock" must reach the user.
+                if n.value.len() == 1 && matches!(n.value[0], 0xE8 | 0xE9) {
+                    self.emit_err(status_message(n.value[0]));
+                }
             }
             CurrentOp::Listing { line, last_progress, rows_seen } => {
                 *last_progress = Instant::now();
@@ -3009,13 +3017,7 @@ impl WorkerState {
                 // unambiguous in practice.
                 if *first_packet && n.value.len() == 1 && is_status_byte(n.value[0]) {
                     let s = n.value[0];
-                    let msg = match s {
-                        0xB0 => "BUSY (logging in progress, send STOP_LOG first)",
-                        0xE1 => "NOT_FOUND",
-                        0xE2 => "IO_ERROR",
-                        0xE3 => "BAD_REQUEST",
-                        _    => "unknown error",
-                    };
+                    let msg = status_message(s);
                     self.emit_err(format!("READ {name}: {msg} (0x{s:02X})"));
                     self.op = CurrentOp::Idle;
                     return;
@@ -3104,13 +3106,7 @@ impl WorkerState {
                     let final_name = std::mem::take(name);
                     self.emit(BleEvent::DeleteDone { name: final_name });
                 } else {
-                    let msg = match s {
-                        0xB0 => "BUSY (logging in progress, send STOP_LOG first)",
-                        0xE1 => "NOT_FOUND",
-                        0xE2 => "IO_ERROR",
-                        0xE3 => "BAD_REQUEST",
-                        _    => "unknown error",
-                    };
+                    let msg = status_message(s);
                     self.emit_err(format!("DELETE {name}: {msg} (0x{s:02X})"));
                 }
                 self.op = CurrentOp::Idle;
@@ -3165,13 +3161,7 @@ impl WorkerState {
                                 if requested { "on" } else { "off" }
                             )));
                         } else {
-                            let msg = match b {
-                                0xB0 => "BUSY (logging in progress, send STOP_LOG first)",
-                                0xE1 => "NOT_FOUND",
-                                0xE2 => "IO_ERROR",
-                                0xE3 => "BAD_REQUEST",
-                                _    => "unknown error",
-                            };
+                            let msg = status_message(b);
                             self.emit_err(format!("GPS_POWER: {msg} (0x{b:02X})"));
                         }
                     } else {
@@ -3204,7 +3194,7 @@ impl WorkerState {
                             let msg = match b {
                                 0xE2 => "IO_ERROR (SD write failed)",
                                 0xE3 => "BAD_REQUEST (wrong-size or wrong-version blob)",
-                                _    => "unknown error",
+                                _    => status_message(b),
                             };
                             self.emit_err(format!("CAL_SET: {msg} (0x{b:02X})"));
                         }
@@ -3731,6 +3721,23 @@ fn parse_list_row(line: &[u8]) -> Option<(String, u64)> {
 
 fn is_status_byte(b: u8) -> bool {
     matches!(b, 0xB0 | 0xE1 | 0xE2 | 0xE3)
+}
+
+/// User-facing text for a single-byte FileData status reply. 0xE8/0xE9
+/// (firmware v0.0.70+) say why an SD-writing op (DELETE / START_LOG /
+/// SET_MODE / CAL_SET) was refused; older firmware sends a bare IO_ERROR.
+/// Only ever replies to writes, so they're deliberately NOT in
+/// `is_status_byte` (READ's first-notify sniff).
+fn status_message(b: u8) -> &'static str {
+    match b {
+        0xB0 => "BUSY (logging in progress, send STOP_LOG first)",
+        0xE1 => "NOT_FOUND",
+        0xE2 => "IO_ERROR",
+        0xE3 => "BAD_REQUEST",
+        0xE8 => "SD card is mounted over USB — eject it on the computer (or unplug USB-C), then retry",
+        0xE9 => "battery too low — SD writes are locked, charge the box via USB-C",
+        _    => "unknown error",
+    }
 }
 
 /// Map a FW_BEGIN error byte to a user-facing message.

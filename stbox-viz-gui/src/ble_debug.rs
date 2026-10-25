@@ -399,7 +399,7 @@ async fn run_async(secs: u64) -> Result<(), String> {
                     match tokio::time::timeout(left, notifs.next()).await {
                         Ok(Some(n)) if n.uuid == FILEDATA_UUID => {
                             rows += 1;
-                            if rows <= 3 {
+                            if rows <= 64 {
                                 say!(t0, "    notify {} B head={} text={:?}", n.value.len(),
                                      hex(&n.value[..n.value.len().min(12)]),
                                      String::from_utf8_lossy(&n.value));
