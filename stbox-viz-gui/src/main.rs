@@ -1397,6 +1397,65 @@ impl AppState {
         ui.add_space(6.0);
     }
 
+    /// Persistent banner while the box reports its SD card mounted by a
+    /// computer over USB-C (BatteryStatus flags bit 3, firmware v0.0.73+):
+    /// every SD write (delete, start session, log mode, calibration) is
+    /// refused (0xE8). Often THIS computer is the one holding the drive.
+    /// Driven only by the bit; hidden when it clears, and `latest_battery`
+    /// is dropped on disconnect, which hides it too. Not dismissible.
+    fn render_usb_host_banner(&self, ui: &mut egui::Ui) {
+        if !matches!(self.sync.ble_state, BleState::Connected) {
+            return;
+        }
+        if !self.latest_battery.is_some_and(|b| b.sd_usb_host) {
+            return;
+        }
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(255, 225, 220))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 70, 70)))
+            .inner_margin(8.0)
+            .rounding(4.0)
+            .show(ui, |ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(140, 20, 20),
+                    egui::RichText::new(
+                        "🔌 SD card in use by a computer — unplug USB-C (or eject the \
+                         drive) to delete files or change the log mode. Live data and \
+                         download keep working.",
+                    )
+                    .strong(),
+                )
+                .on_hover_text(
+                    "A computer has the box's SD card mounted as a USB drive, so the \
+                     box refuses every SD write (delete, start session, log mode, \
+                     calibration) until the drive is ejected or USB-C is unplugged. \
+                     This may be this computer.",
+                );
+            });
+        ui.add_space(6.0);
+    }
+
+    /// START_LOG is followed straight away by a Disconnect, so the box's
+    /// refusal byte (0xE8 USB host / 0xE9 battery lock) is never read — and
+    /// the GUI would show a session countdown for a session that never
+    /// started. Refuse locally while the latest BatteryStatus says the box
+    /// can't write its card. Returns `true` (and shows why) when refused.
+    fn refuse_start_log(&mut self) -> bool {
+        let Some(b) = self.latest_battery else { return false; };
+        let why = if b.sd_usb_host {
+            ble::SD_USB_UNPLUG_MSG.to_string()
+        } else if b.sd_lowbat_lock {
+            "battery lock — recording paused, charge the box (until about 3.7 V)".to_string()
+        } else {
+            return false;
+        };
+        let msg = format!("START_LOG: {why}");
+        self.sync.ble_status = format!("error: {msg}");
+        push_log(&self.log, format!("ble error: {msg} (not sent)"));
+        self.sync.ble_settings_err = Some(msg);
+        true
+    }
+
     fn render_fw_banner(&mut self, ui: &mut egui::Ui) {
         if !matches!(self.sync.ble_state, BleState::Connected) {
             return;
@@ -1887,6 +1946,7 @@ impl AppState {
                         .clicked()
                         && mode != Some(false)
                     {
+                        self.sync.ble_settings_err = None;
                         if let Some(b) = self.sync.ble.as_ref() {
                             b.send(BleCmd::SetLogMode { manual: false });
                         }
@@ -1901,6 +1961,7 @@ impl AppState {
                         .clicked()
                         && mode != Some(true)
                     {
+                        self.sync.ble_settings_err = None;
                         if let Some(b) = self.sync.ble.as_ref() {
                             b.send(BleCmd::SetLogMode { manual: true });
                         }
@@ -1939,6 +2000,7 @@ impl AppState {
                         // mid-pass grabs the op slot between two queued files
                         // and wedges the pass. tick_pending_gps sends it the
                         // moment the pass drains.
+                        self.sync.ble_settings_err = None;
                         self.sync.pending_gps_power = Some(true);
                         // Optimistic — the box's GpsPower reply reconciles.
                         self.sync.ble_gps_power = Some(true);
@@ -1954,6 +2016,7 @@ impl AppState {
                         && gps != Some(false)
                     {
                         // Same parking as the On button — see tick_pending_gps.
+                        self.sync.ble_settings_err = None;
                         self.sync.pending_gps_power = Some(false);
                         self.sync.ble_gps_power = Some(false);
                         push_log(&self.log, "ble: GPS_POWER off queued".into());
@@ -1996,6 +2059,7 @@ impl AppState {
                         .add_enabled(connected, egui::Button::new("Start session"))
                         .on_hover_text("Box reboots into LOG mode and is INVISIBLE to Scan for the configured duration. After it expires the box auto-reboots back to BLE mode (~8 s) and reappears. Short-press the user button on the box to abort a session early.")
                         .clicked()
+                        && !self.refuse_start_log()
                     {
                         if let Some(b) = self.sync.ble.as_ref() {
                             b.send(BleCmd::StartLog { duration_seconds: self.sync.ble_session_duration_s });
@@ -2179,6 +2243,26 @@ impl AppState {
                     /* Firmware-upload progress bar + result line and the
                        "Check FW" status live in the Firmware tab now
                        (ui_firmware_tab). */
+                    if let Some(err) = self.sync.ble_settings_err.clone() {
+                        ui.add_space(4.0);
+                        egui::Frame::group(ui.style())
+                            .fill(egui::Color32::from_rgb(255, 230, 230))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgb(200, 80, 80),
+                            ))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(170, 30, 30),
+                                        format!("⚠ {err}"),
+                                    );
+                                    if ui.small_button("Dismiss").clicked() {
+                                        self.sync.ble_settings_err = None;
+                                    }
+                                });
+                            });
+                    }
                     if let Some(err) = self.sync.ble_delete_err.clone() {
                         ui.add_space(4.0);
                         egui::Frame::group(ui.style())
@@ -4641,6 +4725,8 @@ impl eframe::App for AppState {
             self.render_fw_banner(ui);
             // Low-battery SD lock (firmware v0.0.72+) — persistent while set.
             self.render_lowbat_lock_banner(ui);
+            // SD card USB-mounted by a computer (firmware v0.0.73+).
+            self.render_usb_host_banner(ui);
 
             match self.current_tab {
                 Tab::Live     => {

@@ -109,7 +109,8 @@ const STREAM_UUID:   Uuid = Uuid::from_u128(0x00000100_0010_11e1_ac36_0002a5d5c5
 /// value is READ-able on demand. New in PumpLogger; absent on legacy
 /// SDDataLogFileX (optional characteristic). NOTE: its flags byte differs
 /// from the SensorStream packet — here bit0=low_batt, bit1=logging,
-/// bit2=sd_lowbat_lock (firmware v0.0.72+; also notified on change).
+/// bit2=sd_lowbat_lock (firmware v0.0.72+; also notified on change),
+/// bit3=sd_usb_host (firmware v0.0.73+; notified within ~1 s of a change).
 const BATTERY_UUID:  Uuid = Uuid::from_u128(0x00000200_0010_11e1_ac36_0002a5d5c51b);
 
 /// Watchdog — if no notification arrives for this long during an active
@@ -117,6 +118,16 @@ const BATTERY_UUID:  Uuid = Uuid::from_u128(0x00000200_0010_11e1_ac36_0002a5d5c5
 /// left staring at "running…" forever (e.g. after a drop-out the box
 /// reconnects but our subscription went stale).
 const OP_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long to wait for SET_MODE's 1-byte status reply before re-reading
+/// the mode with GET_MODE to verify. Just above the firmware's 10 s
+/// deferred-reply window (`ble_notify_or_defer`).
+const SET_MODE_REPLY_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Shown instead of sending an SD-writing op (DELETE / START_LOG / SET_MODE /
+/// CAL_SET) while the box reports BatteryStatus flags bit 3 (a computer has
+/// its SD card mounted over USB-C, firmware v0.0.73+) — the box would refuse
+/// it with 0xE8, and that reply is not reliably delivered.
+pub const SD_USB_UNPLUG_MSG: &str = "Unplug USB-C — the box's SD card is in use by a computer";
 /// GET_VERSION answers within one connection interval or never (the firmware's
 /// reply notify is best-effort — `ble_notify_try` gives up after 500 ms when
 /// the stack is busy), so waiting the full OP_IDLE_TIMEOUT just delays the
@@ -791,7 +802,7 @@ impl LiveSample {
 
 /// One decoded BatteryStatus snapshot (8-byte LE packed layout, DESIGN.md
 /// §4). Distinct from `LiveSample` — its flags byte uses bit0=low_batt,
-/// bit1=logging, bit2=sd_lowbat_lock (see firmware `Src/battery.c`), so it does NOT share
+/// bit1=logging, bit2=sd_lowbat_lock, bit3=sd_usb_host (see firmware `Src/battery.c`), so it does NOT share
 /// `LiveSample`'s decode.
 #[derive(Clone, Copy, Debug)]
 pub struct BatterySample {
@@ -812,6 +823,11 @@ pub struct BatterySample {
     /// (hysteresis; the release rule is firmware-owned). Older firmware
     /// always sends 0.
     pub sd_lowbat_lock: bool,
+    /// SD card mounted by a computer over USB-C (firmware v0.0.73+, flags
+    /// bit 3): every SD write is refused (0xE8) until the drive is ejected or
+    /// USB-C is unplugged. Live data, LIST and READ keep working. Notified
+    /// within ~1 s of every change and on subscribe; older firmware sends 0.
+    pub sd_usb_host: bool,
 }
 
 impl BatterySample {
@@ -827,6 +843,7 @@ impl BatterySample {
             low_batt:       b[6] & 0x01 != 0,
             logging:        b[6] & 0x02 != 0,
             sd_lowbat_lock: b[6] & 0x04 != 0,
+            sd_usb_host:    b[6] & 0x08 != 0,
             // b[7] reserved.
         })
     }
@@ -1098,6 +1115,30 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
                     state.set_gps_power(on).await;
                 }
             }
+            // SET_MODE status reply overdue: re-read the mode to verify (the
+            // reply may have been eaten by ACL congestion while the switch
+            // still landed). With the card USB-mounted the refusal is
+            // certain — say so right away.
+            if let Some((manual, sent)) = state.set_mode_await {
+                if sent.elapsed() > SET_MODE_REPLY_TIMEOUT {
+                    state.set_mode_await = None;
+                    if state.sd_usb_host {
+                        state.emit_err(format!("SET_MODE: {SD_USB_UNPLUG_MSG}"));
+                    } else {
+                        state.verify_mode = Some(manual);
+                    }
+                    state.refresh_mode = true;
+                }
+            }
+            // Reconcile an optimistic toggle after a failed/unanswered SET.
+            if state.refresh_mode && matches!(state.op, CurrentOp::Idle) && state.peripheral.is_some() {
+                state.refresh_mode = false;
+                state.get_log_mode().await;
+            }
+            if state.refresh_gps && matches!(state.op, CurrentOp::Idle) && state.peripheral.is_some() {
+                state.refresh_gps = false;
+                state.get_gps_power().await;
+            }
         } else {
             // Not connected: only commands matter. arx.recv() returns
             // None when every BleBackend handle is dropped → process
@@ -1265,6 +1306,27 @@ struct WorkerState {
     /// lost behind the GUI's optimistic toggle (v0.0.65). Applied by the worker
     /// loop once `op` returns to Idle (takes the GpsPowerReq slot then).
     pending_set_gps: Option<bool>,
+    /// Latest BatteryStatus flags bit 3 (firmware v0.0.73+): a computer has
+    /// the box's SD card mounted over USB-C. While set, SD-writing ops are
+    /// refused locally with `SD_USB_UNPLUG_MSG` instead of being sent.
+    /// Cleared on disconnect.
+    sd_usb_host: bool,
+    /// SET_MODE sent, its 1-byte status reply not yet seen: the requested
+    /// mode + when it was sent. The reply arrives while `op == Idle` (SET_MODE
+    /// is fire-and-forget) and is demuxed in the Idle arm; on timeout the
+    /// mode is re-read (GET_MODE) to verify.
+    set_mode_await: Option<(bool, Instant)>,
+    /// Requested mode to check the next GET_MODE reply against (after a
+    /// SET_MODE whose status reply never arrived). Mismatch → error.
+    verify_mode: Option<bool>,
+    /// Requested GPS state to check the next GPS_GET_POWER reply against
+    /// (after a GPS_POWER whose status reply never arrived).
+    verify_gps: Option<bool>,
+    /// Re-read the box's log mode / GPS state once the op slot is free — set
+    /// after a failed/unanswered SET so the GUI's optimistic toggle snaps
+    /// back to the box's truth instead of silently showing the wrong state.
+    refresh_mode: bool,
+    refresh_gps: bool,
     /// OS "stay awake / no App Nap" assertion, held for the whole connected
     /// session **including** auto-reconnect windows (mirrors iOS's
     /// background-task assertion / Android's foreground service). `Some`
@@ -1303,6 +1365,12 @@ impl WorkerState {
             shared,
             pending_set_mode: None,
             pending_set_gps: None,
+            sd_usb_host: false,
+            set_mode_await: None,
+            verify_mode: None,
+            verify_gps: None,
+            refresh_mode: false,
+            refresh_gps: false,
             power: None,
             read_ride_out_logged: false,
             read_rate_mark: None,
@@ -1779,6 +1847,7 @@ impl WorkerState {
                             tokio::time::timeout(LINK_OP_TIMEOUT, p.read(&batt_char)).await
                         {
                             if let Some(b) = BatterySample::parse(&v) {
+                                self.sd_usb_host = b.sd_usb_host;
                                 self.emit(BleEvent::Battery(b));
                             }
                         }
@@ -2175,6 +2244,12 @@ impl WorkerState {
         self.stream_asm      = StreamAsm::default();
         self.stream_capable  = false;
         self.battery_capable = false;
+        self.sd_usb_host     = false;
+        self.set_mode_await  = None;
+        self.verify_mode     = None;
+        self.verify_gps      = None;
+        self.refresh_mode    = false;
+        self.refresh_gps     = false;
         if let Some(p) = self.peripheral.take() {
             drop_link(&p).await;
         }
@@ -2349,6 +2424,14 @@ impl WorkerState {
             self.emit_err("not connected");
             return;
         }
+        if self.sd_usb_host {
+            // The box would refuse with 0xE8 — and that reply is not
+            // reliably delivered (iOS saw a 20 s timeout). No "timed out"
+            // in the text, so the sync engine treats it as a hard failure
+            // (banner) instead of retrying.
+            self.emit_err(format!("DELETE {name}: {SD_USB_UNPLUG_MSG}"));
+            return;
+        }
         // Opcode payload: 0x03 + filename bytes (no NUL).
         let mut payload = Vec::with_capacity(1 + name.len());
         payload.push(0x03);
@@ -2414,6 +2497,10 @@ impl WorkerState {
     /// in [1, 86400] s, writes BKP1R/BKP2R, and reboots into LOG mode.
     /// BLE connection drops shortly after — host should expect Disconnected.
     async fn start_log(&mut self, duration_seconds: u32) {
+        if self.sd_usb_host {
+            self.emit_err(format!("START_LOG: {SD_USB_UNPLUG_MSG}"));
+            return;
+        }
         let payload = [
             0x05,
             duration_seconds         as u8,
@@ -2465,6 +2552,12 @@ impl WorkerState {
             self.emit_err("not connected");
             return;
         }
+        if self.sd_usb_host {
+            // Refuse before the optimistic LogMode emit, so the toggle never
+            // flips to a mode the box can't persist.
+            self.emit_err(format!("SET_MODE: {SD_USB_UNPLUG_MSG}"));
+            return;
+        }
         self.emit(BleEvent::LogMode { manual });
         if !matches!(self.op, CurrentOp::Idle) {
             // Mid-LIST/READ: defer the 0x06 write so the firmware's OK-status
@@ -2481,10 +2574,19 @@ impl WorkerState {
     /// lands harmlessly while `op == Idle` and never collides with a
     /// GET_MODE read-back.
     async fn write_set_mode(&mut self, manual: bool) {
-        if let Err(e) = self.write_cmd(&[0x06, manual as u8]).await {
-            self.emit_err(e);
+        if self.sd_usb_host {
+            // Deferred click whose card got USB-mounted meanwhile: refuse and
+            // re-read so the optimistic toggle snaps back.
+            self.emit_err(format!("SET_MODE: {SD_USB_UNPLUG_MSG}"));
+            self.refresh_mode = true;
             return;
         }
+        if let Err(e) = self.write_cmd(&[0x06, manual as u8]).await {
+            self.emit_err(format!("SET_MODE: {e}"));
+            self.refresh_mode = true;
+            return;
+        }
+        self.set_mode_await = Some((manual, Instant::now()));
         self.emit(BleEvent::Status(format!(
             "SET_MODE {} sent",
             if manual { "manual" } else { "auto" }
@@ -2636,6 +2738,10 @@ impl WorkerState {
         }
         if !matches!(self.op, CurrentOp::Idle) {
             self.emit_err("another op is in flight — wait or Disconnect");
+            return;
+        }
+        if self.sd_usb_host {
+            self.emit_err(format!("CAL_SET: {SD_USB_UNPLUG_MSG}"));
             return;
         }
         let mut payload = Vec::with_capacity(1 + blob.len());
@@ -2988,8 +3094,26 @@ impl WorkerState {
                 // v0.0.70 SD-refusal bytes: fire-and-forget START_LOG /
                 // SET_MODE get their reply here, and "eject the USB drive"
                 // / "battery lock" must reach the user.
-                if n.value.len() == 1 && matches!(n.value[0], 0xE8 | 0xE9) {
-                    self.emit_err(status_message(n.value[0]));
+                if n.value.len() == 1 {
+                    let b = n.value[0];
+                    if let Some((manual, _)) = self.set_mode_await.take() {
+                        // SET_MODE's status reply. Any non-OK byte means the
+                        // switch did NOT happen — the GUI already lit the
+                        // requested mode optimistically, so surface the
+                        // reason and re-read the box's real mode.
+                        if b == 0x00 {
+                            self.emit(BleEvent::Status(format!(
+                                "log mode set to {}",
+                                if manual { "manual" } else { "auto" }
+                            )));
+                        } else {
+                            let msg = status_message(b);
+                            self.emit_err(format!("SET_MODE: {msg} (0x{b:02X})"));
+                            self.refresh_mode = true;
+                        }
+                    } else if matches!(b, 0xE8 | 0xE9) {
+                        self.emit_err(status_message(b));
+                    }
                 }
             }
             CurrentOp::Listing { line, last_progress, rows_seen } => {
@@ -3125,6 +3249,14 @@ impl WorkerState {
                    1 = manual. Anything else → ignore (stay "unknown"). */
                 if let Some(&b) = n.value.first() {
                     if b == 0 || b == 1 {
+                        if let Some(want) = self.verify_mode.take() {
+                            if want != (b == 1) {
+                                self.emit_err(format!(
+                                    "SET_MODE: the box did not switch to {} (no reply) — try again",
+                                    if want { "manual" } else { "auto" }
+                                ));
+                            }
+                        }
                         self.emit(BleEvent::LogMode { manual: b == 1 });
                     }
                 }
@@ -3164,15 +3296,35 @@ impl WorkerState {
                     if is_set {
                         if b == 0x00 {
                             self.emit(BleEvent::GpsPower { on: requested });
-                            self.emit(BleEvent::Status(format!(
-                                "GPS turned {}",
-                                if requested { "on" } else { "off" }
-                            )));
+                            if self.sd_usb_host {
+                                // The firmware applies GPS_POWER even while a
+                                // computer owns the card, but can't persist it
+                                // (GPSPWR.CFG) — it reverts on the next boot.
+                                self.emit_err(format!(
+                                    "GPS_POWER: GPS turned {} for now, but not saved —                                      {SD_USB_UNPLUG_MSG}; set it again afterwards",
+                                    if requested { "on" } else { "off" }
+                                ));
+                            } else {
+                                self.emit(BleEvent::Status(format!(
+                                    "GPS turned {}",
+                                    if requested { "on" } else { "off" }
+                                )));
+                            }
                         } else {
                             let msg = status_message(b);
                             self.emit_err(format!("GPS_POWER: {msg} (0x{b:02X})"));
+                            // Toggle was flipped optimistically — re-read.
+                            self.refresh_gps = true;
                         }
                     } else {
+                        if let Some(want) = self.verify_gps.take() {
+                            if want != (b != 0) {
+                                self.emit_err(format!(
+                                    "GPS_POWER: the box did not turn GPS {} (no reply) — try again",
+                                    if want { "on" } else { "off" }
+                                ));
+                            }
+                        }
                         self.emit(BleEvent::GpsPower { on: b != 0 });
                     }
                 }
@@ -3398,6 +3550,7 @@ impl WorkerState {
     /// frames are dropped silently.
     fn handle_battery_notification(&mut self, bytes: &[u8]) {
         if let Some(b) = BatterySample::parse(bytes) {
+            self.sd_usb_host = b.sd_usb_host;
             self.emit(BleEvent::Battery(b));
         }
     }
@@ -3558,13 +3711,20 @@ impl WorkerState {
                 true // starved READ → caller reconnects + resumes
             }
             CurrentOp::Deleting { name, .. } => {
-                self.emit_err(format!("DELETE {name} timed out — no notify for 20 s"));
+                if self.sd_usb_host {
+                    // The 0xE8 refusal got lost — the reason is known, say it
+                    // (no "timed out" → hard failure, no pointless retry).
+                    self.emit_err(format!("DELETE {name}: {SD_USB_UNPLUG_MSG}"));
+                } else {
+                    self.emit_err(format!("DELETE {name} timed out — no notify for 20 s"));
+                }
                 false
             }
             CurrentOp::GettingMode { .. } => {
                 // Legacy PumpTsueri firmware never replies to GET_MODE.
                 // Silently drop to Idle (mode stays "unknown"); never
                 // reconnect — there's nothing wrong with the link.
+                self.verify_mode = None;
                 false
             }
             CurrentOp::GettingVersion { .. } => {
@@ -3576,10 +3736,18 @@ impl WorkerState {
                 self.emit(BleEvent::FirmwareVersion(None));
                 false
             }
-            CurrentOp::GpsPowerReq { .. } => {
+            CurrentOp::GpsPowerReq { is_set, on, .. } => {
                 // Legacy firmware (< v0.0.35) never replies to GPS_POWER /
-                // GPS_GET_POWER. Silently drop to Idle (toggle stays
-                // "unknown"); never reconnect — the link is fine.
+                // GPS_GET_POWER. Drop to Idle; never reconnect — the link is
+                // fine. A SET whose reply got lost is verified with one
+                // GPS_GET_POWER (legacy never answers that either → silent),
+                // so a click that silently didn't land is surfaced.
+                if is_set {
+                    self.verify_gps = Some(on);
+                    self.refresh_gps = true;
+                } else {
+                    self.verify_gps = None;
+                }
                 false
             }
             CurrentOp::CalibrationReq { is_set, .. } => {
@@ -3742,7 +3910,7 @@ fn status_message(b: u8) -> &'static str {
         0xE1 => "NOT_FOUND",
         0xE2 => "IO_ERROR",
         0xE3 => "BAD_REQUEST",
-        0xE8 => "SD card is mounted over USB — eject it on the computer (or unplug USB-C), then retry",
+        0xE8 => "unplug USB-C — the box's SD card is in use by a computer (or eject the drive), then retry",
         0xE9 => "battery lock — recording and SD writes paused, charge the box (until about 3.7 V)",
         _    => "unknown error",
     }
@@ -3779,4 +3947,48 @@ fn fw_commit_err(code: u8) -> String {
         _    => "unknown error",
     };
     format!("FW_COMMIT rejected: {why} (0x{code:02X})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batt(flags: u8) -> BatterySample {
+        // 3700 mV, 55.0 %, -12.3 mA, flags, reserved.
+        let mut b = [0u8; 8];
+        b[0..2].copy_from_slice(&3700u16.to_le_bytes());
+        b[2..4].copy_from_slice(&550u16.to_le_bytes());
+        b[4..6].copy_from_slice(&(-123i16).to_le_bytes());
+        b[6] = flags;
+        BatterySample::parse(&b).expect("8-byte payload parses")
+    }
+
+    #[test]
+    fn battery_flags_decode() {
+        let none = batt(0x00);
+        assert!(!none.low_batt && !none.logging && !none.sd_lowbat_lock && !none.sd_usb_host);
+        assert_eq!(none.voltage_mv, 3700);
+        assert_eq!(none.soc_x10, 550);
+        assert_eq!(none.current_x100ua, -123);
+
+        let lock = batt(0x04);
+        assert!(lock.sd_lowbat_lock && !lock.sd_usb_host);
+
+        let usb = batt(0x08);
+        assert!(usb.sd_usb_host && !usb.sd_lowbat_lock && !usb.low_batt && !usb.logging);
+
+        let all = batt(0x0F);
+        assert!(all.low_batt && all.logging && all.sd_lowbat_lock && all.sd_usb_host);
+    }
+
+    #[test]
+    fn battery_wrong_length_rejected() {
+        assert!(BatterySample::parse(&[0u8; 7]).is_none());
+        assert!(BatterySample::parse(&[0u8; 9]).is_none());
+    }
+
+    #[test]
+    fn sd_usb_status_leads_with_action() {
+        assert!(status_message(0xE8).starts_with("unplug USB-C"));
+    }
 }

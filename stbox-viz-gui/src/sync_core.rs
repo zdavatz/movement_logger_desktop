@@ -280,6 +280,15 @@ pub struct SyncCore {
     /// delete isn't only buried in the log. Cleared on a successful
     /// delete, a new delete attempt, or disconnect.
     pub ble_delete_err: Option<String>,
+    /// Last failure of a box-settings write — SET_MODE (log mode),
+    /// GPS_POWER, CAL_SET, START_LOG: a refusal status (0xE8 USB host /
+    /// 0xE9 battery lock / IO_ERROR …), an unanswered SET that the re-read
+    /// showed didn't land, or a local refusal while the SD card is
+    /// USB-mounted. Shown as a red banner under the box controls so the
+    /// click never fails silently (the status line is overwritten by the
+    /// next sync event). Cleared on Dismiss, a new settings click, or
+    /// disconnect.
+    pub ble_settings_err: Option<String>,
     /// Serial DELETE queue. Trash-icon clicks push `(name, attempts_left)`
     /// here; the head is sent to the worker and the next entry is popped on
     /// DeleteDone or a DELETE-side error. Required because the worker has
@@ -969,6 +978,7 @@ impl SyncCore {
                     self.ble_connected_id = None;
                     self.ble_sync_pending = false;
                     self.ble_delete_err = None;
+                    self.ble_settings_err = None;
                     /* Clear any in-flight firmware progress bar (the box
                        reboots after a successful COMMIT, dropping the
                        link). Keep `ble_flash_msg` so the success/error
@@ -1467,6 +1477,16 @@ impl SyncCore {
                 BleEvent::Error(msg) => {
                     self.ble_status = format!("error: {msg}");
                     push_log(&self.log, format!("ble error: {msg}"));
+                    if ["SET_MODE", "GPS_POWER", "CAL_SET", "START_LOG"]
+                        .iter()
+                        .any(|p| msg.starts_with(p))
+                        // Un-prefixed SD refusal (0xE8/0xE9) of a
+                        // fire-and-forget write whose reply wasn't tracked.
+                        || msg.starts_with("unplug USB-C")
+                        || msg.starts_with("battery lock")
+                    {
+                        self.ble_settings_err = Some(msg.clone());
+                    }
                     /* The worker is authoritative about the link: if it
                        rejects a Connect with "already connected", the UI's
                        state drifted (e.g. a stray ScanStopped overrode
