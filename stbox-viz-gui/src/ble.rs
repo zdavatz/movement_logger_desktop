@@ -364,12 +364,6 @@ const HOST_DISCONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 /// correctness, only throughput).
 const FW_CHUNK: usize = 160;
 
-/// FW_DATA chunks kept in flight before waiting for an ACK (v0.0.81).
-/// 8 × 165 B stays well inside CoreBluetooth's write-without-response queue
-/// and the box's event buffer; a dropped chunk is caught as a 0xE7 gap or a
-/// missed ACK and resent from the last ACKed offset.
-const FW_WINDOW_CHUNKS: usize = 8;
-
 /// FW_BEGIN erases the inactive flash bank (~1 s) before replying, so it
 /// needs a longer ceiling than a normal op. FW_COMMIT verifies the hash,
 /// swaps banks, and resets — its reply (0xA0) may never arrive because
@@ -2934,21 +2928,9 @@ impl WorkerState {
         }
         self.emit(BleEvent::FlashStarted { total: image_len as u64 });
 
-        // --- FW_DATA: windowed, offset-gated ---------------------------
-        // Up to FW_WINDOW_CHUNKS chunks in flight instead of stop-and-wait:
-        // on macOS every round trip costs several (slow) connection events,
-        // so one-chunk-per-ACK ran at ~1.6 KB/s. The box ACKs the highest
-        // contiguous offset it has programmed (firmware v0.0.75+ coalesces
-        // those ACKs while chunks are queued; older firmware ACKs each one —
-        // both work). Go-back-N recovery: on a missed ACK or a 0xE7 gap (a
-        // chunk CoreBluetooth dropped) resend from the last ACKed offset;
-        // the box ignores chunks below its cursor, so duplicates are harmless.
-        let window = FW_WINDOW_CHUNKS * FW_CHUNK;
-        let mut acked = 0usize; // box's confirmed next-expected offset
-        let mut sent = 0usize;  // next offset to put on the air
-        let mut retries = 0u32;
-        let mut rewound_at: Option<usize> = None;
-        while acked < image_len {
+        // --- FW_DATA: offset-gated chunk loop --------------------------
+        let mut offset = 0usize;
+        while offset < image_len {
             // Honour a Disconnect / quit promptly instead of running the whole
             // upload to completion: the single-op worker can't service the
             // command channel while this loop owns the stream, so without this
@@ -2957,93 +2939,75 @@ impl WorkerState {
                 self.op = CurrentOp::Idle;
                 self.abort_firmware().await;
                 self.emit(BleEvent::FlashError {
-                    msg: format!("firmware upload aborted at {acked} B"),
+                    msg: format!("firmware upload aborted at {offset} B"),
                 });
                 return;
             }
-            while sent < image_len && sent - acked < window {
-                let n = FW_CHUNK.min(image_len - sent);
-                let mut chunk = Vec::with_capacity(5 + n);
-                chunk.push(OP_FW_DATA);
-                chunk.extend_from_slice(&(sent as u32).to_le_bytes());
-                chunk.extend_from_slice(&bytes[sent..sent + n]);
+            let n = FW_CHUNK.min(image_len - offset);
+            let mut chunk = Vec::with_capacity(5 + n);
+            chunk.push(OP_FW_DATA);
+            chunk.extend_from_slice(&(offset as u32).to_le_bytes());
+            chunk.extend_from_slice(&bytes[offset..offset + n]);
+
+            let mut attempt = 0u32;
+            let next_off = loop {
                 if let Err(e) = self.write_cmd(&chunk).await {
                     self.op = CurrentOp::Idle;
                     self.abort_firmware().await;
                     self.emit(BleEvent::FlashError {
-                        msg: format!("FW_DATA write at {sent}: {e}"),
+                        msg: format!("FW_DATA write at {offset}: {e}"),
                     });
                     return;
                 }
-                sent += n;
-            }
-            match self.next_filedata(FW_DATA_TIMEOUT).await {
-                Ok(Some(v)) if v.len() == 4 => {
-                    // 4-byte LE next-expected offset ACK.
-                    let a = (u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as usize)
-                        .min(image_len);
-                    if a > acked {
-                        acked = a;
-                        retries = 0;
-                        rewound_at = None;
-                        if let CurrentOp::Flashing { last_progress } = &mut self.op {
-                            *last_progress = Instant::now();
-                        }
-                        self.emit(BleEvent::FlashProgress {
-                            bytes_done: acked as u64,
-                            total: image_len as u64,
-                        });
+                match self.next_filedata(FW_DATA_TIMEOUT).await {
+                    Ok(Some(v)) if v.len() == 4 => {
+                        // 4-byte LE next-expected offset ACK.
+                        break u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as usize;
                     }
-                    sent = sent.max(acked);
-                }
-                Ok(Some(v)) if v.first() == Some(&0xE7) => {
-                    // Gap: a chunk never reached the box. Every chunk already
-                    // in flight behind it answers 0xE7 too — rewind once per
-                    // ACK position, not once per stale reply.
-                    if rewound_at != Some(acked) {
-                        retries += 1;
-                        if retries >= FW_DATA_RETRIES {
-                            self.op = CurrentOp::Idle;
-                            self.abort_firmware().await;
-                            self.emit(BleEvent::FlashError { msg: fw_data_err(0xE7) });
-                            return;
-                        }
-                        rewound_at = Some(acked);
-                        sent = acked;
-                    }
-                }
-                Ok(Some(v)) => {
-                    // 1-byte error (0xE5 flash-fail, …).
-                    let code = v.first().copied().unwrap_or(0);
-                    self.op = CurrentOp::Idle;
-                    self.abort_firmware().await;
-                    self.emit(BleEvent::FlashError { msg: fw_data_err(code) });
-                    return;
-                }
-                Ok(None) => {
-                    self.op = CurrentOp::Idle;
-                    self.emit(BleEvent::FlashError {
-                        msg: format!("link dropped during FW_DATA at {acked} B"),
-                    });
-                    return;
-                }
-                Err(()) => {
-                    // Missed ACK — resend from the last confirmed offset.
-                    retries += 1;
-                    if retries >= FW_DATA_RETRIES {
+                    Ok(Some(v)) => {
+                        // 1-byte error (0xE7 bad-seq / 0xE5 flash-fail).
+                        let code = v.first().copied().unwrap_or(0);
                         self.op = CurrentOp::Idle;
                         self.abort_firmware().await;
+                        self.emit(BleEvent::FlashError { msg: fw_data_err(code) });
+                        return;
+                    }
+                    Ok(None) => {
+                        self.op = CurrentOp::Idle;
                         self.emit(BleEvent::FlashError {
-                            msg: format!(
-                                "FW_DATA timed out at {acked} B after {retries} retries"
-                            ),
+                            msg: format!("link dropped during FW_DATA at {offset} B"),
                         });
                         return;
                     }
-                    rewound_at = Some(acked);
-                    sent = acked;
+                    Err(()) => {
+                        // Missed ACK — resend the SAME offset (the box is
+                        // idempotent for offset < its write cursor).
+                        attempt += 1;
+                        if attempt >= FW_DATA_RETRIES {
+                            self.op = CurrentOp::Idle;
+                            self.abort_firmware().await;
+                            self.emit(BleEvent::FlashError {
+                                msg: format!(
+                                    "FW_DATA timed out at {offset} B after {attempt} retries"
+                                ),
+                            });
+                            return;
+                        }
+                        // loop → resend this chunk
+                    }
                 }
+            };
+            // The box drives the cursor: jump to whatever offset it
+            // reports next (normally offset + n; on a resent-after-ACK
+            // race it may already be ahead, which is fine).
+            offset = next_off.max(offset + n).min(image_len);
+            if let CurrentOp::Flashing { last_progress } = &mut self.op {
+                *last_progress = Instant::now();
             }
+            self.emit(BleEvent::FlashProgress {
+                bytes_done: offset as u64,
+                total: image_len as u64,
+            });
         }
 
         // --- FW_COMMIT: verify hash, swap banks, RESET -----------------
