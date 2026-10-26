@@ -136,6 +136,10 @@ those silently while the notify stream is busy. Stall after ~4 segments, then th
 - `reset_adapter`: after `CONNECT_FAILS_BEFORE_RESET` (2) failed connects the
   CoreBluetooth session is rebuilt — what an app restart used to do by hand.
 - No auto-resume on reconnect unless Keep synced is on; per-row **Resume** button.
+- **Firmware upload (v0.0.84):** FW_BEGIN / every FW_DATA chunk / FW_COMMIT go
+  through the same `write_confirmed_or_plain`, and the per-chunk ACK wait is
+  1.5 s × 8 retries (was 5 s × 5). First successful Mac FOTA after a day of
+  failures: 124 kB in 75 s incl. scan/connect (~2.3 KB/s), 0 fallbacks, 0 resends.
 - `btleplug-patched` logs every `didDisconnectPeripheral` reason
   (`[corebluetooth] … CBErrorDomain code N`). Code 7 after our own `0x0F`
   teardown is expected.

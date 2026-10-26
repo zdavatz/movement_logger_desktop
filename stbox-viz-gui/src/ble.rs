@@ -378,9 +378,11 @@ const FW_BEGIN_TIMEOUT:  Duration = Duration::from_secs(8);
 const FW_COMMIT_TIMEOUT: Duration = Duration::from_secs(8);
 /// Per-chunk ACK wait. On timeout we resend the SAME offset (the box is
 /// idempotent for offset < its write cursor) up to `FW_DATA_RETRIES`
-/// times before failing the whole upload.
-const FW_DATA_TIMEOUT: Duration = Duration::from_secs(5);
-const FW_DATA_RETRIES: u32 = 5;
+/// times before failing the whole upload. v0.0.84: 5 s → 1.5 s and 5 → 8
+/// retries (12 s worst case, under the box's 15 s FW stall) — chunks are
+/// confirmed writes now, so a silence means a lost ACK notify, not a slow box.
+const FW_DATA_TIMEOUT: Duration = Duration::from_millis(1500);
+const FW_DATA_RETRIES: u32 = 8;
 
 // ---------------------------------------------------------------------------
 //  Public command / event API
@@ -2397,10 +2399,21 @@ impl WorkerState {
     }
 
     async fn write_read_request(&self, payload: &[u8]) -> Result<(), String> {
+        self.write_confirmed_or_plain(payload).await
+    }
+
+    /// Confirmed FileCmd write (ATT write with response), falling back to a
+    /// write-without-response if the ACK times out. CoreBluetooth drops
+    /// unconfirmed writes silently when busy (#18) — used for READ requests
+    /// (v0.0.83) and every firmware-upload write (v0.0.84).
+    async fn write_confirmed_or_plain(&self, payload: &[u8]) -> Result<(), String> {
         match self.write_cmd_confirmed(payload).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                eprintln!("[read] confirmed READ request failed ({e}) — falling back to write-without-response");
+                eprintln!(
+                    "[write] confirmed write (op {:#04x}) failed ({e}) — falling back to write-without-response",
+                    payload.first().copied().unwrap_or(0)
+                );
                 self.write_cmd(payload).await
             }
         }
@@ -3015,7 +3028,7 @@ impl WorkerState {
         begin.push(OP_FW_BEGIN);
         begin.extend_from_slice(&(image_len as u32).to_le_bytes());
         begin.extend_from_slice(&sha);
-        if let Err(e) = self.write_cmd(&begin).await {
+        if let Err(e) = self.write_confirmed_or_plain(&begin).await {
             self.op = CurrentOp::Idle;
             self.emit(BleEvent::FlashError { msg: format!("FW_BEGIN write: {e}") });
             return;
@@ -3070,7 +3083,7 @@ impl WorkerState {
 
             let mut attempt = 0u32;
             let next_off = loop {
-                if let Err(e) = self.write_cmd(&chunk).await {
+                if let Err(e) = self.write_confirmed_or_plain(&chunk).await {
                     self.op = CurrentOp::Idle;
                     self.abort_firmware().await;
                     self.emit(BleEvent::FlashError {
@@ -3130,7 +3143,7 @@ impl WorkerState {
         }
 
         // --- FW_COMMIT: verify hash, swap banks, RESET -----------------
-        if let Err(e) = self.write_cmd(&[OP_FW_COMMIT]).await {
+        if let Err(e) = self.write_confirmed_or_plain(&[OP_FW_COMMIT]).await {
             self.op = CurrentOp::Idle;
             self.emit(BleEvent::FlashError { msg: format!("FW_COMMIT write: {e}") });
             return;
