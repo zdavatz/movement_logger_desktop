@@ -188,7 +188,7 @@ impl BootReport {
         } else if lower.contains("iwdg") || lower.contains("wwdg") {
             "the box firmware hung and the watchdog auto-restarted it".to_string()
         } else if lower.contains("9600") && lower.contains("fallback") {
-            "GPS stuck at its fallback baud rate (box→GPS wire suspect)".to_string()
+            "GPS stuck at its fallback baud rate (box-to-GPS wire suspect)".to_string()
         } else if lower.contains("checksum") || lower.contains("uart") {
             "GPS data arriving corrupted (wiring/interference suspect)".to_string()
         } else if lower.contains("cut short") || lower.contains("power removed") {
@@ -718,13 +718,13 @@ fn finish_boot(mut rep: BootReport, scan: BootScan) -> BootReport {
         Some(9600) => f.push(Finding {
             severity: Severity::Warn,
             msg: "GPS stuck at fallback 9600 baud / 5 Hz — the $PUBX,41 upgrade never took; \
-                  box→module command wire (JP2 pin 14) suspect"
+                  box-to-module command wire (JP2 pin 14) suspect"
                 .into(),
         }),
         Some(_) if scan.upgrade_ok || scan.cfg_ack || scan.bridge_valset_ack => {
             f.push(Finding {
                 severity: Severity::Info,
-                msg: "box→module command wire verified (UBX/PUBX ACKed)".into(),
+                msg: "box-to-module command wire verified (UBX/PUBX ACKed)".into(),
             })
         }
         _ => {}

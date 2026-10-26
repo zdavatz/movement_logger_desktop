@@ -1610,7 +1610,9 @@ fn render_file_group(
     });
     for &i in indices {
         let f = &mut files[i];
-        ui.horizontal(|ui| {
+        // The row's own content width — the progress bar below ends where
+        // the row ends (at the Share… button), not at the window edge.
+        let row_w = ui.horizontal(|ui| {
             ui.checkbox(&mut f.selected, "");
             // Monospace size so the digits right-align cleanly into a column;
             // the name follows, then the trash button + status sit right next
@@ -1721,7 +1723,8 @@ fn render_file_group(
                     egui::RichText::new("✅ downloaded").strong(),
                 );
             }
-        });
+            ui.min_rect().width()
+        }).inner;
         if !f.downloaded && f.bytes_done > 0 && f.size > 0 {
             let frac = (f.bytes_done as f32 / f.size as f32).clamp(0.0, 1.0);
             let bytes_str = if f.size >= 1024 * 1024 {
@@ -1731,9 +1734,10 @@ fn render_file_group(
             } else {
                 format!("{} / {} B", f.bytes_done, f.size)
             };
-            // Full-width progress bar (adapts to the window; no fixed 360 px
-            // that would overflow a narrow window).
-            ui.add(egui::ProgressBar::new(frac).text(bytes_str));
+            // As wide as the file row above it (still shrinks with a narrow
+            // window — never wider than what's available).
+            let w = row_w.min(ui.available_width());
+            ui.add(egui::ProgressBar::new(frac).desired_width(w).text(bytes_str));
         }
     }
 }
@@ -2192,56 +2196,9 @@ impl AppState {
                     }
                 }
 
-                /* Surface a bad box boot right where the user syncs: the
-                   errlog auto-check (Debug tab has the details) graded
-                   the newest boot section of the mirrored log. Rendered
-                   regardless of connection state — the report also
-                   exists offline (startup check on the local mirror).
-                   Quiet when the latest boot is healthy. */
-                // Live box answer wins; before a box has answered this
-                // session, fall back to the persisted last-known state so
-                // the suppression survives an app restart.
-                let gps_deliberately_off = self
-                    .sync
-                    .ble_gps_power
-                    .or(self.sync.gps_power_last_known)
-                    == Some(false);
-                if let Some(last) = self
-                    .sync
-                    .errlog_report
-                    .as_ref()
-                    .and_then(|r| r.latest())
-                    .filter(|b| b.verdict() != errlog_check::Severity::Info)
-                    // A boot whose ONLY failure is "GPS silent at power-on"
-                    // is expected — not a fault — while the box reports its
-                    // GPS deliberately powered off. Suppress the badge; any
-                    // other co-occurring finding still shows it.
-                    .filter(|b| !(gps_deliberately_off && b.fail_is_only_gps_silence()))
-                {
-                    ui.add_space(2.0);
-                    let col = match last.verdict() {
-                        errlog_check::Severity::Fail => egui::Color32::from_rgb(235, 90, 90),
-                        _ => egui::Color32::from_rgb(230, 175, 60),
-                    };
-                    // Say WHAT failed right in the badge — a bare verdict
-                    // ("latest boot FAIL") carried no value; the user had
-                    // to dig through the Debug tab to learn it was e.g.
-                    // just the GPS being asleep at power-on.
-                    ui.colored_label(
-                        col,
-                        match last.human_reason() {
-                            Some(why) => format!(
-                                "Box health: last boot {} — {} (details: Debug tab)",
-                                last.verdict_label(),
-                                why
-                            ),
-                            None => format!(
-                                "Box health: last boot {} — see Debug tab",
-                                last.verdict_label()
-                            ),
-                        },
-                    );
-                }
+                /* Box health (errlog auto-check) is shown only in the Debug
+                   tab (v0.0.85): a degraded-but-working box (e.g. GPS stuck
+                   at its factory 9600 baud) read as an alarm in the Sync tab. */
 
                 // ----- File list / download ------------------------
                 if matches!(self.sync.ble_state, BleState::Connected) {
