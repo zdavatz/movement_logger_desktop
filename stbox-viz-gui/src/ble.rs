@@ -308,6 +308,8 @@ const LINK_OP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Keep-synced turned off. DISTINCT from `LINK_OP_TIMEOUT`, which still bounds
 /// discover/subscribe/notifications and the snappy manual first-connect.
 const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Failed connects in a row before the Bluetooth session is rebuilt (#18).
+const CONNECT_FAILS_BEFORE_RESET: u32 = 2;
 
 /// How `connect_core` issues the CoreBluetooth connect.
 #[derive(Clone, Copy)]
@@ -1279,6 +1281,8 @@ struct WorkerState {
     /// DeviceDisconnected only (discovery spam never queues up).
     central_rx:   Option<tokio_mpsc::UnboundedReceiver<String>>,
     central_pump: Option<tokio::task::JoinHandle<()>>,
+    /// Consecutive failed manual Connects (see `reset_adapter`).
+    connect_fail_streak: u32,
     op:           CurrentOp,
     /// SensorStream chunked-mode reassembly buffer.
     stream_asm:   StreamAsm,
@@ -1357,6 +1361,7 @@ impl WorkerState {
             notif_pump: None,
             central_rx: None,
             central_pump: None,
+            connect_fail_streak: 0,
             op: CurrentOp::Idle,
             stream_asm: StreamAsm::default(),
             stream_capable: false,
@@ -1519,6 +1524,22 @@ impl WorkerState {
         Some(adapter)
     }
 
+    /// Throw away the Bluetooth session and start a fresh one on the next
+    /// `ensure_adapter` — what an app restart did by hand (#18). After an
+    /// unclean macOS drop the long-lived CBCentralManager keeps handing back
+    /// the stale peripheral; every connect on it times out while a fresh
+    /// process connects at once. A new Adapter = a new CBCentralManager.
+    fn reset_adapter(&mut self, why: &str) {
+        eprintln!("[ble] resetting the Bluetooth session ({why})");
+        if let Some(pump) = self.central_pump.take() {
+            pump.abort();
+        }
+        self.central_rx = None;
+        self.adapter = None;
+        self.connect_fail_streak = 0;
+        self.emit(BleEvent::Status("Bluetooth session reset — reconnecting fresh".into()));
+    }
+
     // ---------------- Command dispatch -------------------------------------
 
     async fn handle_command(&mut self, cmd: BleCmd) {
@@ -1624,6 +1645,7 @@ impl WorkerState {
         match self.connect_core(&id, ConnectMode::Manual).await {
             Ok(()) => {
                 eprintln!("[connect] manual Connect OK for {id}");
+                self.connect_fail_streak = 0;
                 self.last_id = Some(id);
                 // Hold the OS awake for the whole session (kept across any
                 // later auto-reconnect windows; released on Disconnect).
@@ -1632,6 +1654,25 @@ impl WorkerState {
             }
             Err(e) => {
                 eprintln!("[connect] manual Connect FAILED: {e}");
+                self.connect_fail_streak += 1;
+                if self.connect_fail_streak >= CONNECT_FAILS_BEFORE_RESET {
+                    self.reset_adapter("manual connects keep failing");
+                    eprintln!("[connect] retrying {id} on the fresh session");
+                    match self.connect_core(&id, ConnectMode::Manual).await {
+                        Ok(()) => {
+                            eprintln!("[connect] manual Connect OK for {id} (fresh session)");
+                            self.last_id = Some(id);
+                            self.hold_power();
+                            self.emit(BleEvent::Connected);
+                            return;
+                        }
+                        Err(e2) => {
+                            eprintln!("[connect] manual Connect FAILED on fresh session: {e2}");
+                            self.emit_err(e2);
+                            return;
+                        }
+                    }
+                }
                 self.emit_err(e);
             }
         }
@@ -1975,6 +2016,8 @@ impl WorkerState {
         // just scan-invisible) and let the scan fallback carry the rest.
         #[cfg(target_os = "macos")]
         let mut retrieve_fails: u32 = 0;
+        #[cfg(target_os = "macos")]
+        let mut session_reset = false;
         loop {
             attempt += 1;
             let persist = self.persist_reconnect();
@@ -2002,6 +2045,15 @@ impl WorkerState {
                 )
             };
             self.emit(BleEvent::Status(label));
+
+            // Retrieve-by-id failing repeatedly after an unclean drop is the
+            // stale-session case (#18): start a fresh session once.
+            #[cfg(target_os = "macos")]
+            if retrieve_fails >= CONNECT_FAILS_BEFORE_RESET && !session_reset {
+                self.reset_adapter("reconnect keeps failing on the old session");
+                session_reset = true;
+                retrieve_fails = 0;
+            }
 
             let Some(adapter) = self.ensure_adapter().await else {
                 // No adapter yet — brief pause, try again.
