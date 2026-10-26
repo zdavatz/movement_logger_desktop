@@ -108,7 +108,8 @@ const STREAM_UUID:   Uuid = Uuid::from_u128(0x00000100_0010_11e1_ac36_0002a5d5c5
 /// notifies once/min + immediately on the low-battery transition, and the
 /// value is READ-able on demand. New in PumpLogger; absent on legacy
 /// SDDataLogFileX (optional characteristic). NOTE: its flags byte differs
-/// from the SensorStream packet — here bit0=low_batt, bit1=logging.
+/// from the SensorStream packet — here bit0=low_batt, bit1=logging,
+/// bit2=sd_lowbat_lock (firmware v0.0.72+; also notified on change).
 const BATTERY_UUID:  Uuid = Uuid::from_u128(0x00000200_0010_11e1_ac36_0002a5d5c51b);
 
 /// Watchdog — if no notification arrives for this long during an active
@@ -790,7 +791,7 @@ impl LiveSample {
 
 /// One decoded BatteryStatus snapshot (8-byte LE packed layout, DESIGN.md
 /// §4). Distinct from `LiveSample` — its flags byte uses bit0=low_batt,
-/// bit1=logging (see firmware `Src/battery.c`), so it does NOT share
+/// bit1=logging, bit2=sd_lowbat_lock (see firmware `Src/battery.c`), so it does NOT share
 /// `LiveSample`'s decode.
 #[derive(Clone, Copy, Debug)]
 pub struct BatterySample {
@@ -805,6 +806,12 @@ pub struct BatterySample {
     pub low_batt: bool,
     /// Box is actively logging to SD.
     pub logging: bool,
+    /// Low-battery SD lock (firmware v0.0.72+, flags bit 2): session closed,
+    /// GPS in backup, every SD write refused (0xE9) until the cell recovers
+    /// (charging, ~3.7 V). Read the bit — never derive it from `voltage_mv`
+    /// (hysteresis; the release rule is firmware-owned). Older firmware
+    /// always sends 0.
+    pub sd_lowbat_lock: bool,
 }
 
 impl BatterySample {
@@ -819,6 +826,7 @@ impl BatterySample {
             current_x100ua: i16::from_le_bytes([b[4], b[5]]),
             low_batt:       b[6] & 0x01 != 0,
             logging:        b[6] & 0x02 != 0,
+            sd_lowbat_lock: b[6] & 0x04 != 0,
             // b[7] reserved.
         })
     }
@@ -3735,7 +3743,7 @@ fn status_message(b: u8) -> &'static str {
         0xE2 => "IO_ERROR",
         0xE3 => "BAD_REQUEST",
         0xE8 => "SD card is mounted over USB — eject it on the computer (or unplug USB-C), then retry",
-        0xE9 => "battery too low — SD writes are locked, charge the box via USB-C",
+        0xE9 => "battery lock — recording and SD writes paused, charge the box (until about 3.7 V)",
         _    => "unknown error",
     }
 }

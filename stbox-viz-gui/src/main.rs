@@ -1360,6 +1360,43 @@ impl AppState {
     /// with a pending update. "Update box" downloads + flashes via
     /// `fw_apply_update`; "✕" dismisses. Same colored strip as the app-update
     /// banner so the two read as one family.
+    /// Persistent red banner while the box reports its low-battery SD lock
+    /// (BatteryStatus flags bit 2, firmware v0.0.72+): session closed, GPS in
+    /// backup, SD writes refused (0xE9) until the cell recovers. Driven only by
+    /// the bit — never by voltage (firmware-owned hysteresis). Hidden when the
+    /// bit clears; `latest_battery` is dropped on disconnect, which hides it too.
+    fn render_lowbat_lock_banner(&self, ui: &mut egui::Ui) {
+        if !matches!(self.sync.ble_state, BleState::Connected) {
+            return;
+        }
+        let Some(b) = self.latest_battery.filter(|b| b.sd_lowbat_lock) else {
+            return;
+        };
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(255, 225, 220))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 70, 70)))
+            .inner_margin(8.0)
+            .rounding(4.0)
+            .show(ui, |ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(140, 20, 20),
+                    egui::RichText::new(format!(
+                        "⚠ Battery lock: recording and GPS paused. Charge the box \
+                         (until about 3.7 V) — now {:.2} V",
+                        b.volts()
+                    ))
+                    .strong(),
+                )
+                .on_hover_text(
+                    "The box closed its logging session, put the GPS into backup \
+                     and refuses SD writes (delete, start session, log mode, \
+                     calibration) until the battery recovers. Live view, file \
+                     list and download keep working.",
+                );
+            });
+        ui.add_space(6.0);
+    }
+
     fn render_fw_banner(&mut self, ui: &mut egui::Ui) {
         if !matches!(self.sync.ble_state, BleState::Connected) {
             return;
@@ -4602,6 +4639,8 @@ impl eframe::App for AppState {
             // Box-firmware update banner (FOTA over BLE) — same treatment,
             // only while a box is connected with a pending firmware update.
             self.render_fw_banner(ui);
+            // Low-battery SD lock (firmware v0.0.72+) — persistent while set.
+            self.render_lowbat_lock_banner(ui);
 
             match self.current_tab {
                 Tab::Live     => {
