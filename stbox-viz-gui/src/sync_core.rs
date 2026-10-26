@@ -231,6 +231,8 @@ pub struct SyncCore {
     /// busy single-op slot (see the "another op is in flight" arm of the
     /// Error handler). v0.0.66.
     pub read_retry_at: Option<std::time::Instant>,
+    /// Re-drive a DELETE that bounced off a busy worker (v0.0.83).
+    pub delete_retry_at: Option<std::time::Instant>,
     /// A GPS-power toggle clicked while a sync pass / download was busy
     /// (v0.0.65). Sending 0x11 mid-pass grabs the single-op slot in the gap
     /// between two files, bounces the next queued READ ("another op is in
@@ -666,6 +668,14 @@ impl SyncCore {
     /// `read_retry_at`). Called from the same ~1 Hz ticks as the transfer
     /// supervisor. No-op unless armed, due, connected, and genuinely idle.
     pub fn tick_read_retry(&mut self) {
+        if let Some(at) = self.delete_retry_at {
+            if std::time::Instant::now() >= at {
+                self.delete_retry_at = None;
+                if matches!(self.ble_state, BleState::Connected) {
+                    self.advance_delete_queue();
+                }
+            }
+        }
         let Some(at) = self.read_retry_at else { return };
         if std::time::Instant::now() < at {
             return;
@@ -879,12 +889,21 @@ impl SyncCore {
                        stale resume can't fire later. */
                     let is_reconnect = self.ble_resume_box.is_some()
                         && self.ble_resume_box == self.ble_connected_id;
-                    if is_reconnect {
+                    /* v0.0.83: only Keep synced resumes by itself. Without it a
+                       multi-MB READ restarted on every reconnect and on macOS
+                       reliably dropped the link again (#18); the file row's
+                       Resume button continues it when the user wants. */
+                    if is_reconnect && self.ble_keep_synced {
                         self.ble_sync_pending = true;
                         self.ble_sync_msg =
                             "Reconnected — resuming sync (skipping files already saved)…"
                                 .into();
                         push_log(&self.log, "ble: reconnect — resuming interrupted sync".into());
+                    } else if is_reconnect {
+                        self.ble_sync_msg =
+                            "Reconnected — the interrupted download waits: click Resume on its row."
+                                .into();
+                        push_log(&self.log, "ble: reconnect — interrupted download left for Resume".into());
                     }
                     self.ble_resume_box = None;
                     if let Some(b) = self.ble.as_ref() {
@@ -1537,6 +1556,7 @@ impl SyncCore {
                         // is Idle by the time we get here on all three paths.
                         let is_timeout   = msg.contains("timed out");
                         let is_not_found = msg.contains("NOT_FOUND");
+                        let is_bounce    = msg.contains("another op is in flight");
                         // On advance_delete_queue we always decrement:
                         // INITIAL_ATTEMPTS=2 → first attempt in-flight
                         // carries attempts_left=1, a retry in-flight carries
@@ -1545,7 +1565,22 @@ impl SyncCore {
                         let is_retry_in_flight = self.ble_delete_attempts_left == 0;
                         let name_in_flight = self.ble_delete_in_flight.clone();
 
-                        if is_timeout && !is_retry_in_flight {
+                        if is_bounce {
+                            // Never reached the box (the worker was busy, e.g.
+                            // the connect-time LIST/GET chain). Put it back at
+                            // the front with its attempt restored and retry in
+                            // 2 s via tick_read_retry — not a failure.
+                            if let Some(name) = name_in_flight.clone() {
+                                self.ble_delete_queue.push_front(
+                                    (name, self.ble_delete_attempts_left.saturating_add(1)),
+                                );
+                            }
+                            self.ble_delete_in_flight = None;
+                            self.ble_delete_started_at = None;
+                            self.delete_retry_at = Some(
+                                std::time::Instant::now() + std::time::Duration::from_secs(2),
+                            );
+                        } else if is_timeout && !is_retry_in_flight {
                             // Almost always a lost status notify — the box's
                             // SDFat_Delete already ran. Requeue at FRONT so
                             // the retry beats any pending clicks; a NOT_FOUND
@@ -1589,9 +1624,11 @@ impl SyncCore {
                             // Surface prominently.
                             self.ble_delete_err = Some(msg.clone());
                         }
-                        self.ble_delete_in_flight = None;
-                        self.ble_delete_started_at = None;
-                        self.advance_delete_queue();
+                        if !is_bounce {
+                            self.ble_delete_in_flight = None;
+                            self.ble_delete_started_at = None;
+                            self.advance_delete_queue();
+                        }
                     }
                     /* A READ-side error (NOT_FOUND, BUSY, IO_ERROR, BAD_REQUEST,
                        timeout, disconnect mid-op) ends the in-flight read. Advance
@@ -1849,8 +1886,8 @@ impl SyncCore {
              already-saved files are skipped)"
                 .into()
         } else {
-            "⚠ Transfer interrupted (BLE link lost). Reconnect to the box — \
-             the sync resumes automatically and skips files already saved."
+            "⚠ Transfer interrupted (BLE link lost). Reconnect to the box, \
+             then click Resume on the file's row (already-saved bytes are kept)."
                 .into()
         };
         push_log(

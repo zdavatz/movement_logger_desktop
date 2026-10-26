@@ -345,12 +345,28 @@ declare_class!(
             &self,
             _central: &CBCentralManager,
             peripheral: &CBPeripheral,
-            _error: Option<&NSError>,
+            error: Option<&NSError>,
         ) {
             trace!(
                 "delegate_centralmanager_diddisconnectperipheral_error {}",
                 peripheral_debug(peripheral)
             );
+            // MovementLogger patch (#18): always print WHY CoreBluetooth says
+            // the link is gone (domain + code + text) — the box often never
+            // sees a disconnect, so this is the only clue to the macOS side.
+            match error {
+                Some(e) => eprintln!(
+                    "[corebluetooth] didDisconnectPeripheral {} — {} code {}: {}",
+                    peripheral_debug(peripheral),
+                    e.domain(),
+                    e.code(),
+                    localized_description(Some(e))
+                ),
+                None => eprintln!(
+                    "[corebluetooth] didDisconnectPeripheral {} — no error (app-requested)",
+                    peripheral_debug(peripheral)
+                ),
+            }
             let peripheral_uuid = nsuuid_to_uuid(unsafe { &peripheral.identifier() });
             self.send_event(CentralDelegateEvent::DisconnectedDevice { peripheral_uuid });
         }

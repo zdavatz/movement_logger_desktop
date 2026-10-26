@@ -153,6 +153,10 @@ const VERSION_REQ_TIMEOUT: Duration = Duration::from_secs(4);
 /// This value is now only the point at which we emit a one-shot "riding out"
 /// status line for visibility; teardown happens only at `READ_RIDE_OUT_LIMIT`.
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// Silence before a READ is re-requested from the current position, and how
+/// many re-requests per silence (at 3 / 6 / 9 s) before the ride-out (#18).
+const READ_RESEND_AFTER: Duration = Duration::from_secs(3);
+const READ_RESEND_MAX: u32 = 3;
 
 /// READ reconnect deadline: how long a notify-parked READ may go before we give
 /// up on the live link and reconnect (byte-resume from the mirror).
@@ -1009,6 +1013,13 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
     });
 
     let mut state = WorkerState::new(evt_tx, shared);
+    // One persistent 200 ms tick (v0.0.83). It used to be a fresh
+    // `sleep(200 ms)` per loop pass, which any command / notification
+    // arriving sooner reset — under steady traffic (READ retries every 2 s
+    // plus the box's live data) the watchdog barely ran, and a DELETE whose
+    // reply never came sat "in flight" past its 20 s timeout indefinitely.
+    let mut watchdog = tokio::time::interval(Duration::from_millis(200));
+    watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // The shape of `select!` depends on whether we have a live
@@ -1018,8 +1029,6 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
         if state.peripheral.is_some() {
             // Watchdog tick is short — 200 ms — so the loop wakes
             // frequently enough to detect op timeouts in human time.
-            let watchdog = tokio::time::sleep(Duration::from_millis(200));
-            tokio::pin!(watchdog);
 
             let central_dead = {
                 // Non-blocking sweep of the DeviceDisconnected pump: did
@@ -1080,8 +1089,12 @@ async fn worker_loop(cmd_rx: Receiver<BleCmd>, evt_tx: Sender<BleEvent>, shared:
                         }
                     }
                 }
-                _ = &mut watchdog => {
-                    if state.tick_watchdog() {
+                _ = watchdog.tick() => {
+                    let reconnect = state.tick_watchdog();
+                    if std::mem::take(&mut state.read_resend_due) && !reconnect {
+                        state.resend_read().await;
+                    }
+                    if reconnect {
                         // v0.0.62: tick_watchdog returns true ONLY at the READ
                         // last-resort (READ_RIDE_OUT_LIMIT, 200 s) — a shorter
                         // notify-park is now ridden out on the live link (see
@@ -1344,6 +1357,10 @@ struct WorkerState {
     /// READ makes progress (idle drops below `READ_STALL_TIMEOUT`) or a new
     /// READ starts. See `tick_watchdog`.
     read_ride_out_logged: bool,
+    /// READ re-request safety net (v0.0.83, #18): resends issued for the
+    /// current silence, and a flag the worker loop turns into the async write.
+    read_resends: u32,
+    read_resend_due: bool,
     /// Rolling-window anchor for the READ minimum-throughput watchdog:
     /// (window start, absolute bytes done at window start). `None` when no
     /// READ is in flight; re-anchored every `READ_MIN_RATE_WINDOW` when the
@@ -1378,6 +1395,8 @@ impl WorkerState {
             refresh_gps: false,
             power: None,
             read_ride_out_logged: false,
+            read_resends: 0,
+            read_resend_due: false,
             read_rate_mark: None,
         }
     }
@@ -2342,6 +2361,51 @@ impl WorkerState {
     /// Bounded by a short timeout: the firmware sends the ATT response before
     /// it acts on the opcode, but if the link is already flaky we don't want to
     /// hang the disconnect — we cancel locally either way.
+    /// Send a READ request (first segment or the next one) as an ATT write
+    /// WITH response (v0.0.83, #18). The box's ERRLOG proved the stalls: it
+    /// finished every 64 KB segment, but the host's write-without-response
+    /// for the next segment never arrived — CoreBluetooth drops those
+    /// silently when its queue is busy (here: mid notify stream). A confirmed
+    /// write is acknowledged or fails loudly; if the ACK doesn't come, fall
+    /// back to the old unconfirmed write so this is never worse than before.
+    /// Re-send the READ for the rest of the current segment, from the first
+    /// byte not yet received (the handler appends contiguously, so the offset
+    /// must be exactly base + received).
+    async fn resend_read(&mut self) {
+        let CurrentOp::Reading { name, base, content, segment_end, .. } = &self.op else {
+            return;
+        };
+        let from = *base + content.len() as u64;
+        if from >= *segment_end {
+            return;
+        }
+        let cap = *segment_end - from;
+        let mut p = Vec::with_capacity(name.len() + 10);
+        p.push(0x02);
+        p.extend_from_slice(name.as_bytes());
+        p.push(0x00);
+        p.extend_from_slice(&(from as u32).to_le_bytes());
+        p.extend_from_slice(&(cap as u32).to_le_bytes());
+        eprintln!(
+            "[read] no data for {}s — re-requesting {name} from {from} (#{})",
+            READ_RESEND_AFTER.as_secs() * self.read_resends as u64,
+            self.read_resends
+        );
+        if let Err(e) = self.write_read_request(&p).await {
+            eprintln!("[read] re-request failed: {e}");
+        }
+    }
+
+    async fn write_read_request(&self, payload: &[u8]) -> Result<(), String> {
+        match self.write_cmd_confirmed(payload).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("[read] confirmed READ request failed ({e}) — falling back to write-without-response");
+                self.write_cmd(payload).await
+            }
+        }
+    }
+
     async fn write_cmd_confirmed(&self, payload: &[u8]) -> Result<(), String> {
         let Some(p) = self.peripheral.as_ref() else {
             return Err("not connected".into());
@@ -2447,7 +2511,7 @@ impl WorkerState {
         payload.push(0x00);
         payload.extend_from_slice(&(offset as u32).to_le_bytes());
         payload.extend_from_slice(&(seg_cap as u32).to_le_bytes());
-        if let Err(e) = self.write_cmd(&payload).await {
+        if let Err(e) = self.write_read_request(&payload).await {
             self.emit_err(e);
             return;
         }
@@ -2469,7 +2533,10 @@ impl WorkerState {
 
     async fn delete(&mut self, name: String) {
         if !matches!(self.op, CurrentOp::Idle) {
-            self.emit_err("another op is in flight — wait or Disconnect");
+            // Named, so the sync engine re-queues this DELETE instead of
+            // mistaking it for a bounced READ (v0.0.83 — before, the DELETE
+            // sat "in flight" until its 20 s watchdog).
+            self.emit_err(format!("DELETE {name}: another op is in flight — retrying"));
             return;
         }
         if self.peripheral.is_none() {
@@ -3520,7 +3587,7 @@ impl WorkerState {
         // central-disconnect sweep tears down + reconnects, and the mirror
         // length drives a clean byte-resume.
         if let Some(p) = next_read {
-            if let Err(e) = self.write_cmd(&p).await {
+            if let Err(e) = self.write_read_request(&p).await {
                 self.emit_err(format!("READ next segment failed: {e}"));
             }
         }
@@ -3674,6 +3741,19 @@ impl WorkerState {
             } else {
                 None
             };
+        // Re-request on silence: after READ_RESEND_AFTER without a byte, send
+        // the READ again from the current position (up to READ_RESEND_MAX
+        // times per silence) before the ride-out / reconnect below.
+        if let Some(idle) = read_idle {
+            if idle < READ_RESEND_AFTER {
+                self.read_resends = 0;
+            } else if self.read_resends < READ_RESEND_MAX
+                && idle >= READ_RESEND_AFTER * (self.read_resends + 1)
+            {
+                self.read_resends += 1;
+                self.read_resend_due = true;
+            }
+        }
         if let (Some(idle), false) = (read_idle, read_trickle) {
             if idle < READ_STALL_TIMEOUT {
                 self.read_ride_out_logged = false; // fresh / progressing

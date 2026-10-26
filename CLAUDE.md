@@ -116,6 +116,30 @@ Downloads are resumable at the byte level. The firmware READ opcode takes `<name
 - **Worker-freeze traps (vendored-fork map holes).** On a peripheral that a late `didDisconnect` purged from the fork's CB-thread map, `is_connected` and `write` **never resolve their reply future** (internal.rs sets no reply on a map miss). On the single-worker-thread runtime one unbounded await = the whole BLE backend frozen until app restart. Therefore: `is_connected` only via the bounded `link_probably_connected` helper; `write_cmd` is timeout-bounded (`LINK_OP_TIMEOUT`). **Never add an unbounded CoreBluetooth await.**
 - **Abort-flag lifecycle: the `BleCmd::Disconnect` handler consumes it.** Every `request_abort()` caller (Disconnect button, START_LOG teardown, `on_exit`, agent stop) queues a `BleCmd::Disconnect` right after; the handler's trailing `clear_abort()` is the *only* consumption point. `auto_reconnect` must **NOT** clear it on entry (the old entry-clear silently swallowed a user's Disconnect click that landed during the preceding teardown → unbounded reconnect against the user's will), and nothing else may leave it set (a lingering flag made every later Scan abort in ~0 ms → "scan saw N, 0 matched" forever — Peter's "Scan zeigt nichts").
 
+## Mac sync stalls fixed: lost READ requests (v0.0.83, #18)
+
+The box's ERRLOG (fw v0.0.76 `fsm … done … passes= ok= busy= wait=` lines) proved
+it: every 64 KB segment finished on the box, but the host's request for the NEXT
+segment (a FileCmd write-without-response) never arrived — CoreBluetooth drops
+those silently while the notify stream is busy. Stall after ~4 segments, then the
+30 s ride-out + reconnect. Fixes in `ble.rs`:
+- `write_read_request`: READ requests go as ATT write **with response**, falling
+  back to the old write if the ACK times out.
+- `resend_read`: after `READ_RESEND_AFTER` (3 s) of silence the READ is re-sent
+  from the first missing byte (`base + content.len()`), up to `READ_RESEND_MAX`
+  (3) times per silence, before the ride-out. Field test: every stall resumed on
+  the first re-send.
+- The worker's watchdog is one persistent 200 ms `interval` (it was a fresh
+  `sleep` per loop pass, which steady traffic kept resetting — a DELETE with a
+  lost reply then never timed out).
+- A DELETE that bounces off a busy worker is re-queued (2 s) instead of failing.
+- `reset_adapter`: after `CONNECT_FAILS_BEFORE_RESET` (2) failed connects the
+  CoreBluetooth session is rebuilt — what an app restart used to do by hand.
+- No auto-resume on reconnect unless Keep synced is on; per-row **Resume** button.
+- `btleplug-patched` logs every `didDisconnectPeripheral` reason
+  (`[corebluetooth] … CBErrorDomain code N`). Code 7 after our own `0x0F`
+  teardown is expected.
+
 ## Firmware update over BLE (FOTA) — `--flash-firmware`
 
 The box's firmware can be upgraded over BLE (dual-bank OTA, firmware v0.0.29+). Same FileData characteristic as LIST/READ; opcodes `0x09` FW_BEGIN `<len32_LE><sha256:32>` (erases the inactive bank, ~1 s), `0x0A` FW_DATA `<off32_LE><bytes…>` (one image chunk, 4-byte LE ack), `0x0B` FW_COMMIT (verify SHA-256, swap banks, RESET), `0x0C` FW_ABORT. Wire spec + ack codes are in the `ble.rs` module header. The image is written to the **inactive** bank, so the box stays bootable on its current firmware the whole time and only swaps on COMMIT — an interrupted upload is harmless (the next FW_BEGIN re-erases and restarts from 0; FOTA is *not* byte-resumable like file READ).

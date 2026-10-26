@@ -1582,6 +1582,10 @@ fn render_file_group(
     // runs in `update`, which has the `eframe::Frame` for the window handle.
     out_dir: &std::path::Path,
     share_target: &mut Option<(PathBuf, egui::Rect)>,
+    // File currently being downloaded (no Resume button on that row) and
+    // the row whose Resume button was clicked this frame.
+    in_flight_name: Option<&str>,
+    resume_target: &mut Option<(String, u64)>,
 ) {
     if indices.is_empty() { return; }
     /* Header strip with a "Select all" toggle right next to the title —
@@ -1670,6 +1674,27 @@ fn render_file_group(
                 ui.colored_label(colour, egui::RichText::new(label).strong());
             } else if is_queued_delete {
                 ui.weak(egui::RichText::new("queued"));
+            }
+            // Resume (v0.0.83): a partly downloaded file is no longer
+            // resumed automatically on reconnect (unless Keep synced is on) —
+            // big BLE transfers are what make macOS drop the link (#18).
+            // The download queue resumes from the bytes already on disk.
+            let local_len = std::fs::metadata(sync_core::mirror_path(out_dir, &f.name))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if local_len > 0 && local_len < f.size && in_flight_name != Some(f.name.as_str()) {
+                let label = format!(
+                    "Resume ({:.2} / {:.2} MB)",
+                    local_len as f64 / 1_048_576.0,
+                    f.size as f64 / 1_048_576.0
+                );
+                if ui
+                    .add(egui::Button::new(label).small())
+                    .on_hover_text("Continue the download from the bytes already saved")
+                    .clicked()
+                {
+                    *resume_target = Some((f.name.clone(), f.size));
+                }
             }
             // Share needs a local copy (a manual download or the Sync
             // mirror — both land at `mirror_path`). iOS/Android parity.
@@ -2415,6 +2440,12 @@ impl AppState {
                             self.sync.ble_delete_in_flight.is_some()
                                 && self.sync.ble_delete_attempts_left == 0;
                         let out_dir = self.sync.ble_out_dir.clone();
+                        let in_flight_name = if self.sync.ble_dl_in_flight {
+                            self.sync.sync_in_flight_name.clone()
+                        } else {
+                            None
+                        };
+                        let mut resume_target: Option<(String, u64)> = None;
                         egui::ScrollArea::vertical()
                             .max_height(list_height)
                             // Use the full window width for the list (don't
@@ -2436,6 +2467,8 @@ impl AppState {
                                     delete_is_retry,
                                     &out_dir,
                                     &mut self.pending_share,
+                                    in_flight_name.as_deref(),
+                                    &mut resume_target,
                                 );
                                 ui.add_space(4.0);
                                 render_file_group(
@@ -2451,6 +2484,8 @@ impl AppState {
                                     delete_is_retry,
                                     &out_dir,
                                     &mut self.pending_share,
+                                    in_flight_name.as_deref(),
+                                    &mut resume_target,
                                 );
                             });
                         /* Trash-click → enqueue on the serial DELETE queue.
@@ -2462,6 +2497,16 @@ impl AppState {
                            slot so the next queued entry gets its turn. */
                         if let Some(name) = delete_target {
                             self.sync.enqueue_delete(name);
+                        }
+                        /* Resume-click → queue that one file; the queue
+                           continues from the bytes already on disk. */
+                        if let Some((name, size)) = resume_target {
+                            if self.sync.validate_save_dir().is_some()
+                                && !self.sync.ble_dl_queue.iter().any(|(n, _)| *n == name)
+                            {
+                                self.sync.ble_dl_queue.push_back((name, size));
+                                self.sync.advance_download_queue();
+                            }
                         }
 
                         ui.add_space(4.0);
