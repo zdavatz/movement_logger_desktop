@@ -26,6 +26,7 @@ mod installer;
 mod mpv;
 mod power;
 mod race;
+mod share;
 mod sync_core;
 mod sync_db;
 mod update;
@@ -108,6 +109,9 @@ const SYNC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3
 
 #[derive(Default)]
 struct AppState {
+    /// Sync-tab "Share…" click: local file + button rect, consumed at the
+    /// top of the next `update` (which has the `eframe::Frame`).
+    pending_share: Option<(PathBuf, egui::Rect)>,
     /// Auto-detected sensor CSV (e.g. `Sens005.csv`). One per session.
     sensor_csv: Option<PathBuf>,
     /// Auto-detected GPS CSV (e.g. `Sens005_gps.csv`). Optional — when
@@ -1573,6 +1577,11 @@ fn render_file_group(
     // (almost always the second attempt succeeds via NOT_FOUND — the box
     // did delete the file the first time, we just lost the status notify).
     delete_is_retry: bool,
+    // Local download folder + the row whose Share button was clicked (with
+    // the button rect, to anchor the macOS share popover). The share itself
+    // runs in `update`, which has the `eframe::Frame` for the window handle.
+    out_dir: &std::path::Path,
+    share_target: &mut Option<(PathBuf, egui::Rect)>,
 ) {
     if indices.is_empty() { return; }
     /* Header strip with a "Select all" toggle right next to the title —
@@ -1661,6 +1670,18 @@ fn render_file_group(
                 ui.colored_label(colour, egui::RichText::new(label).strong());
             } else if is_queued_delete {
                 ui.weak(egui::RichText::new("queued"));
+            }
+            // Share needs a local copy (a manual download or the Sync
+            // mirror — both land at `mirror_path`). iOS/Android parity.
+            let local = sync_core::mirror_path(out_dir, &f.name);
+            let have_local = !busy
+                && std::fs::metadata(&local).map(|m| m.len() > 0).unwrap_or(false);
+            let share = ui
+                .add_enabled(have_local, egui::Button::new(share::LABEL).small())
+                .on_hover_text(share::HINT)
+                .on_disabled_hover_text("Download the file first");
+            if share.clicked() {
+                *share_target = Some((local, share.rect));
             }
             if f.downloaded {
                 /* Clear "downloaded" badge. Earlier code used `✓` U+2713,
@@ -2393,6 +2414,7 @@ impl AppState {
                         let delete_is_retry =
                             self.sync.ble_delete_in_flight.is_some()
                                 && self.sync.ble_delete_attempts_left == 0;
+                        let out_dir = self.sync.ble_out_dir.clone();
                         egui::ScrollArea::vertical()
                             .max_height(list_height)
                             // Use the full window width for the list (don't
@@ -2412,6 +2434,8 @@ impl AppState {
                                     &delete_queued_names,
                                     delete_elapsed_s,
                                     delete_is_retry,
+                                    &out_dir,
+                                    &mut self.pending_share,
                                 );
                                 ui.add_space(4.0);
                                 render_file_group(
@@ -2425,6 +2449,8 @@ impl AppState {
                                     &delete_queued_names,
                                     delete_elapsed_s,
                                     delete_is_retry,
+                                    &out_dir,
+                                    &mut self.pending_share,
                                 );
                             });
                         /* Trash-click → enqueue on the serial DELETE queue.
@@ -4457,7 +4483,12 @@ impl eframe::App for AppState {
         self._gui_lock = None;
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some((path, rect)) = self.pending_share.take() {
+            if let Err(e) = share::share_file(frame, &path, rect) {
+                self.log.lock().unwrap().push(format!("Share {}: {e:#}", path.display()));
+            }
+        }
         // Drag-and-drop handling. Plain files come through
         // `dropped_files`; `hovered_files` lets us highlight the drop
         // zone before the user releases.

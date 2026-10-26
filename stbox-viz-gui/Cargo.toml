@@ -101,6 +101,15 @@ gps-debug = { path = "../gps-debug" }
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 
+# Per-file "Share…" in the Sync tab: the native NSSharingServicePicker,
+# anchored to the window's NSView (raw-window-handle from eframe). Same
+# objc2 0.6 / app-kit 0.3 line arboard already pulls in — no second copy.
+[target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSGeometry", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3", features = ["NSResponder", "NSSharingService", "NSView"] }
+
 [build-dependencies]
 winres = "0.1"
 
