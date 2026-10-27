@@ -573,7 +573,9 @@ where
         say!(t0, "  ERRLOG.LOG not in LIST — cannot read the firmware verdict");
         return;
     };
-    let from = size.saturating_sub(4000);
+    // ERRLOG_TAIL_BYTES widens the tail (default 4000 B); ERRLOG_TAIL_OUT saves it raw.
+    let want = std::env::var("ERRLOG_TAIL_BYTES").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(4000);
+    let from = size.saturating_sub(want.min(60_000));
     let cap = size - from;
     let mut req = vec![0x02];
     req.extend_from_slice(b"ERRLOG.LOG");
@@ -593,10 +595,17 @@ where
             }
         }
     }
+    if let Ok(out) = std::env::var("ERRLOG_TAIL_OUT") {
+        match std::fs::write(&out, &tail) {
+            Ok(()) => say!(t0, "  ERRLOG.LOG tail saved to {out}"),
+            Err(e) => say!(t0, "  ERRLOG.LOG tail NOT saved to {out}: {e}"),
+        }
+    }
     say!(t0, "  ERRLOG.LOG tail ({} of {} B from offset {from}), gps/bridge/boot/fwupdate lines:", tail.len(), cap);
     for l in String::from_utf8_lossy(&tail).lines() {
         if l.contains("gps") || l.contains("GPS") || l.contains("bridge")
             || l.contains("fwupdate") || l.contains("--- Boot") || l.contains("reset:")
+            || l.contains("***")
         {
             say!(t0, "    {l}");
         }
