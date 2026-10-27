@@ -620,11 +620,14 @@ where
             }
         }
     }
+    // ERRLOG_TAIL_FILE reads the tail of another box file instead (e.g. GPS000.CSV).
+    let file = std::env::var("ERRLOG_TAIL_FILE").unwrap_or_else(|_| "ERRLOG.LOG".into());
+    let prefix = format!("{file},");
     let size = String::from_utf8_lossy(&listing)
         .lines()
-        .find_map(|l| l.strip_prefix("ERRLOG.LOG,").and_then(|s| s.trim().parse::<u64>().ok()));
+        .find_map(|l| l.strip_prefix(prefix.as_str()).and_then(|s| s.trim().parse::<u64>().ok()));
     let Some(size) = size else {
-        say!(t0, "  ERRLOG.LOG not in LIST — cannot read the firmware verdict");
+        say!(t0, "  {file} not in LIST — cannot read it");
         return;
     };
     // ERRLOG_TAIL_BYTES widens the tail (default 4000 B); ERRLOG_TAIL_OUT saves it raw.
@@ -632,7 +635,7 @@ where
     let from = size.saturating_sub(want.min(60_000));
     let cap = size - from;
     let mut req = vec![0x02];
-    req.extend_from_slice(b"ERRLOG.LOG");
+    req.extend_from_slice(file.as_bytes());
     req.push(0x00);
     req.extend_from_slice(&(from as u32).to_le_bytes());
     req.extend_from_slice(&(cap as u32).to_le_bytes());
@@ -651,11 +654,11 @@ where
     }
     if let Ok(out) = std::env::var("ERRLOG_TAIL_OUT") {
         match std::fs::write(&out, &tail) {
-            Ok(()) => say!(t0, "  ERRLOG.LOG tail saved to {out}"),
-            Err(e) => say!(t0, "  ERRLOG.LOG tail NOT saved to {out}: {e}"),
+            Ok(()) => say!(t0, "  {file} tail saved to {out}"),
+            Err(e) => say!(t0, "  {file} tail NOT saved to {out}: {e}"),
         }
     }
-    say!(t0, "  ERRLOG.LOG tail ({} of {} B from offset {from}), gps/bridge/boot/fwupdate lines:", tail.len(), cap);
+    say!(t0, "  {file} tail ({} of {} B from offset {from}), gps/bridge/boot/fwupdate lines:", tail.len(), cap);
     for l in String::from_utf8_lossy(&tail).lines() {
         if l.contains("gps") || l.contains("GPS") || l.contains("bridge")
             || l.contains("fwupdate") || l.contains("--- Boot") || l.contains("reset:")
