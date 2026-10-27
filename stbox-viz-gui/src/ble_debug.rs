@@ -593,9 +593,11 @@ where
             }
         }
     }
-    say!(t0, "  ERRLOG.LOG tail ({} of {} B from offset {from}), gps/bridge lines:", tail.len(), cap);
+    say!(t0, "  ERRLOG.LOG tail ({} of {} B from offset {from}), gps/bridge/boot/fwupdate lines:", tail.len(), cap);
     for l in String::from_utf8_lossy(&tail).lines() {
-        if l.contains("gps") || l.contains("GPS") || l.contains("bridge") {
+        if l.contains("gps") || l.contains("GPS") || l.contains("bridge")
+            || l.contains("fwupdate") || l.contains("--- Boot") || l.contains("reset:")
+        {
             say!(t0, "    {l}");
         }
     }
