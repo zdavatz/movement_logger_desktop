@@ -58,7 +58,17 @@ You can do it two ways:
 
   No window opens. It connects to the box remembered in `~/.movementlogger/config.toml` (so the box must have been connected once from the GUI first — on macOS this is also what records the Bluetooth permission the headless run inherits), uploads the image, and prints progress to stderr. Exit code `0` = sent (box reboots into the new firmware), `1` = error/timeout, `2` = file missing.
 
+> **Eject the box's USB drive first.** While the SD card is mounted over USB-C the box is busy serving it, and the flash erase at the start of an upload can time out (`FW_BEGIN timed out (bank erase)`).
+
 > **Typically ~1–2 minutes.** BLE OTA is stop-and-wait (160-byte chunks, each waiting for the box to program it to flash and acknowledge before the next): ~1.6 KB/s on a good link, so a ~124 kB image takes about 80 s. On a slow connection interval it can drop to ~90 B/s (~20 min). Leave it running; the box only switches to the new firmware after the whole image is uploaded and its SHA-256 checks out.
+
+## GPS TX check (`--gps-tx`)
+
+```sh
+MovementLogger --ble-debug 6 --gps-tx
+```
+
+Headless probe for a box whose GPS stays at 1 Hz / 9600 baud. It connects, turns the box's GPS bridge on, sends UBX polls (MON-VER, NAV-PVT) through the box to the u-blox, reports whether the module answered, then reads the tail of the box's `ERRLOG.LOG` over BLE and prints the GPS lines (firmware v0.0.79+ adds `gps: txdiag …`, which shows whether the box itself transmitted). Close the GUI first — the box takes one connection.
 
 ## Build from source
 

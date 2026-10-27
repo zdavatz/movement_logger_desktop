@@ -5851,7 +5851,8 @@ fn main() -> eframe::Result<()> {
             .get(pos + 1)
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(20);
-        std::process::exit(ble_debug::run(secs));
+        let gps_tx = args.iter().any(|a| a == "--gps-tx");
+        std::process::exit(ble_debug::run(secs, gps_tx));
     }
     // Autostart (de)registration entry points — invoked in a clean
     // child by the updater/agent so the login item always points at

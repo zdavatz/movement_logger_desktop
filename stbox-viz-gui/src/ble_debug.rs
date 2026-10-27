@@ -47,8 +47,13 @@ const FILEDATA_UUID: Uuid = Uuid::from_u128(0x00000040_0010_11e1_ac36_0002a5d5c5
 const STREAM_UUID: Uuid = Uuid::from_u128(0x00000100_0010_11e1_ac36_0002a5d5c51b);
 
 const OP_LIST: u8 = 0x01;
+const OP_GPS_BRIDGE: u8 = 0x0D;
+const OP_GPS_TX: u8 = 0x0E;
 const OP_DISCONNECT: u8 = 0x0F;
 const OP_GET_VERSION: u8 = 0x10;
+
+/// How long `--gps-tx` collects bridged UBX bytes after each poll.
+const GPS_TX_WAIT: Duration = Duration::from_secs(4);
 
 /// Same bound as ble.rs `LINK_OP_TIMEOUT` — no CoreBluetooth await may
 /// run unbounded (vendored-fork map holes never resolve their reply).
@@ -61,7 +66,7 @@ macro_rules! say {
     }};
 }
 
-pub fn run(secs: u64) -> i32 {
+pub fn run(secs: u64, gps_tx: bool) -> i32 {
     // btleplug internal logs → stderr. Default to warn so the probe's
     // own stdout stays readable; RUST_LOG overrides for deep traces.
     let _ = env_logger::Builder::from_env(
@@ -78,7 +83,7 @@ pub fn run(secs: u64) -> i32 {
             return 1;
         }
     };
-    match rt.block_on(run_async(secs)) {
+    match rt.block_on(run_async(secs, gps_tx)) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("[ble-debug] FAILED: {e}");
@@ -116,7 +121,7 @@ fn is_box_id(
             .unwrap_or(false)
 }
 
-async fn run_async(secs: u64) -> Result<(), String> {
+async fn run_async(secs: u64, gps_tx: bool) -> Result<(), String> {
     let t0 = Instant::now();
     say!(t0, "MovementLogger --ble-debug v{} ({})",
          env!("CARGO_PKG_VERSION"), std::env::consts::OS);
@@ -415,6 +420,9 @@ async fn run_async(secs: u64) -> Result<(), String> {
             Ok(Err(e)) => say!(t0, "  LIST write FAILED: {e}"),
             Err(_) => say!(t0, "  LIST write timed out"),
         }
+        if gps_tx {
+            gps_tx_test(&p, &cmd, &mut notifs, t0).await;
+        }
     }
 
     // Polite box-side teardown (0x0F, fw v0.0.22+; older fw ignores it),
@@ -434,4 +442,167 @@ async fn run_async(secs: u64) -> Result<(), String> {
     let _ = tokio::time::timeout(Duration::from_secs(3), p.disconnect()).await;
     say!(t0, "probe done");
     Ok(())
+}
+
+/// UBX frame `B5 62 cls id len16 payload ck_a ck_b`.
+fn ubx_frame(cls: u8, id: u8, payload: &[u8]) -> Vec<u8> {
+    let mut f = vec![0xB5, 0x62, cls, id, payload.len() as u8, (payload.len() >> 8) as u8];
+    f.extend_from_slice(payload);
+    let (mut a, mut b) = (0u8, 0u8);
+    for &x in &f[2..] {
+        a = a.wrapping_add(x);
+        b = b.wrapping_add(a);
+    }
+    f.push(a);
+    f.push(b);
+    f
+}
+
+/// Distinct (class, id) of every UBX sync header in `buf`.
+fn ubx_headers(buf: &[u8]) -> Vec<(u8, u8)> {
+    let mut out = Vec::new();
+    for w in buf.windows(4) {
+        if w[0] == 0xB5 && w[1] == 0x62 && !out.contains(&(w[2], w[3])) {
+            out.push((w[2], w[3]));
+        }
+    }
+    out
+}
+
+/// `--gps-tx`: does the box → u-blox UART line carry bytes? Turns the GPS
+/// bridge on (0x0D 1 — the firmware itself sends a CFG-VALSET then and logs
+/// its ACK/FAIL to ERRLOG), forwards UBX polls through the box (0x0E) and
+/// watches the bridged FileData notifies for the module's replies. A reply
+/// can only exist if the module received the poll, i.e. the TX wire works.
+async fn gps_tx_test<P, S>(p: &P, cmd: &btleplug::api::Characteristic, notifs: &mut S, t0: Instant)
+where
+    P: btleplug::api::Peripheral,
+    S: futures::Stream<Item = btleplug::api::ValueNotification> + Unpin,
+{
+    say!(t0, "GPS TX test: bridge on (0x0D 1)…");
+    match tokio::time::timeout(
+        STEP_TIMEOUT,
+        p.write(cmd, &[OP_GPS_BRIDGE, 1], WriteType::WithResponse),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => { say!(t0, "  bridge-on write FAILED: {e}"); return; }
+        Err(_) => { say!(t0, "  bridge-on write timed out"); return; }
+    }
+    // The firmware's own VALSET at bridge-on waits up to ~300 ms for its ACK.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let polls: [(&str, u8, u8); 2] = [("MON-VER", 0x0A, 0x04), ("NAV-PVT", 0x01, 0x07)];
+    let mut answered = 0;
+    for (name, cls, id) in polls {
+        let mut payload = vec![OP_GPS_TX];
+        payload.extend(ubx_frame(cls, id, &[]));
+        if let Err(e) = tokio::time::timeout(
+            STEP_TIMEOUT,
+            p.write(cmd, &payload, WriteType::WithResponse),
+        )
+        .await
+        .map_err(|_| "timed out".to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()))
+        {
+            say!(t0, "  {name} poll write FAILED: {e}");
+            continue;
+        }
+        let mut buf = Vec::new();
+        let dl = Instant::now() + GPS_TX_WAIT;
+        loop {
+            let left = dl.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, notifs.next()).await {
+                Ok(Some(n)) if n.uuid == FILEDATA_UUID => buf.extend_from_slice(&n.value),
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        let hdrs = ubx_headers(&buf);
+        let hit = hdrs.contains(&(cls, id));
+        if hit {
+            answered += 1;
+        }
+        say!(t0, "  {name} poll → {} bridged byte(s), UBX frames {:02X?} — {}",
+             buf.len(), hdrs,
+             if hit { "MODULE ANSWERED" } else { "no reply" });
+        if hit && name == "MON-VER" {
+            // MON-VER payload: swVersion[30] hwVersion[10] extensions[30]…
+            if let Some(pos) = buf.windows(4).position(|w| w == [0xB5, 0x62, 0x0A, 0x04]) {
+                let body = &buf[pos + 6..];
+                let txt: String = body.iter()
+                    .map(|&c| if (0x20..0x7F).contains(&c) { c as char } else { ' ' })
+                    .collect();
+                say!(t0, "    version text: {}",
+                     txt.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
+    }
+
+    let _ = tokio::time::timeout(
+        STEP_TIMEOUT,
+        p.write(cmd, &[OP_GPS_BRIDGE, 0], WriteType::WithResponse),
+    )
+    .await;
+    say!(t0, "  bridge off (0x0D 0)");
+
+    // The firmware's own verdict: bridge on/off each send a CFG-VALSET and
+    // log "pvt throttle/restore ACK|FAIL". ERRLOG flushes every 10 s, so
+    // wait, LIST for its size, then READ the tail.
+    say!(t0, "  waiting 12 s for the box to flush ERRLOG.LOG…");
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let mut listing = Vec::new();
+    if tokio::time::timeout(STEP_TIMEOUT, p.write(cmd, &[OP_LIST], WriteType::WithResponse))
+        .await
+        .is_ok()
+    {
+        while let Ok(Some(n)) = tokio::time::timeout(Duration::from_secs(2), notifs.next()).await {
+            if n.uuid == FILEDATA_UUID {
+                listing.extend_from_slice(&n.value);
+            }
+        }
+    }
+    let size = String::from_utf8_lossy(&listing)
+        .lines()
+        .find_map(|l| l.strip_prefix("ERRLOG.LOG,").and_then(|s| s.trim().parse::<u64>().ok()));
+    let Some(size) = size else {
+        say!(t0, "  ERRLOG.LOG not in LIST — cannot read the firmware verdict");
+        return;
+    };
+    let from = size.saturating_sub(4000);
+    let cap = size - from;
+    let mut req = vec![0x02];
+    req.extend_from_slice(b"ERRLOG.LOG");
+    req.push(0x00);
+    req.extend_from_slice(&(from as u32).to_le_bytes());
+    req.extend_from_slice(&(cap as u32).to_le_bytes());
+    let mut tail = Vec::new();
+    if tokio::time::timeout(STEP_TIMEOUT, p.write(cmd, &req, WriteType::WithResponse))
+        .await
+        .is_ok()
+    {
+        while (tail.len() as u64) < cap {
+            match tokio::time::timeout(Duration::from_secs(4), notifs.next()).await {
+                Ok(Some(n)) if n.uuid == FILEDATA_UUID => tail.extend_from_slice(&n.value),
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+    }
+    say!(t0, "  ERRLOG.LOG tail ({} of {} B from offset {from}), gps/bridge lines:", tail.len(), cap);
+    for l in String::from_utf8_lossy(&tail).lines() {
+        if l.contains("gps") || l.contains("GPS") || l.contains("bridge") {
+            say!(t0, "    {l}");
+        }
+    }
+    say!(t0, "GPS TX test: {answered}/{} poll(s) answered — {}", polls.len(),
+         if answered > 0 {
+             "box -> module TX WORKS"
+         } else {
+             "box -> module TX DEAD (or firmware bridge missing); see ERRLOG 'gps: bridge ON … pvt throttle ACK/FAIL'"
+         });
 }
