@@ -72,6 +72,8 @@ Headless probe for a box whose GPS stays at 1 Hz / 9600 baud. It connects, turns
 
 The ERRLOG tail also shows every `***` warning. Firmware v0.0.90+ adds one wiring line per boot (`gps: wiring 3V3+BLK … | TX->JP2-13 … | RX<-JP2-14 …`), which says directly which SparkFun wire is missing. To save more of the log: `ERRLOG_TAIL_BYTES=40000 ERRLOG_TAIL_OUT=errlog.log MovementLogger --ble-debug 6 --gps-tx` (default tail 4 KB, max 60 KB).
 
+If the module answers the polls but the latest wiring line still says `RX<-JP2-14 MISSING`, the RX contact came after the box booted. The box configures the GPS (230400 baud, 10 Hz after the first fix) only at boot, so power-cycle it and run the check again.
+
 ## Build from source
 
 ```sh
