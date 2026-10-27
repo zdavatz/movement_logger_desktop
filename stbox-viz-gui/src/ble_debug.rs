@@ -469,6 +469,59 @@ fn ubx_headers(buf: &[u8]) -> Vec<(u8, u8)> {
     out
 }
 
+/// Payloads of every complete, checksum-valid UBX `cls`/`id` frame in `buf`.
+fn ubx_payloads(buf: &[u8], cls: u8, id: u8) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 8 <= buf.len() {
+        if buf[i] == 0xB5 && buf[i + 1] == 0x62 && buf[i + 2] == cls && buf[i + 3] == id {
+            let len = u16::from_le_bytes([buf[i + 4], buf[i + 5]]) as usize;
+            if i + 8 + len <= buf.len() {
+                let (mut a, mut b) = (0u8, 0u8);
+                for &c in &buf[i + 2..i + 6 + len] {
+                    a = a.wrapping_add(c);
+                    b = b.wrapping_add(a);
+                }
+                if a == buf[i + 6 + len] && b == buf[i + 7 + len] {
+                    out.push(&buf[i + 6..i + 6 + len]);
+                    i += 8 + len;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Prints the receiver's own view: last NAV-PVT (fix, satellites used,
+/// accuracy) and last NAV-SAT (every tracked satellite with its C/N0).
+fn print_gps_state(t0: Instant, buf: &[u8]) {
+    if let Some(pvt) = ubx_payloads(buf, 0x01, 0x07).last().filter(|p| p.len() >= 92) {
+        let fix = match pvt[20] { 0 => "none", 1 => "DR", 2 => "2D", 3 => "3D", 4 => "GNSS+DR", 5 => "time", _ => "?" };
+        let h_acc = u32::from_le_bytes([pvt[40], pvt[41], pvt[42], pvt[43]]);
+        say!(t0, "    NAV-PVT: fix={fix} ok={} numSV={} hAcc={:.1} m",
+             pvt[21] & 1, pvt[23], h_acc as f64 / 1000.0);
+    }
+    if let Some(sat) = ubx_payloads(buf, 0x01, 0x35).last().filter(|p| p.len() >= 8) {
+        let n = (sat[5] as usize).min((sat.len() - 8) / 12);
+        let mut rows: Vec<(u8, u8, u8, i8, bool)> = (0..n)
+            .map(|k| {
+                let b = &sat[8 + 12 * k..];
+                (b[0], b[1], b[2], b[3] as i8, b[8] & 0x08 != 0)
+            })
+            .collect();
+        rows.sort_by(|a, b| b.2.cmp(&a.2));
+        let with_signal = rows.iter().filter(|r| r.2 > 0).count();
+        say!(t0, "    NAV-SAT: {n} satellite(s) known, {with_signal} with signal (C/N0 > 0), {} used",
+             rows.iter().filter(|r| r.4).count());
+        for (g, sv, cno, elev, used) in rows.iter().filter(|r| r.2 > 0).take(12) {
+            let sys = match g { 0 => "G", 1 => "S", 2 => "E", 3 => "B", 5 => "Q", 6 => "R", _ => "?" };
+            say!(t0, "      {sys}{sv:02} C/N0={cno:2} dBHz elev={elev:3}°{}", if *used { " used" } else { "" });
+        }
+    }
+}
+
 /// `--gps-tx`: does the box → u-blox UART line carry bytes? Turns the GPS
 /// bridge on (0x0D 1 — the firmware itself sends a CFG-VALSET then and logs
 /// its ACK/FAIL to ERRLOG), forwards UBX polls through the box (0x0E) and
@@ -530,6 +583,7 @@ where
         say!(t0, "  {name} poll → {} bridged byte(s), UBX frames {:02X?} — {}",
              buf.len(), hdrs,
              if hit { "MODULE ANSWERED" } else { "no reply" });
+        print_gps_state(t0, &buf);
         if hit && name == "MON-VER" {
             // MON-VER payload: swVersion[30] hwVersion[10] extensions[30]…
             if let Some(pos) = buf.windows(4).position(|w| w == [0xB5, 0x62, 0x0A, 0x04]) {
