@@ -208,6 +208,46 @@ is GPS+Galileo only). Everything else — baud 230400, RATE-MEAS 100,
 PM-OPERATEMODE 0, INPROT/OUTPROT-UBX, GPS/GAL enables — should MATCH; any
 *other* `***` (or a wall of "no reply") is a real finding.
 
+## Session tab — map + sensor charts without video (`session_view.rs`)
+
+`Tab::Session` draws one recorded session straight from `SENSnnn.CSV` +
+`GPSnnn.CSV`, fully in-process (no stbox-viz child, no ffmpeg). Inputs are the
+Replay tab's `sensor_csv` / `gps_csv` slots, so the global drop handler feeds
+both tabs. `classify` treats `GPS*` (box naming) as GPS and ignores `BAT*`, and
+`guess_gps_for` maps `SENSnnn.CSV` → `GPSnnn.CSV` — before that a dropped
+`GPS000.CSV` landed in the *sensor* slot.
+
+- **Parsing** reuses `stbox_viz::io` (`load_sensor_csv` / `load_gps_csv` /
+  `read_sync_anchors`; `stbox-viz` now exports `io` from its lib and the GUI
+  depends on it by path) — one parser for CLI and GUI, both schemas, torn-row
+  skip. Loading runs on a thread (`start_load` → `poll_loading`); 956 k sensor
+  rows + 22 k GPS rows load in 0.7 s (release).
+- **One clock**: both files carry the box's `HAL_GetTick()` ms, so t = 0 is the
+  first sample of either file and no alignment is needed. Wall-clock labels:
+  `# SYNC` anchors first, else the median GPS-UTC offset (`Clock`), shown in
+  local time.
+- **Derived series**: |acc| g, |gyro| °/s, pitch/roll from the accelerometer
+  only (0.5 s moving average; box frame nose = +Y, up = +Z — *not* the
+  phone-style formulas that swap pitch/roll on this box), baro height relative
+  to the first second (barometric formula), GPS speed from the module.
+- **Charts** (`egui_plot` 0.29, linked x-axis + cursor): never raw samples —
+  `decimate` reduces each series to ≤ 1200 min/max buckets over the visible
+  range of the previous frame, so a 1 M-row series costs ~2400 vertices.
+- **Map** reuses `race::{OverzoomTiles, EsriWorldImagery, opts, MAX_MAP_ZOOM}`
+  (made `pub(crate)`; the shared tile caches). Track = fixed rows minus
+  multipath hops > 60 km/h, drawn as one polyline per speed band (16 bands,
+  colour scale capped at the 95th percentile). Click near the track (15 px) or
+  in a chart moves the cursor; *Fit track* / *Follow cursor* / *Satellite*.
+- **Reading** is the slow part, not parsing: the box's USB mass-storage SD
+  serves ~0.45 MB/s (`dd` of a 57 MB SENS000.CSV: 127 s), so parallel parsing
+  buys nothing. `read_all` reads each file once in 4 MB chunks into RAM (the
+  old path read the sensor file twice — rows + `# SYNC` anchors — via
+  `io::*_from` / `sync_anchors_from_str`) and feeds a `Progress` bar.
+- `MovementLogger --session <SENS> [GPS]` starts in the Session tab and loads
+  the files (GPS guessed via `guess_gps_for` when omitted).
+- `real_session` (ignored test) loads a real file:
+  `SESSION_SENS=…/SENS000.CSV cargo test --release -p movement-logger real_session -- --ignored --nocapture`.
+
 ## Race tab — live multi-rider tracking (`race.rs`)
 
 Wingfoil-race screen: every rider's phone streams its GPS fix as one

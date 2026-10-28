@@ -58,6 +58,14 @@ serde_json = "1"
 # eframe/egui.
 walkers = "0.31"
 
+# Session tab: time-series charts (speed, acceleration, pitch/roll,
+# baro height) next to the GPS track. Same release line as egui 0.29.
+egui_plot = "0.29"
+
+# Session tab: the Sens/Gps CSV loaders (both schemas, torn-row skip,
+# `# SYNC` anchors) — one parser for the GUI and the stbox-viz CLI.
+stbox-viz = { path = "../stbox-viz" }
+
 # Persisted agent/GUI config (~/.movementlogger/config.toml): box id,
 # save dir, keep-synced, box log mode. Shared by the GUI (writer) and
 # the headless --agent (reader) so a zero-click background sync knows

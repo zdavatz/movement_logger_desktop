@@ -62,13 +62,13 @@ const MAX_TRAIL_JUMP_KMH: f64 = 60.0;
 /// OSM serves tiles up to z19; deeper zoom magnifies those via
 /// [`OverzoomTiles`], readable to about z22.
 const TILE_MAX_NATIVE_ZOOM: u8 = 19;
-const MAX_MAP_ZOOM: f64 = 22.0;
+pub(crate) const MAX_MAP_ZOOM: f64 = 22.0;
 
 /// Esri World Imagery — satellite tiles, the view that actually shows
 /// something at deep zoom where OSM carto is a featureless landuse
 /// fill (a rural backyard at z21 is one uniform `#E0DFDF` rectangle).
 /// Note the `z/y/x` path order, unlike OSM's `z/x/y`.
-struct EsriWorldImagery;
+pub(crate) struct EsriWorldImagery;
 
 impl walkers::sources::TileSource for EsriWorldImagery {
     fn tile_url(&self, tile_id: TileId) -> String {
@@ -95,7 +95,7 @@ impl walkers::sources::TileSource for EsriWorldImagery {
 /// Tile source wrapper that answers requests beyond the server's
 /// native maximum zoom with a magnified sub-rect of the deepest real
 /// tile — blurry but usable, instead of walkers' blank grey world.
-struct OverzoomTiles(HttpTiles);
+pub(crate) struct OverzoomTiles(pub(crate) HttpTiles);
 
 impl walkers::Tiles for OverzoomTiles {
     fn at(&mut self, tile_id: TileId) -> Option<walkers::TextureWithUv> {
@@ -132,6 +132,17 @@ impl walkers::Tiles for OverzoomTiles {
 
     fn tile_size(&self) -> u32 {
         self.0.tile_size()
+    }
+}
+
+/// Tile-cache + identifying user agent (OSM tile policy) for one map
+/// style. Shared with the Session tab's track map.
+pub(crate) fn opts(dir: &str) -> HttpOptions {
+    HttpOptions {
+        cache: Some(crate::agent_config::movementlogger_home().join(dir)),
+        user_agent: Some(walkers::HeaderValue::from_static(
+            "MovementLogger-Desktop (github.com/zdavatz/movement_logger_desktop)",
+        )),
     }
 }
 
@@ -807,14 +818,6 @@ impl RaceState {
         // Map — created lazily so the tiles cache/UA are set up with a
         // live egui context. One instance per style, each with its own
         // disk cache.
-        fn opts(dir: &str) -> HttpOptions {
-            HttpOptions {
-                cache: Some(crate::agent_config::movementlogger_home().join(dir)),
-                user_agent: Some(walkers::HeaderValue::from_static(
-                    "MovementLogger-Desktop (github.com/zdavatz/movement_logger_desktop)",
-                )),
-            }
-        }
         if self.tiles.is_none() {
             self.tiles = Some(OverzoomTiles(HttpTiles::with_options(
                 walkers::sources::OpenStreetMap,

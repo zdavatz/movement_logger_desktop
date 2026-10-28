@@ -1268,6 +1268,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_plot"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8dca4871c15d51aadb79534dcf51a8189e5de3426ee7b465eb7db9a0a81ea67"
+dependencies = [
+ "ahash",
+ "egui",
+ "emath",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2939,6 +2950,7 @@ dependencies = [
  "ctrlc",
  "eframe",
  "egui",
+ "egui_plot",
  "env_logger",
  "fs4",
  "futures",
@@ -2955,6 +2967,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "stbox-viz",
  "tokio",
  "toml 0.8.23",
  "uuid",

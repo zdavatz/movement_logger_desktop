@@ -96,14 +96,20 @@ fn parse_i32(s: &str) -> Result<i32> {
 }
 
 pub fn load_sensor_csv(path: &Path) -> Result<Vec<SensorRow>> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    load_sensor_csv_from(file, path)
+}
+
+/// `load_sensor_csv` over any reader (e.g. a file already read into
+/// memory); `path` only labels warnings.
+pub fn load_sensor_csv_from<R: std::io::Read>(src: R, path: &Path) -> Result<Vec<SensorRow>> {
     let mut rdr = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
         // Skip the firmware's `# SYNC epoch_ms=.. tick_ms=..` marker lines
         // (v0.0.10+) — they're host time-sync anchors, not data rows; pulled
         // separately by `read_sync_anchors`.
         .comment(Some(b'#'))
-        .from_path(path)
-        .with_context(|| format!("open {}", path.display()))?;
+        .from_reader(src);
 
     let hdr = rdr.headers()?.clone();
     let cols = Cols::from_headers(&hdr);
@@ -176,11 +182,16 @@ pub fn load_sensor_csv(path: &Path) -> Result<Vec<SensorRow>> {
 }
 
 pub fn load_gps_csv(path: &Path) -> Result<Vec<GpsRow>> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    load_gps_csv_from(file, path)
+}
+
+/// `load_gps_csv` over any reader; `path` only labels warnings.
+pub fn load_gps_csv_from<R: std::io::Read>(src: R, path: &Path) -> Result<Vec<GpsRow>> {
     let mut rdr = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
         .comment(Some(b'#'))
-        .from_path(path)
-        .with_context(|| format!("open {}", path.display()))?;
+        .from_reader(src);
 
     let hdr = rdr.headers()?.clone();
     let cols = Cols::from_headers(&hdr);
@@ -259,6 +270,11 @@ pub struct SyncAnchor {
 pub fn read_sync_anchors(path: &Path) -> Result<Vec<SyncAnchor>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("open {}", path.display()))?;
+    Ok(sync_anchors_from_str(&text))
+}
+
+/// `read_sync_anchors` over file contents already in memory.
+pub fn sync_anchors_from_str(text: &str) -> Vec<SyncAnchor> {
     let mut tick_div = 10.0_f64; // compact `ms` schema → raw ms; ÷10 → 10ms ticks
     let mut saw_header = false;
     let mut out: Vec<SyncAnchor> = Vec::new();
@@ -296,7 +312,7 @@ pub fn read_sync_anchors(path: &Path) -> Result<Vec<SyncAnchor>> {
     // Sort + dedupe by tick so the interpolation gets a clean monotone curve.
     out.sort_by(|a, b| a.ticks.partial_cmp(&b.ticks).unwrap_or(std::cmp::Ordering::Equal));
     out.dedup_by(|a, b| a.ticks == b.ticks);
-    Ok(out)
+    out
 }
 
 /// Map row ticks → absolute epoch ms through host-clock `# SYNC` anchors.

@@ -26,6 +26,7 @@ mod installer;
 mod mpv;
 mod power;
 mod race;
+mod session_view;
 mod share;
 mod sync_core;
 mod sync_db;
@@ -70,6 +71,9 @@ enum Tab {
     /// dot/trail per phone that's sending position datagrams (see
     /// `race.rs` for the wire format and the Android/iOS senders).
     Race,
+    /// A recorded session drawn from its SENS + GPS CSVs: track map,
+    /// sensor charts, time slider — no video (`session_view.rs`).
+    Session,
     /// Diagnostics: BLE probe (headless --ble-debug as a child) + the
     /// GPS/antenna survey. One tab so every "send me the output" tool
     /// lives in the same place.
@@ -294,6 +298,8 @@ struct AppState {
     current_tab: Tab,
     /// Race tab: UDP listener + live rider map (race.rs owns it all).
     race: race::RaceState,
+    /// Session tab: map + charts of one recorded session.
+    session: session_view::SessionView,
     /// Most recent SensorStream snapshot. Cleared on disconnect.
     latest_sample: Option<LiveSample>,
     /// Wall-clock instant the latest sample arrived. Used for the
@@ -402,12 +408,16 @@ fn classify(path: &Path) -> FileKind {
         .to_ascii_lowercase();
     match ext.as_str() {
         "csv" => {
-            if name.ends_with("_gps.csv") {
+            let lower = name.to_ascii_lowercase();
+            if lower.ends_with("_gps.csv") || lower.starts_with("gps") {
                 FileKind::Gps
             // _quaternions.csv is a derived stbox-viz output, not an
             // input — silently ignore so the user dropping a result
             // folder doesn't end up with the wrong sensor source.
-            } else if name.ends_with("_quaternions.csv") || name.ends_with("_errlog.txt") {
+            } else if name.ends_with("_quaternions.csv")
+                || name.ends_with("_errlog.txt")
+                || lower.starts_with("bat")
+            {
                 FileKind::Unknown
             } else {
                 FileKind::Sensor
@@ -420,16 +430,21 @@ fn classify(path: &Path) -> FileKind {
 }
 
 /// Best-effort companion-GPS guesser: given `Sens005.csv`, look for
-/// `Sens005_gps.csv` next to it.
+/// `Sens005_gps.csv` next to it; given the box's `SENS005.CSV`, look
+/// for `GPS005.CSV` (any case).
 fn guess_gps_for(sensor: &Path) -> Option<PathBuf> {
     let stem = sensor.file_stem()?.to_str()?.to_string();
     let parent = sensor.parent()?;
     let gps = parent.join(format!("{stem}_gps.csv"));
     if gps.exists() {
-        Some(gps)
-    } else {
-        None
+        return Some(gps);
     }
+    let num = stem.get(4..).filter(|_| stem.to_ascii_lowercase().starts_with("sens"))?;
+    ["GPS", "Gps", "gps"]
+        .iter()
+        .flat_map(|p| [format!("{p}{num}.CSV"), format!("{p}{num}.csv")])
+        .map(|n| parent.join(n))
+        .find(|p| p.exists())
 }
 
 // ---------------------------------------------------------------------------
@@ -4661,6 +4676,7 @@ impl eframe::App for AppState {
                     (Tab::Live,     "Live"),
                     (Tab::Sync,     "Sync"),
                     (Tab::Replay,   "Replay"),
+                    (Tab::Session,  "Session"),
                     (Tab::Race,     "Race"),
                     (Tab::Debug,    "Debug"),
                     (Tab::Firmware, "Firmware"),
@@ -4784,6 +4800,10 @@ impl eframe::App for AppState {
                 }
                 Tab::Debug    => { self.ui_debug_tab(ui);    return; }
                 Tab::Race     => { self.race.ui(ui);         return; }
+                Tab::Session  => {
+                    self.session.ui(ui, &mut self.sensor_csv, &mut self.gps_csv);
+                    return;
+                }
                 Tab::Replay   => { /* fall through to original layout */ }
             }
 
@@ -5885,6 +5905,21 @@ fn main() -> eframe::Result<()> {
         let _ = autostart::register();
     }
 
+    /* `--session <SENSnnn.CSV> [GPSnnn.CSV]`: open straight into the
+       Session tab and load that recording (GPS guessed when omitted). */
+    let session_args: Option<(PathBuf, Option<PathBuf>)> = args
+        .iter()
+        .position(|a| a == "--session")
+        .and_then(|pos| {
+            let sens = PathBuf::from(args.get(pos + 1)?);
+            let gps = args
+                .get(pos + 2)
+                .filter(|a| !a.starts_with("--"))
+                .map(PathBuf::from)
+                .or_else(|| guess_gps_for(&sens));
+            Some((sens, gps))
+        });
+
     let title = format!("MovementLogger v{}", env!("CARGO_PKG_VERSION"));
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([880.0, 720.0])
@@ -5916,7 +5951,14 @@ fn main() -> eframe::Result<()> {
             if let Some(z) = agent_config::AgentConfig::load().ui_zoom {
                 cc.egui_ctx.set_zoom_factor(z.clamp(0.6, 3.0));
             }
-            Ok(Box::new(AppState::new()))
+            let mut app = AppState::new();
+            if let Some((sens, gps)) = session_args {
+                app.current_tab = Tab::Session;
+                app.sensor_csv = Some(sens.clone());
+                app.gps_csv = gps.clone();
+                app.session.start_load(&cc.egui_ctx, sens, gps);
+            }
+            Ok(Box::new(app))
         }),
     )
 }
